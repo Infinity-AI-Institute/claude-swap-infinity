@@ -197,6 +197,84 @@ cswap purge                     # Remove all claude-swap data
 
 The original flag spellings (`cswap --switch`, `cswap --list`, ...) keep working.
 
+### Other tools: Codex CLI and Kimi Code
+
+claude-swap also manages accounts for the **Codex CLI** (OpenAI) and **Kimi Code**
+CLI, in their own namespaces with their own account stores — Claude accounts are
+never touched by these commands, and vice versa.
+
+```bash
+cswap codex add                  # snapshot the current Codex login (~/.codex/auth.json)
+cswap codex switch               # rotate to the next stored Codex account
+cswap codex switch 2             # switch to a specific slot (or by label)
+cswap codex list                 # all slots with 5h/weekly rate-limit usage
+cswap codex status               # which account is currently logged in
+cswap codex remove 2             # remove a slot (the live login is untouched)
+cswap codex run 2                # launch codex as account 2, this terminal only
+cswap codex run 2 -- --resume    # everything after '--' is forwarded to codex
+
+cswap kimi add                   # same for Kimi Code (~/.kimi-code/credentials/kimi-code.json)
+cswap kimi switch
+cswap kimi list
+cswap kimi status
+cswap kimi remove 2
+cswap kimi run 2
+```
+
+- **Data** lives in per-tool subdirectories of the backup root
+  (`~/.claude-swap-backup/codex/`, `~/.claude-swap-backup/kimi/` on Windows/macOS;
+  under the XDG data dir on Linux), so the three namespaces can't collide.
+- **Labels** are auto-detected where possible (Codex accounts get their email from
+  the login's ID token) or set with `cswap codex add --label work`.
+- **Switching** restores a slot into the tool's live credential file. If the
+  current login was never snapshotted, it is auto-added to a free slot first, so
+  a switch never discards an unbacked-up login.
+- **Session mode** (`run`) uses each tool's own home-override env var —
+  `CODEX_HOME` for Codex, `KIMI_CODE_HOME` for Kimi Code — pointing at a
+  per-account session directory that holds a copy of the slot's credentials plus
+  your shared config files. The default login and other terminals are unaffected.
+- **Usage is best-effort**: Codex usage comes from the ChatGPT backend's
+  rate-limit endpoint (`GET https://chatgpt.com/backend-api/wham/usage`, Bearer
+  access token + `ChatGPT-Account-Id` header; the same endpoint the Codex CLI
+  itself reads), Kimi usage from `GET https://api.kimi.com/coding/v1/usages` with
+  the official CLI's request headers. If an endpoint errors or the payload shape
+  changes, the account simply shows "usage unavailable" — nothing crashes.
+  `list`/`status` also accept `--json`.
+
+## Persistent autonomous runner
+
+Start a mission and let `cswap` keep working on it until you stop it. The runner walks a configurable priority list of backends and automatically falls back when one hits a quota, rate limit, or auth error:
+
+```bash
+cswap persistent start "refactor the auth module into services"
+cswap persistent status              # running, backend, last error
+cswap persistent logs -n 100         # tail the mission log
+cswap persistent stop                # pause the daemon
+```
+
+Default priority (subscription → paid fallback → free → local):
+
+```bash
+claude → codex → kimi → openrouter-qwen → opencode-free → local
+```
+
+Change it arbitrarily:
+
+```bash
+cswap persistent priority --set codex,kimi,claude,openrouter-qwen,opencode-free,local
+```
+
+Backends:
+
+- `claude` — Claude Code CLI (uses the current or best cswap account)
+- `codex` — Codex CLI (uses the current or next cswap account)
+- `kimi` — Kimi Code CLI (uses the current or next cswap account)
+- `openrouter-qwen` — OpenRouter `qwen/qwen3.8-max` (set `OPENROUTER_API_KEY`)
+- `opencode-free` — opencode built-in free models
+- `local` — probes `http://127.0.0.1:11434/v1` (ollama) and `http://127.0.0.1:8080/v1` (llama-server) and uses the first reachable model
+
+State and logs live in `<backup-root>/runner/` so the daemon survives restarts. The runner loops by default; each successful step appends to the conversation history and continues. Disable looping with `runner.autoLoop: false` in `settings.json`.
+
 ## Tips
 
 - **Do you need to restart after switching?** Usually not. On **Linux and Windows**, credentials are stored in a file and Claude Code re-reads them whenever that file changes, so the new account takes effect on your next message — no restart needed. On **macOS**, credentials live in the Keychain, which Claude Code caches for about 30 seconds; a running session picks up the switch once that cache expires. Restart Claude Code (or close and reopen the VS Code extension tab) only if you want the change to apply instantly.

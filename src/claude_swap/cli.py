@@ -824,6 +824,360 @@ Examples:
         sys.exit(130)
 
 
+def _format_resets_in(resets_at: float | None) -> str:
+    """"resets in 2d 3h" from an epoch timestamp; "" when unknown/past."""
+    import time as _time
+
+    if resets_at is None:
+        return ""
+    remaining = int(resets_at - _time.time())
+    if remaining <= 0:
+        return "  reset now"
+    days, rem = divmod(remaining, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes = rem // 60
+    if days:
+        return f"  resets in {days}d {hours}h"
+    if hours:
+        return f"  resets in {hours}h {minutes}m"
+    return f"  resets in {max(1, minutes)}m"
+
+
+def _tool_usage_lines(store) -> dict[int, list[str]]:
+    """Fetch usage for every slot of a tool store, in parallel.
+
+    Best-effort by design: any failure becomes a dimmed "usage unavailable"
+    line for that account, never a crash (the endpoints are undocumented and
+    rate-limited).
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    from claude_swap.tool_usage import ToolUsageError, fetch_usage
+
+    _, accounts = store.list_accounts()
+    slots = {a.number: store._slot_path(a.number) for a in accounts}
+
+    def _one(slot: int) -> list[str]:
+        try:
+            content = slots[slot].read_text(encoding="utf-8")
+            usage = fetch_usage(store.spec.key, content)
+        except (ToolUsageError, OSError) as e:
+            reason = str(e) if isinstance(e, ToolUsageError) else "unreadable"
+            return [dimmed(f"usage unavailable ({reason})")]
+        lines = []
+        for w in usage.windows:
+            lines.append(f"{w.label}: {w.pct:>3.0f}%{_format_resets_in(w.resets_at)}")
+        if usage.plan:
+            lines.insert(0, f"plan: {usage.plan}")
+        return lines or [dimmed("usage unavailable (no quota windows reported)")]
+
+    if not slots:
+        return {}
+    results: dict[int, list[str]] = {}
+    with ThreadPoolExecutor(max_workers=min(4, len(slots))) as pool:
+        for slot, lines in zip(slots, pool.map(_one, slots)):
+            results[slot] = lines
+    return results
+
+
+def _tool_command(tool: str, argv: list[str]) -> None:
+    """Handle `cswap codex|kimi add|switch|list|status|remove|run`.
+
+    Pre-dispatched before the main parser is built, like `run`/`auto` — the
+    tool namespaces are self-contained and must not disturb the established
+    Claude flag interface.
+    """
+    from claude_swap.tool_switcher import TOOLS, ToolAccountStore
+
+    spec = TOOLS[tool]
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} {tool}",
+        description=(
+            f"Manage {spec.display} accounts (credentials: "
+            f"{spec.env_home_var or '~/' + spec.default_home}). Data lives in "
+            f"<backup-root>/{tool}/, separate from Claude accounts."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=f"""
+Commands:
+  add [--slot N] [--label NAME]   snapshot the current login into a slot
+  switch [NUM|LABEL]              restore a slot as the live login (bare: rotate)
+  list                            show all slots with usage
+  status                          show which account is logged in
+  remove NUM|LABEL                remove a slot (live login untouched)
+  run NUM|LABEL [-- args]         launch {spec.binary} as an account, this
+                                  terminal only ({spec.env_home_var} session)
+
+Examples:
+  cswap {tool} add
+  cswap {tool} switch 2
+  cswap {tool} list
+  cswap {tool} run 2 -- --help
+        """,
+    )
+    parser.add_argument(
+        "command",
+        choices=("add", "switch", "list", "status", "remove", "run"),
+        help="Action to perform",
+    )
+    parser.add_argument(
+        "target",
+        nargs="?",
+        metavar="NUM|LABEL",
+        help="Account slot number or label (switch/remove/run)",
+    )
+    parser.add_argument("--slot", type=int, metavar="N", help="Slot number for 'add'")
+    parser.add_argument("--label", metavar="NAME", help="Display label for 'add'")
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON to stdout (with 'list' or 'status')",
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+
+    # Everything after `--` is forwarded to the tool verbatim (run only).
+    if "--" in argv:
+        split = argv.index("--")
+        head, forward = argv[:split], argv[split + 1 :]
+    else:
+        head, forward = argv, []
+    args = parser.parse_args(head)
+
+    if args.json and args.command not in ("list", "status"):
+        parser.error("--json can only be used with 'list' or 'status'")
+    if forward and args.command != "run":
+        parser.error("arguments after '--' are only forwarded with 'run'")
+    if args.command in ("remove", "run") and not args.target:
+        parser.error(f"'{args.command}' requires NUM|LABEL")
+
+    json_mode = args.json
+    try:
+        store = ToolAccountStore(tool)
+
+        if args.command == "add":
+            slot, label = store.add(slot=args.slot, label=args.label)
+            print(f"{accent('Added')} {spec.display} account {slot} ({label})")
+        elif args.command == "switch":
+            slot, label = store.switch(args.target)
+            print(f"{accent('Switched to')} {spec.display} account {slot} ({label})")
+            print(
+                dimmed(
+                    f"{spec.binary} picks up the new login on its next start."
+                )
+            )
+        elif args.command == "remove":
+            slot, label = store.remove(args.target)
+            print(f"{accent('Removed')} {spec.display} account {slot} ({label})")
+        elif args.command == "status":
+            slot, label = store.status()
+            if json_mode:
+                print(
+                    json.dumps(
+                        {
+                            "schemaVersion": 1,
+                            "tool": tool,
+                            "activeAccountNumber": slot,
+                            "label": label,
+                        },
+                        indent=2,
+                    )
+                )
+            elif slot is None:
+                print(f"{spec.display}: {label}")
+            else:
+                print(f"{spec.display}: account {slot} ({label}) {accent('[active]')}")
+        elif args.command == "list":
+            live_slot, accounts = store.list_accounts()
+            if json_mode:
+                usage_by_slot = _tool_usage_lines(store)
+                print(
+                    json.dumps(
+                        {
+                            "schemaVersion": 1,
+                            "tool": tool,
+                            "activeAccountNumber": live_slot,
+                            "accounts": [
+                                {
+                                    "number": a.number,
+                                    "label": a.label,
+                                    "active": a.active,
+                                    "usage": usage_by_slot.get(a.number, []),
+                                }
+                                for a in accounts
+                            ],
+                        },
+                        indent=2,
+                    )
+                )
+            else:
+                if not accounts:
+                    print(
+                        dimmed(
+                            f"No {spec.display} accounts stored. Log in with "
+                            f"'{spec.binary}', then run 'cswap {tool} add'."
+                        )
+                    )
+                    return
+                print(bolded(f"{spec.display} accounts:"))
+                usage_by_slot = _tool_usage_lines(store)
+                for a in accounts:
+                    marker = f" {accent('[active]')}" if a.active else ""
+                    print(f"  {a.number}: {a.label}{marker}")
+                    lines = usage_by_slot.get(a.number, [])
+                    for j, line in enumerate(lines):
+                        branch = "└" if j == len(lines) - 1 else "├"
+                        print(f"    {dimmed(branch)} {line}")
+        elif args.command == "run":
+            store.run_session(args.target, forward)
+            return  # only reachable in tests where exec/exit is mocked
+    except ClaudeSwitchError as e:
+        if json_mode:
+            print(json.dumps(error_envelope(e), indent=2))
+        else:
+            error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(
+            f"\n{dimmed('Operation cancelled')}",
+            file=sys.stderr if json_mode else sys.stdout,
+        )
+        sys.exit(130)
+
+
+def _runner_command(argv: list[str]) -> None:
+    """Handle ``cswap persistent start|stop|status|logs|priority``.
+
+    Pre-dispatched before the main parser, like ``run`` and ``auto``. The
+    persistent runner is a headless daemon that keeps working on a mission
+    across a configurable priority list of backends (Claude, Codex, Kimi,
+    OpenRouter Qwen, opencode free models, local /rig models), switching
+    automatically when one hits a quota wall.
+    """
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} persistent",
+        description="Start and control a persistent autonomous mission runner.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Commands:
+  start "mission"          start the daemon with a mission string
+  start -f mission.md      read the mission from a file
+  stop                     signal the daemon to pause
+  status                   show running state, backend, last error
+  logs [-n N]              tail the runner log (default 50 lines)
+  priority                 show the current backend priority list
+  priority --set A,B,C...  change the priority list
+
+Priority backends:
+  claude          Claude Code (uses best cswap account)
+  codex           Codex CLI (uses best cswap account)
+  kimi            Kimi Code CLI (uses best cswap account)
+  openrouter-qwen OpenRouter Qwen 3.8 (needs OPENROUTER_API_KEY)
+  opencode-free   opencode built-in free models
+  local           /rig ollama or llama-server (probes 11434/8080)
+
+Examples:
+  cswap persistent start "refactor auth.py into modules"
+  cswap persistent priority --set codex,kimi,claude,openrouter-qwen,opencode-free,local
+  cswap persistent stop
+        """,
+    )
+    parser.add_argument(
+        "command",
+        choices=("start", "stop", "status", "logs", "priority"),
+        help="Action to perform",
+    )
+    parser.add_argument(
+        "rest",
+        nargs="*",
+        help="Mission string for 'start' or values for 'priority'",
+    )
+    parser.add_argument(
+        "-f", "--file",
+        dest="file",
+        metavar="PATH",
+        help="Read mission from file (with 'start')",
+    )
+    parser.add_argument(
+        "-n", "--lines",
+        type=int,
+        default=50,
+        metavar="N",
+        help="Number of log lines to show (with 'logs')",
+    )
+    parser.add_argument(
+        "--set",
+        dest="set_value",
+        metavar="LIST",
+        help="Comma-separated backend list (with 'priority')",
+    )
+    parser.add_argument("--json", action="store_true", help="Machine-readable output")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+
+    from claude_swap import runner as runner_module
+
+    try:
+        if args.command == "start":
+            mission = ""
+            if args.file:
+                mission = Path(args.file).read_text(encoding="utf-8")
+            elif args.rest:
+                mission = " ".join(args.rest)
+            if not mission.strip():
+                parser.error("'start' requires a mission string or -f PATH")
+            pid = runner_module.start_daemon(mission)
+            print(f"{accent('Started')} persistent runner daemon (pid {pid})")
+            return
+
+        if args.command == "stop":
+            runner_module.stop_daemon()
+            print(accent("Stopped") + " persistent runner daemon")
+            return
+
+        if args.command == "status":
+            status = runner_module.runner_status()
+            if args.json:
+                print(json.dumps(status, indent=2))
+            else:
+                print(bolded("Persistent runner status"))
+                for key, value in status.items():
+                    print(f"  {key}: {value}")
+            return
+
+        if args.command == "logs":
+            text = runner_module.tail_logs(lines=args.lines)
+            if text:
+                print(text)
+            else:
+                print(dimmed("No runner logs yet"))
+            return
+
+        if args.command == "priority":
+            if args.set_value:
+                priority = [p.strip() for p in args.set_value.split(",") if p.strip()]
+                runner_module.set_priority(priority)
+                print(f"{accent('Priority set')}: {', '.join(priority)}")
+            else:
+                settings = runner_module._load_runner_settings()
+                print(bolded("Backend priority"))
+                for i, name in enumerate(settings.priority, 1):
+                    marker = " "
+                    state = runner_module.RunnerStore().load_state()
+                    if state.backend_index == i - 1:
+                        marker = accent(">")
+                    print(f"  {marker} {i}. {name}")
+            return
+    except ClaudeSwitchError as e:
+        if args.json:
+            print(json.dumps(error_envelope(e), indent=2))
+        else:
+            error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+
+
 def _use_native_tls() -> None:
     """Route TLS trust decisions through the OS-native verifier.
 
@@ -872,6 +1226,14 @@ def main() -> None:
     if argv and argv[0] == "auto":
         _auto_command(argv[1:])
         return  # only reachable in tests where sys.exit is mocked
+    # Persistent autonomous runner across all backends.
+    if argv and argv[0] == "persistent":
+        _runner_command(argv[1:])
+        return
+    # Per-tool namespaces for Codex / Kimi Code accounts.
+    if argv and argv[0] in ("codex", "kimi"):
+        _tool_command(argv[0], argv[1:])
+        return
     if len(sys.argv) > 1 and sys.argv[1] == "config":
         _config_command(sys.argv[2:])
         return
@@ -929,6 +1291,7 @@ Commands:
   %(prog)s swap <a> <b>               exchange two accounts' slot numbers
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
   %(prog)s auto                       auto-switch when nearing rate limits
+  %(prog)s persistent start "..."     autonomous runner with model fallback
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
   %(prog)s export <path>              export accounts
   %(prog)s import <path>              import accounts
@@ -937,6 +1300,10 @@ Commands:
   %(prog)s menubar                    macOS menu bar app
   %(prog)s upgrade                    self-upgrade to latest
   %(prog)s purge                      remove all claude-swap data
+
+Other tools (separate account stores):
+  %(prog)s codex add|switch|list|status|remove|run   manage Codex CLI accounts
+  %(prog)s kimi add|switch|list|status|remove|run    manage Kimi Code accounts
 
 Aliases: ls=list  rm=remove  update=upgrade""",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -950,6 +1317,8 @@ Aliases: ls=list  rm=remove  update=upgrade""",
   %(prog)s add-token sk-ant-oat01-... --email me@example.com
   %(prog)s run 2 -- --resume                 # forward args after '--' to claude
   %(prog)s auto --once                       # single auto-switch tick (cron-friendly)
+  %(prog)s persistent start "refactor auth"  # autonomous until stopped
+  %(prog)s persistent priority --set codex,kimi,openrouter-qwen,opencode-free,local
   %(prog)s config set autoswitch.threshold 80
 
 The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep working.
