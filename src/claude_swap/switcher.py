@@ -5444,7 +5444,8 @@ class ClaudeAccountSwitcher:
                   (the default) performs a plain rotation.
             models: Per-model weekly windows folded into every usage
                   comparison of the usage-aware strategies (parsed display
-                  names, or the ``all`` sentinel — see
+                  names, the ``all`` sentinel, or the ``spend`` sentinel for
+                  the monthly extra-usage spend limit — see
                   ``oauth.relevant_windows``). Empty = 5h/7d only.
             model_source: Where ``models`` came from (``"cli"`` or
                   ``"autoswitch.model"``) — announced up front so a config

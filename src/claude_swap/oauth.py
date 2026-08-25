@@ -510,11 +510,16 @@ def relevant_windows(
     Always the 5-hour ("5h") and 7-day ("7d") windows. When ``models`` is
     non-empty, each named per-model weekly ``scoped`` window is included too
     (matched case-insensitively on display name, e.g. "Fable"; the sentinel
-    ``all`` matches every scoped window the account reports). The single
+    ``all`` matches every scoped window the account reports). The reserved
+    sentinel ``spend`` additionally folds in the monthly extra-usage spend
+    limit as a ``("spend", pct, resets_at)`` window — the one axis that can
+    gate an account for a whole billing month. It must be asked for by name:
+    ``all`` matches only scoped *model* windows and deliberately does not
+    imply it (no real model is named "spend"), and without the sentinel the
+    spend axis stays excluded exactly as before. The single
     canonical window source for decisions, scheduling, and reset math — so a
     window that binds a decision can never be invisible to the scheduler.
-    ``spend`` (pay-as-you-go extra-usage credits) is a separate axis and is
-    deliberately excluded. ``resets_at`` is the ISO string as fetched, or
+    ``resets_at`` is the ISO string as fetched, or
     ``None`` when the API sent none.
     """
     if not isinstance(usage, dict):
@@ -537,6 +542,10 @@ def relevant_windows(
                     and (match_all or s["name"].lower() in wanted)
                 ):
                     windows.append((s["name"], float(s["pct"]), s.get("resets_at")))
+        if "spend" in wanted:
+            spend = usage.get("spend")
+            if isinstance(spend, dict) and isinstance(spend.get("pct"), (int, float)):
+                windows.append(("spend", float(spend["pct"]), spend.get("resets_at")))
     return windows
 
 
@@ -549,7 +558,10 @@ def account_headroom(
     gate requests. When ``models`` is non-empty, each named per-model weekly
     ``scoped`` window (see :func:`relevant_windows`) is folded in too: a model
     maxed at 100% blocks that model's work even with 5h/7d headroom, so for
-    someone pinned to that model it binds just as hard. Returns the headroom
+    someone pinned to that model it binds just as hard. The reserved
+    ``spend`` sentinel likewise folds in the monthly extra-usage spend limit:
+    an account at its monthly cap has zero headroom until the month resets,
+    however clear its 5h/7d windows look. Returns the headroom
     of the *binding* window (``100 - max(pct)``), so ``<= 0`` means the
     account is at or over a limit. Returns ``None`` when usage is unavailable
     or carries no window data, which callers treat as "unknown" (never

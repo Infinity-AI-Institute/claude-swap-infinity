@@ -133,7 +133,8 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         ),
         SettingSpec(
             "autoswitch", "model", "model", "string",
-            help="Also switch on these models' weekly limits (e.g. Fable, Fable,Opus, or all)",
+            help="Also switch on these models' weekly limits (e.g. Fable, Fable,Opus, or all); "
+            "add spend to also gate on the monthly extra-usage spend limit",
         ),
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),

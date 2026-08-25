@@ -50,6 +50,20 @@ class TestAccountHeadroom:
         usage = {"spend": {"pct": 99.0}, "five_hour": {"pct": 10.0}}
         assert oauth.account_headroom(usage) == 90.0
 
+    def test_spend_sentinel_gates_headroom(self):
+        # With the reserved sentinel, the monthly spend limit binds: an
+        # account near its monthly cap has almost no headroom, however clear
+        # its 5h/7d windows look.
+        usage = {"spend": {"pct": 99.0}, "five_hour": {"pct": 10.0}}
+        assert oauth.account_headroom(usage, ["spend"]) == 1.0
+
+    def test_spend_sentinel_alone_at_cap_is_zero(self):
+        assert oauth.account_headroom({"spend": {"pct": 100.0}}, ["spend"]) == 0.0
+
+    def test_all_sentinel_does_not_imply_spend(self):
+        usage = {"spend": {"pct": 99.0}, "five_hour": {"pct": 10.0}}
+        assert oauth.account_headroom(usage, ["all"]) == 90.0
+
     def test_no_window_data_is_unknown(self):
         assert oauth.account_headroom({"spend": {"pct": 50.0}}) is None
         assert oauth.account_headroom({}) is None
@@ -144,6 +158,32 @@ class TestRelevantWindows:
     def test_scoped_excluded_without_models(self):
         usage = {"five_hour": {"pct": 10.0}, "scoped": [{"name": "Fable", "pct": 99.0}]}
         assert oauth.relevant_windows(usage) == [("5h", 10.0, None)]
+
+    def test_spend_sentinel_includes_spend_window(self):
+        usage = {
+            "five_hour": {"pct": 10.0},
+            "spend": {"pct": 92.5, "resets_at": "2026-09-01T00:00:00Z"},
+        }
+        assert oauth.relevant_windows(usage, ["spend"]) == [
+            ("5h", 10.0, None),
+            ("spend", 92.5, "2026-09-01T00:00:00Z"),
+        ]
+
+    def test_spend_sentinel_is_case_insensitive(self):
+        usage = {"spend": {"pct": 50.0}}
+        assert oauth.relevant_windows(usage, ["SPEND"]) == [("spend", 50.0, None)]
+
+    def test_spend_excluded_without_sentinel_even_with_models(self):
+        usage = {"spend": {"pct": 99.0}, "scoped": [{"name": "Fable", "pct": 20.0}]}
+        assert oauth.relevant_windows(usage, ["Fable"]) == [("Fable", 20.0, None)]
+        assert oauth.relevant_windows(usage, ["all"]) == [("Fable", 20.0, None)]
+
+    def test_spend_sentinel_without_spend_data_adds_nothing(self):
+        # An account whose plan reports no spend axis (disabled or unlimited)
+        # contributes no spend window; the sentinel must not invent one.
+        assert oauth.relevant_windows({"five_hour": {"pct": 10.0}}, ["spend"]) == [
+            ("5h", 10.0, None)
+        ]
 
     def test_non_dict_usage_is_empty(self):
         assert oauth.relevant_windows(None) == []
