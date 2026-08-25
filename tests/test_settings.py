@@ -20,6 +20,7 @@ from claude_swap.settings import (
     load_settings,
     load_ui_settings,
     merged_with_cli,
+    parse_window_thresholds,
     save_settings,
     set_setting,
     settings_path,
@@ -355,3 +356,66 @@ class TestAtomicWriteThroughSymlink:
         assert (repo.stat().st_mode & 0o777) == 0o755, "foreign dir untouched"
         assert (live.stat().st_mode & 0o777) == 0o700, "our dir hardened"
         assert (tracked.stat().st_mode & 0o777) == 0o600, "file still 0600"
+
+
+class TestParseWindowThresholds:
+    """parse_window_thresholds: the strict `autoswitch.thresholds` parser.
+
+    Strict on purpose — these walls are what keeps an unattended fleet
+    inside its included limits, so a typo must raise (naming the bad part)
+    rather than silently disabling a wall.
+    """
+
+    def test_single_pair(self):
+        assert parse_window_thresholds("7d=98") == {"7d": 98.0}
+
+    def test_reserved_labels_combine(self):
+        assert parse_window_thresholds("5h=95,7d=98,spend=97") == {
+            "5h": 95.0, "7d": 98.0, "spend": 97.0,
+        }
+
+    def test_model_labels_are_lowercased(self):
+        assert parse_window_thresholds("Fable=96") == {"fable": 96.0}
+
+    def test_whitespace_and_case_are_normalized(self):
+        assert parse_window_thresholds("  5H = 95 ,  7D=98 ") == {
+            "5h": 95.0, "7d": 98.0,
+        }
+
+    def test_hundred_is_allowed(self):
+        assert parse_window_thresholds("7d=100") == {"7d": 100.0}
+
+    def test_none_and_empty_mean_no_overrides(self):
+        assert parse_window_thresholds(None) == {}
+        assert parse_window_thresholds("") == {}
+        assert parse_window_thresholds("   ") == {}
+
+    @pytest.mark.parametrize("bad", ["7d", "7d=", "=98", "7d:98"])
+    def test_shape_errors_name_the_bad_part(self, bad):
+        with pytest.raises(ValueError, match="label=pct"):
+            parse_window_thresholds(bad)
+
+    def test_malformed_part_in_a_valid_list_still_raises(self):
+        # A good pair beside the typo must not rescue it: the wall the typo
+        # was meant to configure would silently not exist.
+        with pytest.raises(ValueError, match="oops"):
+            parse_window_thresholds("5h=95,7d=oops")
+
+    def test_non_numeric_pct_raises(self):
+        with pytest.raises(ValueError, match="not a number"):
+            parse_window_thresholds("7d=ninety")
+
+    @pytest.mark.parametrize("bad", ["7d=0", "7d=-5", "7d=101"])
+    def test_out_of_range_pct_raises(self, bad):
+        with pytest.raises(ValueError, match="greater than 0 and at most 100"):
+            parse_window_thresholds(bad)
+
+    def test_trailing_comma_raises(self):
+        with pytest.raises(ValueError, match="label=pct"):
+            parse_window_thresholds("7d=98,")
+
+    def test_duplicate_label_raises(self):
+        # Case-insensitive: two spellings of one label are one label, and
+        # letting the later one win would hide which wall is in force.
+        with pytest.raises(ValueError, match="duplicate"):
+            parse_window_thresholds("7d=98,7D=95")

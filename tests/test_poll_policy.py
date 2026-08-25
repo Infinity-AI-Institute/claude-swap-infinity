@@ -313,3 +313,42 @@ class TestBudgetInvariants:
         # (which absorbs any overshoot) is considered.
         polls = poll_policy.ESCALATION_MARGIN_PCT / poll_policy.MOVEMENT_DELTA_PCT
         assert polls < 27
+
+
+class TestPerWindowWallEscalation:
+    """plan_after_fetch escalates against each window's own wall
+    (oauth.switch_margin with window_thresholds), not just the global
+    threshold — an axis held to a tighter wall pulls the urgent cadence in
+    exactly where it pulls the switch in."""
+
+    def _kwargs(self, **overrides):
+        # 7d burning 68 → 70: 20 points from the global 90 threshold
+        # (outside the escalation band), 10 points from a 7d=80 wall
+        # (inside it).
+        kwargs = dict(
+            prev_interval_s=poll_policy.MIN_INTERVAL_S,
+            prev_usage={"five_hour": {"pct": 40.0}, "seven_day": {"pct": 68.0}},
+            new_usage={"five_hour": {"pct": 40.0}, "seven_day": {"pct": 70.0}},
+            is_active=True,
+            threshold=90.0,
+        )
+        kwargs.update(overrides)
+        return kwargs
+
+    def test_wall_inside_the_band_goes_urgent(self):
+        _, interval = _plan(
+            **self._kwargs(window_thresholds={"7d": 80.0})
+        )
+        assert interval == poll_policy.URGENT_INTERVAL_S
+
+    def test_without_the_wall_the_same_burn_stays_calm(self):
+        # The companion measurement: identical usage, no per-window wall —
+        # movement halves toward the floor, never urgent.
+        _, interval = _plan(**self._kwargs())
+        assert interval == poll_policy.MIN_INTERVAL_S
+
+    def test_wall_still_outside_the_band_stays_calm(self):
+        _, interval = _plan(
+            **self._kwargs(window_thresholds={"7d": 95.0})
+        )
+        assert interval == poll_policy.MIN_INTERVAL_S

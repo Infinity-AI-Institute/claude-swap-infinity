@@ -43,7 +43,7 @@ from pathlib import Path
 from typing import ClassVar
 
 from claude_swap import oauth, poll_policy
-from claude_swap.exceptions import ClaudeSwitchError
+from claude_swap.exceptions import ClaudeSwitchError, ConfigError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.locking import FileLock
 from claude_swap.poll_policy import (
@@ -51,7 +51,12 @@ from claude_swap.poll_policy import (
     RESET_SLACK_S,
     binding_pct,
 )
-from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
+from claude_swap.settings import (
+    AutoSwitchSettings,
+    atomic_write_json,
+    parse_model_names,
+    parse_window_thresholds,
+)
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
 
@@ -593,25 +598,26 @@ def _binding_recovery_ts(
 
 def _every_account_above_threshold(
     candidates: Sequence[str],
-    headroom: dict[str, float | None],
-    active_headroom: float | None,
-    threshold: float,
+    margins: dict[str, float | None],
+    active_margin: float | None,
 ) -> bool:
-    """Whether the active account AND every measured candidate are at or over
-    the threshold — the state where "land somewhere healthy" has no answer.
+    """Whether the active account AND every measured candidate are at or past
+    their switch wall (``switch_margin <= 0``) — the state where "land
+    somewhere healthy" has no answer. With no per-window overrides this is
+    the old "at or over the threshold" verbatim.
 
-    Requires the active account's own headroom to be known: without it we do
+    Requires the active account's own margin to be known: without it we do
     not know we are in this state, and guessing here would relax the landing
     rule on an ordinary tick. An unmeasured candidate does not block the
     verdict (it may be healthy, but it cannot be *chosen* either — the caller
-    skips ``None`` headroom) as long as at least one candidate was measured.
+    skips unknown accounts) as long as at least one candidate was measured.
     """
-    if active_headroom is None or (100.0 - active_headroom) < threshold:
+    if active_margin is None or active_margin > 0:
         return False
-    measured = [headroom.get(n) for n in candidates if headroom.get(n) is not None]
+    measured = [margins.get(n) for n in candidates if margins.get(n) is not None]
     if not measured:
         return False
-    return all((100.0 - h) >= threshold for h in measured)
+    return all(m <= 0 for m in measured)
 
 
 def _ref(number: str, email: str) -> dict:
@@ -625,6 +631,46 @@ def _headroom_by_account(
     return {
         num: oauth.account_headroom(
             value if isinstance(value, dict) else None, models
+        )
+        for num, value in usage.items()
+    }
+
+
+def _margins_from_headroom(
+    headroom: dict[str, float | None], threshold: float
+) -> dict[str, float | None]:
+    """No-override margins derived from headroom: ``h - (100 - threshold)``.
+
+    The algebraic identity ``switch_margin`` reduces to without per-window
+    overrides — the compatibility fallback for direct callers of the ranking
+    helpers that predate per-window walls (tests included). The engine always
+    passes real margins computed by :func:`_margin_by_account`.
+    """
+    offset = 100.0 - threshold
+    return {
+        num: (None if h is None else h - offset) for num, h in headroom.items()
+    }
+
+
+def _margin_by_account(
+    usage: dict[str, dict | str | None],
+    models: tuple[str, ...],
+    threshold: float,
+    window_thresholds: dict[str, float],
+) -> dict[str, float | None]:
+    """Per-account switch margin derived from decision values.
+
+    The policy-side sibling of ``_headroom_by_account``: headroom keeps its
+    100%-hard-limit semantics for exhausted-detection, margins carry every
+    "past the switch threshold?" comparison so a per-window wall binds
+    everywhere the global threshold used to.
+    """
+    return {
+        num: oauth.switch_margin(
+            value if isinstance(value, dict) else None,
+            models,
+            threshold,
+            window_thresholds,
         )
         for num, value in usage.items()
     }
@@ -656,10 +702,50 @@ class AutoSwitchEngine:
         # pass everywhere usage windows are read — decisions, cadence, and
         # reset scheduling must all see the same axes.
         self._models = parse_model_names(settings.model)
+        # Per-window switch walls (label → pct) overriding the global
+        # threshold, parsed once like the model axes and passed everywhere a
+        # threshold comparison happens (decisions, cadence, escalation).
+        # STRICT: a malformed value must stop the engine here, not silently
+        # gate nothing while the fleet burns past a limit.
+        try:
+            self._window_thresholds = parse_window_thresholds(settings.thresholds)
+        except ValueError as e:
+            raise ConfigError(f"autoswitch.thresholds: {e}") from e
+        if self._window_thresholds:
+            _logger.info(
+                "Per-window switch thresholds in effect: %s (others at %s%%)",
+                ", ".join(
+                    f"{label}={pct:g}"
+                    for label, pct in self._window_thresholds.items()
+                ),
+                f"{settings.threshold:g}",
+            )
+            # A wall on an axis the window source never consults is inert —
+            # "spend" and model labels gate only when enabled via
+            # ``autoswitch.model`` (see oauth.relevant_windows). Same shape
+            # as the ``_check_model_names`` typo guard: warn loudly rather
+            # than let a configured-looking wall protect nothing.
+            model_axes = {m.lower() for m in self._models}
+            inert = [
+                label
+                for label in self._window_thresholds
+                if label not in ("5h", "7d")
+                and label not in model_axes
+                and not (label != "spend" and "all" in model_axes)
+            ]
+            if inert:
+                _logger.warning(
+                    "autoswitch.thresholds: %s gate(s) no window — the spend "
+                    "and per-model axes bind only when also listed in "
+                    "autoswitch.model, so these walls are inert until then",
+                    ", ".join(inert),
+                )
         # Poll plans written by the collector must key on the same threshold/
         # models the engine decides with (CLI overrides included), not on
         # whatever the settings file happens to say.
-        switcher.set_poll_policy_inputs(settings.threshold, self._models)
+        switcher.set_poll_policy_inputs(
+            settings.threshold, self._models, self._window_thresholds
+        )
         self.on_event = on_event
         self.dry_run = dry_run
         self.state_path = state_path or (switcher.backup_dir / STATE_FILENAME)
@@ -937,6 +1023,14 @@ class AutoSwitchEngine:
         entries, usage, headroom = self._collect_scheduled_usage(
             current, quarantined, threshold=settings.threshold
         )
+        # Margins to each account's nearest switch wall, beside the headroom
+        # map: headroom keeps answering "at the hard 100% limit?", margins
+        # answer every "past the switch threshold?" comparison below. With no
+        # per-window overrides the two orderings are identical (margin =
+        # headroom - (100 - threshold)).
+        margins = _margin_by_account(
+            usage, self._models, settings.threshold, self._window_thresholds
+        )
         self._emit(
             PollEvent(
                 active=active_ref,
@@ -973,20 +1067,21 @@ class AutoSwitchEngine:
             return TickOutcome.NO_ACTION
 
         active_headroom = headroom.get(current)
+        # None exactly together (both derive from the same window set); the
+        # margin carries the wall comparisons, the headroom the hard-limit
+        # ones.
+        active_margin = margins.get(current)
         if active_headroom is not None:
             self._unhealthy_ticks = 0
             self._idle_hold_since = None
             utilization = 100.0 - active_headroom
-            if utilization < settings.threshold:
+            if active_margin > 0:
                 if settings.strategy != "consume-first":
                     self._emit(
                         NoSwitchEvent(
                             reason="below-threshold",
-                            # Both sides through pct_label: .0f utilization could
-                            # display an impossible "100% < 99.9%".
-                            detail=(
-                                f"{pct_label(utilization)}% < "
-                                f"{pct_label(settings.threshold)}%"
+                            detail=self._below_wall_detail(
+                                utilization, active_margin, settings
                             ),
                         )
                     )
@@ -1071,7 +1166,7 @@ class AutoSwitchEngine:
         if (
             trigger == "consume-first"
             and not oauth_candidates
-            and active_headroom is not None
+            and active_margin is not None
         ):
             # Healthy below-threshold account with no OAuth peer to compare
             # against — the same state `best` reports as below-threshold
@@ -1084,9 +1179,8 @@ class AutoSwitchEngine:
             self._emit(
                 NoSwitchEvent(
                     reason="below-threshold",
-                    detail=(
-                        f"{pct_label(100.0 - active_headroom)}% < "
-                        f"{pct_label(settings.threshold)}%"
+                    detail=self._below_wall_detail(
+                        100.0 - active_headroom, active_margin, settings
                     ),
                 )
             )
@@ -1156,6 +1250,7 @@ class AutoSwitchEngine:
                 kw["settings"],
                 kw["now"],
                 kw["current"],
+                margins=kw["margins"],
             )
             no_return = self._no_return_account(
                 trigger,
@@ -1165,6 +1260,7 @@ class AutoSwitchEngine:
                 recovered,
                 kw["settings"],
                 kw["current"],
+                margins=kw["margins"],
             )
             ranked = self._rank_candidates(no_return=no_return, **kw)
             if no_return is not None and not ranked[0] and recovered:
@@ -1180,8 +1276,10 @@ class AutoSwitchEngine:
             oauth_candidates=oauth_candidates,
             usage=usage,
             headroom=headroom,
+            margins=margins,
             current=current,
             active_headroom=active_headroom,
+            active_margin=active_margin,
             settings=settings,
             now=decided_now,
         )
@@ -1203,7 +1301,11 @@ class AutoSwitchEngine:
             )
             usage = {num: entry.decision_value() for num, entry in entries.items()}
             headroom = _headroom_by_account(usage, self._models)
+            margins = _margin_by_account(
+                usage, self._models, settings.threshold, self._window_thresholds
+            )
             active_headroom = headroom.get(current)
+            active_margin = margins.get(current)
             decided_now = self.clock()
             ordered, any_known, active_reset_ts = _rank(
                 trigger=trigger,
@@ -1211,8 +1313,10 @@ class AutoSwitchEngine:
                 oauth_candidates=oauth_candidates,
                 usage=usage,
                 headroom=headroom,
+                margins=margins,
                 current=current,
                 active_headroom=active_headroom,
+                active_margin=active_margin,
                 settings=settings,
                 now=decided_now,
             )
@@ -1390,6 +1494,8 @@ class AutoSwitchEngine:
         recovered: bool,
         settings: AutoSwitchSettings,
         current: str | None = None,
+        *,
+        margins: dict[str, float | None] | None = None,
     ) -> str | None:
         """The account this engine most recently left, while it is still barred.
 
@@ -1469,6 +1575,10 @@ class AutoSwitchEngine:
         came_from = state.get("lastSwitchFrom")
         if trigger not in ("proactive", "consume-first") or came_from is None:
             return None
+        if margins is None and settings is not None:
+            # Direct callers without per-window margins get the no-override
+            # derivation, keeping their behavior byte-identical.
+            margins = _margins_from_headroom(headroom, settings.threshold)
         # Only while we are still standing where that switch put us. A manual
         # switch away already undid the move, so there is nothing left to
         # refuse to undo. `str` on both sides: `lastSwitchTo` is written from
@@ -1493,12 +1603,15 @@ class AutoSwitchEngine:
                     return None               # beats us outright; not a flip
             elif (
                 settings is not None
-                and left_headroom > 100.0 - settings.threshold
+                and margins is not None
+                and (left_margin := margins.get(barred)) is not None
+                and left_margin > 0
             ):
                 # An unreadable active must not be silently scored as "the
                 # peer does not beat it" -- same landing-eligible fallback
                 # `_left_account_recovered` uses when it, too, has no active
-                # to compare against.
+                # to compare against. Margin > 0 is the per-window spelling
+                # of the old `left_headroom > 100 - threshold`.
                 return None
         return barred
 
@@ -1511,6 +1624,8 @@ class AutoSwitchEngine:
         settings: AutoSwitchSettings,
         now: float,
         current: str | None = None,
+        *,
+        margins: dict[str, float | None] | None = None,
     ) -> bool:
         """Is the account we left a better proposition than when we left it?
 
@@ -1609,6 +1724,10 @@ class AutoSwitchEngine:
         escapes the account untouched, and the next successful switch
         overwrites the snapshot outright.
         """
+        if margins is None:
+            # Direct callers without per-window margins get the no-override
+            # derivation, keeping their behavior byte-identical.
+            margins = _margins_from_headroom(headroom, settings.threshold)
         came_from = state.get("lastSwitchFrom")
         if came_from is None:
             # Unreachable through `_no_return_account`, the only caller: it
@@ -1669,7 +1788,8 @@ class AutoSwitchEngine:
             # when a nearer window starts binding, never as a side effect
             # of the active spending down -- the failure mode a bare
             # dominance leg has, guarded directly in the mutation table.
-            if h is not None and h > 100.0 - settings.threshold:
+            barred_margin = margins.get(barred)
+            if barred_margin is not None and barred_margin > 0:
                 return True
             peer_recovery_ts = _binding_recovery_ts(usage.get(barred), self._models, now)
             active_recovery_ts = _binding_recovery_ts(usage.get(current), self._models, now)
@@ -1735,7 +1855,12 @@ class AutoSwitchEngine:
             if active_headroom is not None:
                 if h > active_headroom * HORIZON_HEADROOM_RATIO + SPENT_HEADROOM_PCT:
                     return True
-            elif h > 100.0 - settings.threshold:
+            elif (
+                (barred_margin := margins.get(barred)) is not None
+                and barred_margin > 0
+            ):
+                # Landing-eligible fallback, margin spelling (see the failover
+                # branch above).
                 return True
         if (
             isinstance(left_headroom, (int, float))
@@ -1765,6 +1890,8 @@ class AutoSwitchEngine:
         active_headroom: float | None,
         settings: AutoSwitchSettings,
         now: float,
+        margins: dict[str, float | None] | None = None,
+        active_margin: float | None = None,
     ) -> tuple[list[str], bool, float | None]:
         """Filter and rank OAuth candidates for this tick's trigger.
 
@@ -1772,7 +1899,19 @@ class AutoSwitchEngine:
         no state writes — so the consume-first two-phase commit can run it
         twice per tick: on the stored snapshot to decide provisionally, then
         on the escalated refetch to re-verify before switching.
+
+        ``margins``/``active_margin`` carry the per-window switch margins
+        (``oauth.switch_margin``) for every threshold comparison; omitted
+        (direct callers predating per-window walls), they derive from
+        ``headroom`` as the no-override identity.
         """
+        if margins is None:
+            margins = _margins_from_headroom(headroom, settings.threshold)
+            active_margin = (
+                None
+                if active_headroom is None
+                else active_headroom - (100.0 - settings.threshold)
+            )
         # consume-first ranks by soonest weekly reset; a proactive (below-
         # threshold) target must reset strictly sooner than where we are.
         active_reset_ts = (
@@ -1791,7 +1930,7 @@ class AutoSwitchEngine:
         # wins the normal way, and RECOVERY_HYSTERESIS_S below replaces the
         # percentage-point margin so two accounts in the 90s cannot ping-pong.
         all_above = _every_account_above_threshold(
-            oauth_candidates, headroom, active_headroom, settings.threshold
+            oauth_candidates, margins, active_margin
         )
         # "Is anything worth having?" — the most headroom any candidate with a
         # READABLE row offers. Two exclusions and no others:
@@ -1831,8 +1970,11 @@ class AutoSwitchEngine:
             if h is None:
                 continue
             any_known = True          # it EXISTS and is readable either way
+            # Non-None whenever h is (same window set); the wall-relative
+            # score for every threshold comparison below.
+            m = margins.get(num)
             if h <= 0:
-                continue  # itself at its limit — never a target
+                continue  # itself at its hard limit — never a target
             if num == no_return:
                 continue  # the account we just left; see _no_return_account
             reset_ts = (
@@ -1844,11 +1986,12 @@ class AutoSwitchEngine:
                 else 0.0
             )
             if trigger in ("proactive", "consume-first"):
-                # Landing must be healthy: an account at/over the threshold
-                # would re-trigger on the very next tick. At-limit and failover
-                # are escapes that skip this whole block — any account with real
-                # headroom beats a blocked or dead one.
-                if (100.0 - h) >= settings.threshold and not all_above:
+                # Landing must be healthy: an account at/past its own switch
+                # wall (margin <= 0) would re-trigger on the very next tick.
+                # At-limit and failover are escapes that skip this whole block
+                # — any account with real headroom beats a blocked or dead
+                # one.
+                if m <= 0 and not all_above:
                     continue
                 if all_above:
                     # Checked before the strategies, because with nothing below
@@ -1907,11 +2050,14 @@ class AutoSwitchEngine:
                         or reset_ts >= active_reset_ts
                     ):
                         continue
-                elif active_headroom is not None:
+                elif active_margin is not None:
                     # best: the candidate must beat the active account by the
                     # full hysteresis margin (a one-way move like 99%→89%
-                    # qualifies; near-line pairs can't flap back).
-                    if h - active_headroom < settings.hysteresis_pct:
+                    # qualifies; near-line pairs can't flap back). Margin
+                    # difference, not headroom difference, so a candidate is
+                    # judged safely-below relative to its OWN walls — with no
+                    # overrides the two differences are identical.
+                    if m - active_margin < settings.hysteresis_pct:
                         continue
             if all_above and trigger in ("proactive", "consume-first"):
                 # Ranked on the axis its own gate decided, and TIERED so the two
@@ -1943,7 +2089,9 @@ class AutoSwitchEngine:
                 # headroom breaks ties, then sequence order.
                 key = (reset_ts if reset_ts is not None else float("inf"), -h)
             else:
-                key = (-h,)
+                # best: widest margin to its nearest wall first — identical to
+                # most-headroom ordering when no per-window overrides exist.
+                key = (-m,)
             qualifying.append((key, num))
         # Ascending by the strategy's key; list order (sequence order) breaks ties.
         qualifying = qualifying or fallback
@@ -1967,7 +2115,9 @@ class AutoSwitchEngine:
         — never-fetched first, then oldest fetch); everyone else is served
         from the usage store. Phase B refetches ALL candidates and recomputes
         before any switch decision when a switch could be near: active
-        utilization within ``ESCALATION_MARGIN_PCT`` of the threshold, or
+        account within ``ESCALATION_MARGIN_PCT`` of its nearest switch wall
+        (``oauth.switch_margin`` — the global threshold unless a per-window
+        override binds), or
         active usage unknown (failover must not run on stale candidate data).
         At-limit, proactive, and ordinary unknown-usage failover selection
         never runs on the pre-escalation snapshot — those triggers imply the
@@ -2052,18 +2202,21 @@ class AutoSwitchEngine:
         usage = {num: entry.decision_value() for num, entry in entries.items()}
 
         active_value = usage.get(current)
-        active_headroom = oauth.account_headroom(
-            active_value if isinstance(active_value, dict) else None, self._models
-        )
         # The caller's tick-snapshotted threshold, so one tick fetches and
         # decides on the same value even if apply_threshold() lands mid-tick.
         if threshold is None:
             threshold = self.settings.threshold
+        active_margin = oauth.switch_margin(
+            active_value if isinstance(active_value, dict) else None,
+            self._models,
+            threshold,
+            self._window_thresholds,
+        )
         escalate = bool(candidates) and (
-            (active_headroom is None and active_value != USAGE_TOKEN_EXPIRED)
+            (active_margin is None and active_value != USAGE_TOKEN_EXPIRED)
             or (
-                active_headroom is not None
-                and 100.0 - active_headroom >= threshold - ESCALATION_MARGIN_PCT
+                active_margin is not None
+                and active_margin <= ESCALATION_MARGIN_PCT
             )
         )
         if escalate:
@@ -2173,6 +2326,25 @@ class AutoSwitchEngine:
 
     # -- helpers --------------------------------------------------------------
 
+    def _below_wall_detail(
+        self,
+        utilization: float,
+        active_margin: float,
+        settings: AutoSwitchSettings,
+    ) -> str:
+        """Narration for a below-threshold hold. Without per-window overrides
+        the classic ``94% < 90%`` comparison (both sides through pct_label:
+        .0f utilization could display an impossible "100% < 99.9%"); with
+        overrides that comparison can be false on its face — the binding
+        window's wall need not be the global threshold — so name the margin
+        to the nearest wall instead."""
+        if not self._window_thresholds:
+            return (
+                f"{pct_label(utilization)}% < "
+                f"{pct_label(settings.threshold)}%"
+            )
+        return f"{pct_label(active_margin)}% margin to the nearest wall"
+
     def _in_cooldown(self, state: dict) -> bool:
         last = state.get("lastSwitchAt")
         if not isinstance(last, (int, float)):
@@ -2281,7 +2453,9 @@ class AutoSwitchEngine:
         state) are fixed at construction. The frozen-settings swap is atomic
         and each tick snapshots ``self.settings`` once, so no locking."""
         self.settings = replace(self.settings, threshold=threshold)
-        self.switcher.set_poll_policy_inputs(threshold, self._models)
+        self.switcher.set_poll_policy_inputs(
+            threshold, self._models, self._window_thresholds
+        )
 
     def _next_delay(self, outcome: TickOutcome) -> float:
         interval = self.settings.interval_seconds

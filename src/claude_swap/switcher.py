@@ -84,7 +84,12 @@ from claude_swap.paths import (
 )
 from claude_swap.process_detection import get_running_instances
 from claude_swap import poll_policy
-from claude_swap.settings import load_settings, parse_model_names, settings_path
+from claude_swap.settings import (
+    load_settings,
+    parse_model_names,
+    parse_window_thresholds,
+    settings_path,
+)
 from claude_swap.usage_store import (
     FetchRecord,
     UsageEntry,
@@ -326,9 +331,14 @@ class ClaudeAccountSwitcher:
         self.lock_file = self.backup_dir / ".lock"
         self._logger = setup_logging(self.backup_dir, debug=debug)
         self._usage_store = UsageStore(self.backup_dir / "cache")
-        # (settings mtime, (threshold, models)) — see _poll_policy_inputs.
-        self._poll_inputs_cache: tuple[float | None, tuple[float, tuple[str, ...]]] | None = None
-        self._poll_inputs_override: tuple[float, tuple[str, ...]] | None = None
+        # (settings mtime, (threshold, models, window_thresholds)) — see
+        # _poll_policy_inputs.
+        self._poll_inputs_cache: tuple[
+            float | None, tuple[float, tuple[str, ...], dict[str, float]]
+        ] | None = None
+        self._poll_inputs_override: tuple[
+            float, tuple[str, ...], dict[str, float]
+        ] | None = None
 
         # The credential storage layer (active + per-account backup stores, macOS
         # Keychain-vs-file routing, the per-process capability cache). Reads its
@@ -1786,12 +1796,15 @@ class ClaudeAccountSwitcher:
         }
 
     def set_poll_policy_inputs(
-        self, threshold: float, models: tuple[str, ...]
+        self,
+        threshold: float,
+        models: tuple[str, ...],
+        window_thresholds: dict[str, float] | None = None,
     ) -> None:
-        """Pin the threshold/models poll planning keys on (set by a hosted
-        auto engine so cadence follows its effective, CLI-merged settings
-        instead of the settings file)."""
-        self._poll_inputs_override = (threshold, models)
+        """Pin the threshold/models/per-window-wall poll planning keys on
+        (set by a hosted auto engine so cadence follows its effective,
+        CLI-merged settings instead of the settings file)."""
+        self._poll_inputs_override = (threshold, models, dict(window_thresholds or {}))
 
     def clear_poll_policy_inputs(self) -> None:
         """Drop the hosted engine's pin so poll planning falls back to the
@@ -1800,10 +1813,17 @@ class ClaudeAccountSwitcher:
         engine it belonged to is gone."""
         self._poll_inputs_override = None
 
-    def _poll_policy_inputs(self) -> tuple[float, tuple[str, ...]]:
-        """Threshold + configured model names for poll planning: the hosting
-        engine's pinned values when present, else the settings file (reloaded
-        only when it changes — one stat per pass)."""
+    def _poll_policy_inputs(self) -> tuple[float, tuple[str, ...], dict[str, float]]:
+        """Threshold + configured model names + per-window walls for poll
+        planning: the hosting engine's pinned values when present, else the
+        settings file (reloaded only when it changes — one stat per pass).
+
+        The settings-file thresholds parse is forgiving here — warn and drop
+        the overrides — unlike the engine's strict one: this path only paces
+        polling for read-only surfaces (``cswap list``, the TUI), and a hand
+        edit must not crash them. The engine, which actually switches on the
+        walls, refuses to start on the same value.
+        """
         if self._poll_inputs_override is not None:
             return self._poll_inputs_override
         path = settings_path(self.backup_dir)
@@ -1814,7 +1834,15 @@ class ClaudeAccountSwitcher:
         if self._poll_inputs_cache is not None and self._poll_inputs_cache[0] == mtime:
             return self._poll_inputs_cache[1]
         loaded = load_settings(self.backup_dir)
-        inputs = (loaded.threshold, parse_model_names(loaded.model))
+        try:
+            window_thresholds = parse_window_thresholds(loaded.thresholds)
+        except ValueError as e:
+            self._logger.warning(
+                f"autoswitch.thresholds is malformed ({e}); ignoring the "
+                "per-window overrides for poll planning"
+            )
+            window_thresholds = {}
+        inputs = (loaded.threshold, parse_model_names(loaded.model), window_thresholds)
         self._poll_inputs_cache = (mtime, inputs)
         return inputs
 
@@ -4619,7 +4647,7 @@ class ClaudeAccountSwitcher:
         info_by_num = {str(info[0]): info for info in accounts_info}
         # Scoped-window models so the 429-stale trust bound honors per-model
         # (e.g. Fable) resets, matching the poll planner's window view.
-        _threshold, models = self._poll_policy_inputs()
+        _threshold, models, _window_thresholds = self._poll_policy_inputs()
         sentinels: dict[str, str] = {}
         for num, info in info_by_num.items():
             static = self._static_usage_sentinel(info)
@@ -4826,7 +4854,7 @@ class ClaudeAccountSwitcher:
         for when the backoff lifts.
         """
         now = self._usage_store.clock()
-        threshold, models = self._poll_policy_inputs()
+        threshold, models, window_thresholds = self._poll_policy_inputs()
         plans: dict[str, tuple[float | None, float | None]] = {}
         for num, rec in records.items():
             if rec.sentinel is not None or rec.error is not None:
@@ -4842,6 +4870,7 @@ class ClaudeAccountSwitcher:
                 models=models,
                 recent_429=recent_429,
                 now=now,
+                window_thresholds=window_thresholds,
             )
         return plans
 
@@ -4920,28 +4949,35 @@ class ClaudeAccountSwitcher:
         current_num: str | None,
         models: tuple[str, ...] = (),
         usage: dict | None = None,
+        threshold: float = 90.0,
+        window_thresholds: dict[str, float] | None = None,
     ) -> tuple[str | None, str]:
         """Decide the ``best`` strategy target relative to the current account.
 
-        Compares the rate-limit headroom of every *other* switchable account
-        against the current one and only recommends a switch it can *prove*
-        lands on strictly more headroom — never onto an account worse than (or
-        merely unverifiable against) where the user already is. When a switch
-        can't be proven beneficial, it stays put; bare ``cswap --switch``
-        remains the way to force a plain rotation. ``models`` folds the named
-        per-model weekly windows into every headroom comparison (see
-        ``oauth.account_headroom``). Returns ``(target, note)``:
+        Compares the *switch margin* (``oauth.switch_margin`` — percentage
+        points to the nearest switch wall, per-window overrides applied) of
+        every *other* switchable account against the current one and only
+        recommends a switch it can *prove* lands strictly further from a wall
+        — never onto an account worse than (or merely unverifiable against)
+        where the user already is. With no ``window_thresholds`` the margin
+        ordering is exactly the headroom ordering this used to rank by. When
+        a switch can't be proven beneficial, it stays put; bare
+        ``cswap --switch`` remains the way to force a plain rotation.
+        ``models`` folds the named per-model weekly windows into every
+        comparison (see ``oauth.relevant_windows``). Returns
+        ``(target, note)``:
 
-        - ``(num, "")`` — switch to ``num`` (strictly more headroom than current)
+        - ``(num, "")`` — switch to ``num`` (strictly more margin than current)
         - ``(None, "current-unavailable")`` — current account's usage is unknown,
           so no comparison is possible → stay
         - ``(None, "no-comparison")`` — no other account has known usage → stay
         - ``(None, "incomplete-comparison")`` — current is best among the
           accounts we can measure, but some candidate's usage is unknown, so we
           can't claim it's the best or that everything is exhausted → stay
-        - ``(None, "stay")`` — current account provably has the most headroom
+        - ``(None, "stay")`` — current account provably has the most margin
         - ``(None, "exhausted")`` — current is the best and every account is at
-          its limit (switching would not help) → stay
+          or past its own wall (margin <= 0: unusable for unattended work even
+          below 100%, so switching would not help) → stay
         - ``(None, "none")`` — no other switchable account exists
 
         Ties (including current-vs-other) resolve in favour of staying put.
@@ -4959,30 +4995,38 @@ class ClaudeAccountSwitcher:
 
         if usage is None:
             usage = self._usage_by_account()
-        current_headroom = oauth.account_headroom(usage.get(str(current_num)), models)
-        if current_headroom is None:
+        current_margin = oauth.switch_margin(
+            usage.get(str(current_num)), models, threshold, window_thresholds
+        )
+        if current_margin is None:
             # Can't measure where the user is → can't prove any target is
             # better. Stay rather than risk moving onto a worse account.
             return None, "current-unavailable"
 
         scored = [
-            (oauth.account_headroom(usage.get(num), models), num) for num in others
+            (
+                oauth.switch_margin(
+                    usage.get(num), models, threshold, window_thresholds
+                ),
+                num,
+            )
+            for num in others
         ]
-        known = [(h, num) for h, num in scored if h is not None]
+        known = [(m, num) for m, num in scored if m is not None]
         if not known:
             return None, "no-comparison"
 
         # max() keeps the first maximal element; `known` preserves rotation
         # order, so ties resolve to the earliest slot.
-        best_headroom, best_num = max(known, key=lambda t: t[0])
-        if best_headroom > current_headroom:
+        best_margin, best_num = max(known, key=lambda t: t[0])
+        if best_margin > current_margin:
             return best_num, ""
 
         # Current is at least as good as every account we can measure. Stay —
         # but only claim "all exhausted" when every candidate's usage is known.
-        if any(h is None for h, _ in scored):
+        if any(m is None for m, _ in scored):
             return None, "incomplete-comparison"
-        if current_headroom <= 0:
+        if current_margin <= 0:
             return None, "exhausted"
         return None, "stay"
 
@@ -5433,15 +5477,17 @@ class ClaudeAccountSwitcher:
         json_output: bool = False,
         models: tuple[str, ...] = (),
         model_source: str | None = None,
+        threshold: float = 90.0,
+        window_thresholds: dict[str, float] | None = None,
     ) -> dict | None:
         """Switch to next account in sequence.
 
         Args:
             strategy: Usage-aware target selection. ``"best"`` jumps to the
-                  switchable account with the most remaining 5h/7d quota instead
+                  switchable account with the widest switch margin instead
                   of advancing the rotation; ``"next-available"`` rotates to the
-                  next account, skipping any currently at its 5h/7d limit. ``None``
-                  (the default) performs a plain rotation.
+                  next account, skipping any currently at or past its switch
+                  wall. ``None`` (the default) performs a plain rotation.
             models: Per-model weekly windows folded into every usage
                   comparison of the usage-aware strategies (parsed display
                   names, the ``all`` sentinel, or the ``spend`` sentinel for
@@ -5450,6 +5496,13 @@ class ClaudeAccountSwitcher:
             model_source: Where ``models`` came from (``"cli"`` or
                   ``"autoswitch.model"``) — announced up front so a config
                   fallback silently steering the pick is impossible.
+            threshold: The global switch wall the usage-aware strategies score
+                  margins against (``oauth.switch_margin``); the CLI passes
+                  ``autoswitch.threshold``. Ignored by plain rotation.
+            window_thresholds: Per-window walls overriding ``threshold``
+                  (parsed ``autoswitch.thresholds``); a window without an
+                  override keeps the global wall. Empty/None = global wall
+                  everywhere.
 
         ``"best"`` only switches when it can prove another account has more
         remaining quota; if usage can't be fetched or no candidate is provably
@@ -5590,7 +5643,7 @@ class ClaudeAccountSwitcher:
             best_usage = self._usage_by_account()
             self._warn_inert_models(best_usage, models, json_output, warnings)
             target, note = self._select_best_switchable(
-                current_num, models, best_usage
+                current_num, models, best_usage, threshold, window_thresholds
             )
             if target is not None:
                 op = self._perform_switch(target, emit_output=not json_output)
@@ -5659,8 +5712,12 @@ class ClaudeAccountSwitcher:
                 )
                 return None
             if note == "exhausted":
-                # With model limits in play the binding window may be scoped.
-                limits_label = "usage limits" if models else "5h/7d limit"
+                # With model limits in play the binding window may be scoped;
+                # with per-window walls "limit" means the configured wall, not
+                # necessarily 100%.
+                limits_label = (
+                    "usage limits" if models or window_thresholds else "5h/7d limit"
+                )
                 if json_output:
                     return self._switch_noop(
                         strategy=strategy_label, reason="candidates-exhausted",
@@ -5724,19 +5781,30 @@ class ClaudeAccountSwitcher:
                     )
                 continue
             if strategy == "next-available":
-                headroom = oauth.account_headroom(usage.get(candidate), models)
-                if headroom is not None and headroom <= 0:
+                margin = oauth.switch_margin(
+                    usage.get(candidate), models, threshold, window_thresholds
+                )
+                if margin is not None and margin <= 0:
                     skipped_exhausted.append(candidate)
                     label = "5h/7d"
-                    if models:
+                    if models or window_thresholds:
                         # Name what actually binds ("Fable", "5h/Fable", ...)
-                        # so a config-driven skip is never mysterious.
+                        # so a config-driven skip is never mysterious. With
+                        # per-window walls a window is "at limit" at its own
+                        # wall (override, else the global threshold — some
+                        # window is, or the skip would not have fired);
+                        # without them keep the literal 100% reading.
+                        walls = window_thresholds or {}
                         at = [
                             name
                             for name, pct, _ in oauth.relevant_windows(
                                 usage.get(candidate), models
                             )
-                            if pct >= 100.0
+                            if pct >= (
+                                walls.get(name.lower(), threshold)
+                                if walls
+                                else 100.0
+                            )
                         ]
                         if at:
                             label = "/".join(at)
@@ -5754,8 +5822,11 @@ class ClaudeAccountSwitcher:
         # account would not help, so stay on the current one instead.
         if next_account is None and skipped_exhausted:
             # With model limits in play the binding window may be a scoped
-            # one (the per-skip lines name it), so don't claim "5h/7d".
-            limits_label = "usage limits" if models else "5h/7d limit"
+            # one (the per-skip lines name it), so don't claim "5h/7d" — and
+            # with per-window walls "limit" means the configured wall.
+            limits_label = (
+                "usage limits" if models or window_thresholds else "5h/7d limit"
+            )
             if json_output:
                 return self._switch_noop(
                     strategy=strategy_label, reason="candidates-exhausted",

@@ -7,6 +7,8 @@ import urllib.error
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from claude_swap import oauth
 
 
@@ -136,6 +138,107 @@ class TestAccountHeadroom:
         }
         assert oauth.account_headroom(usage, ["all"]) == 3.0
         assert oauth.account_headroom(usage, ["ALL"]) == 3.0
+
+
+
+class TestSwitchMargin:
+    """switch_margin: percentage points to the nearest switch wall.
+
+    account_headroom keeps the hard 100% semantics; this is the policy-side
+    distance, with an optional per-window wall overriding the global
+    threshold per axis.
+    """
+
+    def test_no_overrides_is_threshold_minus_binding_pct(self):
+        usage = {"five_hour": {"pct": 80.0}, "seven_day": {"pct": 20.0}}
+        assert oauth.switch_margin(usage) == 10.0
+        assert oauth.switch_margin(usage, threshold=95.0) == 15.0
+        assert oauth.switch_margin(usage, threshold=80.0) == 0.0
+        assert oauth.switch_margin(usage, threshold=70.0) == -10.0
+
+    def test_no_overrides_tracks_account_headroom_on_every_shape(self):
+        """margin == headroom - (100 - threshold) for every usage shape the
+        window source emits — scoped models and the spend sentinel included —
+        so every refactored `margin <= 0` comparison is the old
+        `pct >= threshold` verbatim."""
+        shapes = [
+            ({"five_hour": {"pct": 42.0}, "seven_day": {"pct": 97.0}}, ()),
+            ({"five_hour": {"pct": 42.0}}, ()),
+            (
+                {
+                    "five_hour": {"pct": 10.0},
+                    "scoped": [{"name": "Fable", "pct": 95.0}],
+                },
+                ("Fable",),
+            ),
+            (
+                {"five_hour": {"pct": 10.0}, "spend": {"pct": 96.0}},
+                ("spend",),
+            ),
+            (
+                {
+                    "five_hour": {"pct": 88.0},
+                    "seven_day": {"pct": 12.0},
+                    "scoped": [{"name": "Opus", "pct": 50.0}],
+                    "spend": {"pct": 30.0},
+                },
+                ("all", "spend"),
+            ),
+        ]
+        for usage, models in shapes:
+            headroom = oauth.account_headroom(usage, models)
+            margin = oauth.switch_margin(usage, models, threshold=90.0)
+            assert margin == headroom - 10.0, (usage, models)
+
+    def test_per_window_wall_binds_on_its_own_axis(self):
+        walls = {"5h": 95.0, "7d": 98.0}
+        def usage(p7):
+            return {"five_hour": {"pct": 10.0}, "seven_day": {"pct": p7}}
+        # 7d at 97.9 is under its 98 wall by a sliver; at 98 it is on it.
+        assert oauth.switch_margin(
+            usage(97.9), threshold=90.0, window_thresholds=walls
+        ) == pytest.approx(0.1)
+        assert oauth.switch_margin(
+            usage(98.0), threshold=90.0, window_thresholds=walls
+        ) == 0.0
+
+    def test_5h_wall_binds_even_with_7d_clear(self):
+        walls = {"5h": 95.0, "7d": 98.0}
+        usage = {"five_hour": {"pct": 95.0}, "seven_day": {"pct": 10.0}}
+        assert oauth.switch_margin(
+            usage, threshold=90.0, window_thresholds=walls
+        ) == 0.0
+
+    def test_window_without_override_keeps_the_global_threshold(self):
+        usage = {"five_hour": {"pct": 89.0}, "seven_day": {"pct": 10.0}}
+        assert oauth.switch_margin(
+            usage, threshold=90.0, window_thresholds={"7d": 98.0}
+        ) == 1.0
+
+    def test_model_wall_matches_display_name_case_insensitively(self):
+        usage = {
+            "five_hour": {"pct": 10.0},
+            "scoped": [{"name": "Fable", "pct": 97.0}],
+        }
+        assert oauth.switch_margin(
+            usage, ["Fable"], threshold=90.0, window_thresholds={"fable": 96.0}
+        ) == -1.0
+
+    def test_spend_wall_gates_the_spend_axis(self):
+        usage = {"five_hour": {"pct": 10.0}, "spend": {"pct": 96.5}}
+        assert oauth.switch_margin(
+            usage, ["spend"], threshold=90.0, window_thresholds={"spend": 97.0}
+        ) == pytest.approx(0.5)
+
+    def test_no_window_data_is_unknown(self):
+        """Same None contract as account_headroom: unknown, never zero."""
+        assert oauth.switch_margin(None) is None
+        assert oauth.switch_margin({}) is None
+        # A spend entry without the sentinel gates nothing — still unknown.
+        assert oauth.switch_margin({"spend": {"pct": 50.0}}) is None
+        assert oauth.switch_margin(
+            {}, window_thresholds={"7d": 98.0}
+        ) is None
 
 
 class TestRelevantWindows:

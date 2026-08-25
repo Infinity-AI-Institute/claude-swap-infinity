@@ -573,6 +573,38 @@ def account_headroom(
     return 100.0 - max(pcts)
 
 
+def switch_margin(
+    usage: dict | None,
+    models: Sequence[str] = (),
+    threshold: float = 90.0,
+    window_thresholds: dict[str, float] | None = None,
+) -> float | None:
+    """Percentage points until the nearest *switch wall*; negative = past it.
+
+    Where :func:`account_headroom` measures distance to the hard 100% limit
+    (its ``<= 0`` is literal exhaustion — keep using it for that), this
+    measures distance to the switch *policy*: the minimum over every gating
+    window (see :func:`relevant_windows`) of ``T_w - pct_w``, where ``T_w``
+    is ``window_thresholds[label.lower()]`` when present, else ``threshold``.
+    Per-window walls let each axis bind on its own margin — a weekly window
+    held to 98% while the fast-recovering 5h one runs to 95% — so an
+    unattended fleet never crosses any single included limit. Reserved labels
+    ("5h", "7d", "spend") are already lowercase; model display names compare
+    case-insensitively. With no overrides this is ``threshold - max(pct)``,
+    so ``margin <= 0`` is exactly the old ``max(pct) >= threshold``. Returns
+    ``None`` when usage carries no window data (same contract as
+    ``account_headroom``: "unknown", never auto-skipped).
+    """
+    walls = window_thresholds or {}
+    margins = [
+        walls.get(label.lower(), threshold) - pct
+        for label, pct, _ in relevant_windows(usage, models)
+    ]
+    if not margins:
+        return None
+    return min(margins)
+
+
 @dataclass(frozen=True)
 class UsageOutcome:
     """Result of a usage-API fetch attempt.

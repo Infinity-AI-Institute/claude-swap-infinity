@@ -3961,7 +3961,7 @@ class TestDeadTokenQuarantine:
 
         switcher = ClaudeAccountSwitcher()
         switcher._setup_directories()
-        switcher._poll_inputs_override = (90.0, ("Fable",))
+        switcher._poll_inputs_override = (90.0, ("Fable",), {})
         store = switcher._usage_store
         now = time.time()
 
@@ -5709,6 +5709,94 @@ class TestUsageAwareSwitch:
             s.switch(strategy="next-available")
 
         # Anchored on the live account (2) → next is 3, not 2 (a no-op).
+        assert s._get_sequence_data()["activeAccountNumber"] == 3
+
+    def test_best_scores_margins_against_per_window_walls(self, temp_home: Path):
+        """With `autoswitch.thresholds` in play, `best` ranks by distance to
+        each account's nearest wall (oauth.switch_margin), not raw headroom.
+        Account 3 holds the most headroom (12 pts) but only 2 pts of margin
+        to the global 90 wall; account 2's binding window is the 7d one,
+        4 pts under its own 98 wall — the widest margin wins. The old
+        headroom ranking would have picked 3."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._seed(s, 3, "c@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+
+        usage = {
+            # margin 0.5 to the global 90 wall (headroom 10.5)
+            "1": {"five_hour": {"pct": 89.5}, "seven_day": {"pct": 0.0}},
+            # margin 4.0 to the 7d=98 wall (headroom 6 — least of the fleet)
+            "2": {"five_hour": {"pct": 0.0}, "seven_day": {"pct": 94.0}},
+            # margin 2.0 to the global 90 wall (headroom 12 — most)
+            "3": {"five_hour": {"pct": 88.0}, "seven_day": {"pct": 0.0}},
+        }
+        with patch.object(s, "_usage_by_account", return_value=usage), \
+             patch.object(s, "list_accounts"):
+            s.switch(
+                strategy="best",
+                threshold=90.0,
+                window_thresholds={"7d": 98.0},
+            )
+
+        assert s._get_sequence_data()["activeAccountNumber"] == 2
+
+    def test_best_all_past_their_walls_is_exhausted_below_100(
+        self, temp_home: Path, capsys
+    ):
+        """Fleet policy: an account past its own wall is unusable even below
+        100%. Every account past the 7d=98 wall (none at a literal limit) →
+        the candidates-exhausted no-op, staying put."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+
+        usage = {
+            "1": {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 98.2}},
+            "2": {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 99.0}},
+        }
+        with patch.object(s, "_usage_by_account", return_value=usage), \
+             patch.object(s, "list_accounts") as mock_list:
+            s.switch(
+                strategy="best",
+                threshold=90.0,
+                window_thresholds={"7d": 98.0},
+            )
+
+        out = capsys.readouterr().out
+        assert "All accounts are at their usage limits" in out
+        assert s._get_sequence_data()["activeAccountNumber"] == 1
+        mock_list.assert_not_called()
+
+    def test_next_available_skips_account_past_its_wall(
+        self, temp_home: Path, capsys
+    ):
+        """The rotation skip honors per-window walls: account 2 at 98.5% of
+        the weekly window is under 100% but past its 98 wall — skipped, and
+        the skip names the binding window's wall, not a literal limit."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._seed(s, 3, "c@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+
+        usage = {
+            "1": self._usage(0),
+            "2": {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 98.5}},
+            "3": self._usage(20),
+        }
+        with patch.object(s, "_usage_by_account", return_value=usage), \
+             patch.object(s, "list_accounts"):
+            s.switch(
+                strategy="next-available",
+                threshold=90.0,
+                window_thresholds={"7d": 98.0},
+            )
+
+        out = capsys.readouterr().out
+        assert "Skipping Account-2 (at 7d limit)" in out
         assert s._get_sequence_data()["activeAccountNumber"] == 3
 
 

@@ -199,7 +199,8 @@ class TestCLI:
             cli.main()
 
         switcher_cls.return_value.switch.assert_called_once_with(
-            strategy="best", json_output=False, models=(), model_source=None
+            strategy="best", json_output=False, models=(), model_source=None,
+            threshold=90.0, window_thresholds={},
         )
 
     def test_switch_strategy_falls_back_to_configured_model(self):
@@ -218,6 +219,7 @@ class TestCLI:
         switcher_cls.return_value.switch.assert_called_once_with(
             strategy="best", json_output=False,
             models=("Fable",), model_source="autoswitch.model",
+            threshold=90.0, window_thresholds={},
         )
 
     def test_switch_model_flag_overrides_setting(self):
@@ -238,6 +240,7 @@ class TestCLI:
         switcher_cls.return_value.switch.assert_called_once_with(
             strategy="next-available", json_output=False,
             models=("Opus", "Fable"), model_source="cli",
+            threshold=90.0, window_thresholds={},
         )
 
     def test_switch_model_without_strategy_is_rejected(self, capsys):
@@ -257,7 +260,8 @@ class TestCLI:
             cli.main()
 
         switcher_cls.return_value.switch.assert_called_once_with(
-            strategy=None, json_output=False, models=(), model_source=None
+            strategy=None, json_output=False, models=(), model_source=None,
+            threshold=90.0, window_thresholds=None,
         )
 
     def test_slot_flag_requires_add_account(self, capsys):
@@ -737,7 +741,8 @@ class TestSubcommandAliases:
              patch("claude_swap.update_check.check_for_update", return_value=None):
             cli.main()
         switcher_cls.return_value.switch.assert_called_once_with(
-            strategy=None, json_output=False, models=(), model_source=None
+            strategy=None, json_output=False, models=(), model_source=None,
+            threshold=90.0, window_thresholds=None,
         )
 
     def test_list_subcommand_with_json(self):
@@ -829,12 +834,15 @@ class TestJsonOutputCli:
 
         switcher_cls.return_value.switch.assert_called_once_with(
             strategy=None, json_output=True, models=(), model_source=None,
+            threshold=90.0, window_thresholds=None,
         )
         assert json.loads(capsys.readouterr().out) == payload
 
     def test_switch_json_carries_model_fields_when_in_effect(self, capsys):
         """Additive models/modelSource fields make a model-steered pick
         auditable from scripts too."""
+        from claude_swap.settings import AutoSwitchSettings
+
         payload = {"schemaVersion": 1, "switched": True}
         with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
              patch.object(sys, "argv", [
@@ -842,6 +850,8 @@ class TestJsonOutputCli:
                  "--model", "Fable", "--json",
              ]), \
              patch("os.geteuid", return_value=1000, create=True), \
+             patch("claude_swap.settings.load_settings",
+                   return_value=AutoSwitchSettings()), \
              patch("claude_swap.update_check.check_for_update", return_value=None):
             switcher_cls.return_value.switch.return_value = payload
             cli.main()
