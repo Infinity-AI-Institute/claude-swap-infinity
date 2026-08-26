@@ -77,7 +77,34 @@ class UiSettings:
     theme: str = "auto"
 
 
-_SECTION_DEFAULT_SOURCES = {"autoswitch": AutoSwitchSettings, "ui": UiSettings}
+@dataclass(frozen=True)
+class CodexSettings:
+    """Knobs for the Codex session handoff (``cswap codex handoff|watch``).
+
+    ``None`` string fields mean "not configured": ``home`` falls back to
+    ``$CODEX_HOME`` / ``~/.codex`` (``codex_accounts.resolve_codex_home``),
+    ``wrapup_message`` falls back to the built-in default text
+    (``codex_handoff.DEFAULT_WRAPUP_MESSAGE``), and ``resume_args`` to no
+    extra arguments. ``tmux_target`` deliberately has NO fallback — the
+    handoff refuses to run without it rather than guess which pane holds a
+    live agent (see ``codex_handoff``). The walls the handoff evaluates are
+    not here: it reuses ``autoswitch.threshold`` / ``autoswitch.thresholds``
+    so Codex and Claude rotation honour one policy.
+    """
+
+    home: str | None = None
+    tmux_target: str | None = None
+    wrapup_message: str | None = None
+    wrapup_grace_s: int = 120
+    resume_args: str | None = None
+    poll_interval_s: int = 300
+
+
+_SECTION_DEFAULT_SOURCES = {
+    "autoswitch": AutoSwitchSettings,
+    "ui": UiSettings,
+    "codex": CodexSettings,
+}
 
 
 @dataclass(frozen=True)
@@ -156,6 +183,38 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
             help="Color theme; auto follows the terminal background",
         ),
+        # Codex handoff keys. JSON keys are snake_case, matching the dotted
+        # names the handoff's operational docs/cron lines use verbatim
+        # (codex.tmux_target, ...), unlike the older camelCase autoswitch
+        # section — a deliberate interface choice, not drift.
+        SettingSpec(
+            "codex", "home", "home", "string",
+            help="Codex home directory (default: $CODEX_HOME, else ~/.codex)",
+        ),
+        SettingSpec(
+            "codex", "tmux_target", "tmux_target", "string",
+            help="tmux pane running the codex TUI (e.g. main:agent.0); "
+            "required for handoff/watch — never guessed",
+        ),
+        SettingSpec(
+            "codex", "wrapup_message", "wrapup_message", "string",
+            help="Wrap-up text pasted to the agent before a handoff "
+            "(default: built-in message)",
+        ),
+        SettingSpec(
+            "codex", "wrapup_grace_s", "wrapup_grace_s", "int", 0, 3600,
+            help="Seconds to wait for the agent to go quiescent before "
+            "stopping the TUI",
+        ),
+        SettingSpec(
+            "codex", "resume_args", "resume_args", "string",
+            help="Extra arguments appended verbatim to 'codex resume <id>' "
+            "(e.g. --model gpt-5.6-sol)",
+        ),
+        SettingSpec(
+            "codex", "poll_interval_s", "poll_interval_s", "int", 15, 86400,
+            help="Poll interval for the cswap codex watch loop, in seconds",
+        ),
     )
 }
 
@@ -226,8 +285,9 @@ def parse_window_thresholds(value: str | None) -> dict[str, float]:
     return thresholds
 
 
-def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
-    """Clamp values into the SETTING_SPECS ranges; bad types → the default."""
+def _clamped_section(settings, section: str):
+    """Clamp one section's values into the SETTING_SPECS ranges; bad types →
+    the default. ``settings`` is that section's dataclass instance."""
 
     def num(value, default: float, lo: float, hi: float) -> float:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -236,7 +296,7 @@ def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
 
     kwargs = {}
     for spec in SETTING_SPECS.values():
-        if spec.section != "autoswitch":
+        if spec.section != section:
             continue
         value = getattr(settings, spec.field)
         if spec.kind in ("float", "int"):
@@ -256,7 +316,37 @@ def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
                 )
                 value = spec.default
             kwargs[spec.field] = value
-    return AutoSwitchSettings(**kwargs)
+    return type(settings)(**kwargs)
+
+
+def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
+    """Clamp the autoswitch section (see :func:`_clamped_section`)."""
+    return _clamped_section(settings, "autoswitch")
+
+
+def _load_section(backup_root: Path, section: str):
+    """Load one section as its clamped dataclass; missing/corrupt file or
+    fields → defaults. The generic shape behind ``load_settings`` /
+    ``load_codex_settings``."""
+    cls = _SECTION_DEFAULT_SOURCES[section]
+    raw = _read_raw(settings_path(backup_root))
+    data = raw.get(section)
+    if not isinstance(data, dict):
+        return cls()
+    field_keys = {
+        spec.field: spec.json_key
+        for spec in SETTING_SPECS.values()
+        if spec.section == section
+    }
+    kwargs = {}
+    for field, json_key in field_keys.items():
+        if json_key in data:
+            kwargs[field] = data[json_key]
+    try:
+        settings = cls(**kwargs)
+    except TypeError:
+        settings = cls()
+    return _clamped_section(settings, section)
 
 
 def _read_raw(path: Path) -> dict:
@@ -275,19 +365,12 @@ def _read_raw(path: Path) -> dict:
 
 def load_settings(backup_root: Path) -> AutoSwitchSettings:
     """Load the autoswitch section; missing/corrupt file or fields → defaults."""
-    raw = _read_raw(settings_path(backup_root))
-    section = raw.get("autoswitch")
-    if not isinstance(section, dict):
-        return AutoSwitchSettings()
-    kwargs = {}
-    for field, json_key in _AUTOSWITCH_KEYS.items():
-        if json_key in section:
-            kwargs[field] = section[json_key]
-    try:
-        settings = AutoSwitchSettings(**kwargs)
-    except TypeError:
-        settings = AutoSwitchSettings()
-    return _clamped(settings)
+    return _load_section(backup_root, "autoswitch")
+
+
+def load_codex_settings(backup_root: Path) -> CodexSettings:
+    """Load the codex section; missing/corrupt file or fields → defaults."""
+    return _load_section(backup_root, "codex")
 
 
 def load_ui_settings(backup_root: Path) -> UiSettings:
@@ -478,6 +561,7 @@ def effective_settings(backup_root: Path) -> list[tuple[SettingSpec, object, boo
     loaded = {
         "autoswitch": load_settings(backup_root),
         "ui": load_ui_settings(backup_root),
+        "codex": load_codex_settings(backup_root),
     }
     rows = []
     for spec in SETTING_SPECS.values():
