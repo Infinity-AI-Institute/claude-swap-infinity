@@ -269,6 +269,29 @@ cswap config path                         # where settings.json lives
 
 </details>
 
+### Codex CLI accounts and session handoff (opt-in)
+
+`cswap codex` manages OpenAI Codex CLI accounts the same way cswap manages Claude accounts — slot snapshots of `$CODEX_HOME/auth.json` under the backup root, separate from the Claude data — plus a **session handoff** that rotates a *live* codex TUI onto a fresh account without losing its working context.
+
+**Why a handoff instead of a hot swap:** measured on 2026-08-26 (codex 0.147), codex reads `auth.json` once at startup and caches the auth in memory. A running TUI ignores an on-disk swap entirely — a turn succeeded with a server-rejected credential sitting on disk — and only a restart re-reads the file. So rotating a live session must be: warn the agent → stop the TUI → swap `auth.json` → relaunch with `codex resume <session-id>`. Because cswap swaps credentials *inside* one `CODEX_HOME`, codex's sessions, history, and `/goal` store all persist across the swap — the resume restores the full working context on the new account.
+
+```bash
+cswap codex add                             # snapshot the current codex login into a slot
+cswap codex list                            # slots with 5h/weekly usage
+cswap codex switch 2                        # cold rotation (next codex start picks it up)
+cswap codex remove 2
+
+cswap config set codex.tmux_target 'agent:0.0'   # REQUIRED for handoff — never guessed
+cswap codex handoff                         # rotate the live session now
+cswap codex handoff --if-needed             # only if a usage wall is reached (cron-friendly, exit 0 otherwise)
+cswap codex handoff --dry-run               # print the plan (target slot, session id, pane), act on nothing
+cswap codex watch                           # opt-in auto mode: poll every codex.poll_interval_s, hand off on a wall
+```
+
+The handoff sequence, every step fail-closed: it evaluates the active account against the **same walls as the Claude side** (`autoswitch.threshold`, plus per-window `autoswitch.thresholds` — codex windows are `5h` and `7d`); picks the registered slot with the most margin to its walls (refusing rather than landing on an exhausted account); pastes a wrap-up message to the agent via bracketed paste (asking it to finish the atomic step in flight and write state down); waits up to `codex.wrapup_grace_s` for the TUI's working indicator to clear; stops the TUI with C-c and **verifies the codex process actually exited** before touching credentials; snapshots the outgoing login back into its slot and restores the target slot transactionally; relaunches `codex resume <session-id>` (plus `codex.resume_args`) in the same pane; and answers codex's "Update available" prompt with option 3 (skip) — never a bare Enter, which runs the updater. `watch` is deliberately separate from the Claude `cswap auto` engine: different mechanism, composable side by side.
+
+Settings (all under `codex.`): `home` (default `$CODEX_HOME`/`~/.codex`), `tmux_target` (no default — required), `wrapup_message`, `wrapup_grace_s` (default 120), `resume_args` (e.g. `--model gpt-5.6-sol`), `poll_interval_s` (default 300).
+
 ### Backup and migration
 
 Move account data between machines or back it up:
