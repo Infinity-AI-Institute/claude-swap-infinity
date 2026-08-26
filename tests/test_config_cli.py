@@ -48,10 +48,11 @@ class TestConfigList:
             "autoswitch.includeApiKeyAccounts",
             "autoswitch.unhealthyTicks",
             "autoswitch.model",
+            "autoswitch.thresholds",
             "ui.theme",
         ):
             assert key in out
-        assert out.count("(default)") == 9
+        assert out.count("(default)") == 10
 
     def test_set_key_not_marked_default(self, temp_home, capsys):
         _run(["set", "autoswitch.cooldownSeconds", "600"], capsys)
@@ -78,7 +79,7 @@ class TestConfigList:
         assert payload["schemaVersion"] == 1
         assert payload["path"].endswith("settings.json")
         by_key = {entry["key"]: entry for entry in payload["settings"]}
-        assert len(by_key) == 9
+        assert len(by_key) == 10
         assert by_key["autoswitch.threshold"]["value"] == 90.0
         assert by_key["autoswitch.threshold"]["isSet"] is False
         assert by_key["autoswitch.includeApiKeyAccounts"]["value"] is False
@@ -100,6 +101,26 @@ class TestConfigSetGet:
         assert set(raw) == {"schemaVersion", "autoswitch"}
         assert set(raw["autoswitch"]) == {"threshold"}
         assert raw["autoswitch"]["threshold"] == 80.0
+
+    def test_set_thresholds_accepts_valid_pairs(self, temp_home, capsys):
+        code, out, _ = _run(
+            ["set", "autoswitch.thresholds", "5h=95,7d=98"], capsys
+        )
+        assert code == 0
+        assert "autoswitch.thresholds = 5h=95,7d=98" in out
+        code, out, _ = _run(["get", "autoswitch.thresholds"], capsys)
+        assert code == 0
+        assert out.strip() == "5h=95,7d=98"
+
+    def test_set_thresholds_rejects_a_typo_at_set_time(self, temp_home, capsys):
+        """The strict parse runs at `config set`, not only at engine start —
+        a wall with a typo must never land in the file looking configured."""
+        code, _, err = _run(
+            ["set", "autoswitch.thresholds", "7d=oops"], capsys
+        )
+        assert code != 0
+        assert "autoswitch.thresholds" in err
+        assert not _settings_file(capsys).exists()
 
     def test_set_bool_words(self, temp_home, capsys):
         code, out, _ = _run(

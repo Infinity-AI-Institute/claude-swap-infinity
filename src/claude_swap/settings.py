@@ -57,6 +57,16 @@ class AutoSwitchSettings:
     # 5h/7d windows still have headroom. None = account-wide 5h/7d only
     # (default).
     model: str | None = None
+    # Per-window switch thresholds overriding ``threshold``, as comma-separated
+    # ``label=pct`` pairs ("5h=95,7d=98,spend=97"). Labels are the window
+    # labels ``relevant_windows`` emits: the reserved "5h"/"7d"/"spend", or a
+    # model display name (case-insensitive; the model must also be listed in
+    # ``model`` for its window to gate at all). A window without an override
+    # keeps the global ``threshold``, so each axis gets its own wall — an
+    # unattended fleet can hold the weekly window to a tighter margin than the
+    # fast-recovering 5h one. "" = no overrides (default). Parsed strictly by
+    # ``parse_window_thresholds``.
+    thresholds: str = ""
 
 
 @dataclass(frozen=True)
@@ -133,7 +143,14 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         ),
         SettingSpec(
             "autoswitch", "model", "model", "string",
-            help="Also switch on these models' weekly limits (e.g. Fable, Fable,Opus, or all)",
+            help="Also switch on these models' weekly limits (e.g. Fable, Fable,Opus, or all); "
+            "add spend to also gate on the monthly extra-usage spend limit",
+        ),
+        SettingSpec(
+            "autoswitch", "thresholds", "thresholds", "string",
+            help="Per-window switch thresholds overriding autoswitch.threshold "
+            "(e.g. 5h=95,7d=98,spend=97; labels: 5h, 7d, spend, or model "
+            "display names)",
         ),
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
@@ -165,6 +182,48 @@ def parse_model_names(value: str | None) -> tuple[str, ...]:
         if name and name.lower() not in seen:
             seen[name.lower()] = name
     return tuple(seen.values())
+
+
+def parse_window_thresholds(value: str | None) -> dict[str, float]:
+    """Parse ``autoswitch.thresholds`` ("5h=95,7d=98,spend=97") into
+    ``{lowercased label: pct}``. Labels are trimmed and lowercased here so
+    lookups against ``relevant_windows`` labels (reserved "5h"/"7d"/"spend"
+    are already lowercase; model display names compare case-insensitively)
+    need no further normalization. Each pct must parse as a number in
+    (0, 100].
+
+    STRICT — any malformed part raises ValueError naming it, and a duplicate
+    label raises rather than letting one spelling silently shadow the other.
+    These walls exist so an unattended fleet never exceeds its included
+    limits; a typo forgivingly ignored would disable a wall without anyone
+    noticing, so unlike the clamp on load this parse fails loud and forces
+    the explicit fix. None/empty → {} (no overrides).
+    """
+    if not value or not value.strip():
+        return {}
+    thresholds: dict[str, float] = {}
+    for part in value.split(","):
+        part = part.strip()
+        label, sep, pct_text = part.partition("=")
+        label = label.strip().lower()
+        if not part or not sep or not label or not pct_text.strip():
+            raise ValueError(
+                f"expected label=pct (e.g. 7d=98), got {part!r}"
+            )
+        try:
+            pct = float(pct_text)
+        except ValueError:
+            raise ValueError(
+                f"{part!r}: {pct_text.strip()!r} is not a number"
+            ) from None
+        if not 0.0 < pct <= 100.0:
+            raise ValueError(
+                f"{part!r}: threshold must be greater than 0 and at most 100"
+            )
+        if label in thresholds:
+            raise ValueError(f"duplicate label {label!r}")
+        thresholds[label] = pct
+    return thresholds
 
 
 def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
@@ -308,6 +367,13 @@ def parse_setting_value(spec: SettingSpec, raw_value: str):
                 f"{spec.dotted} expects a non-empty value; use "
                 f"'cswap config unset {spec.dotted}' to clear it"
             )
+        if spec.dotted == "autoswitch.thresholds":
+            # Validate at set time, not just at engine start: a wall with a
+            # typo must never make it into the file looking configured.
+            try:
+                parse_window_thresholds(value)
+            except ValueError as e:
+                raise ConfigError(f"{spec.dotted}: {e}") from None
         return value
     try:
         value = int(raw_value) if spec.kind == "int" else float(raw_value)

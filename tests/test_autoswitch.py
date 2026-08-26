@@ -2217,7 +2217,7 @@ class TestSessionThreshold:
         harness.engine.apply_threshold(72.0)
         assert harness.engine.settings.threshold == 72.0
         # Poll-cadence planning follows the new value immediately.
-        assert harness.switcher._poll_inputs_override == (72.0, ())
+        assert harness.switcher._poll_inputs_override == (72.0, (), {})
         # And the very next tick decides with it: 80% ≥ 72 switches, where
         # the constructed 90 would not have.
         outcome = harness.tick_with_usage({
@@ -6894,3 +6894,95 @@ class TestFreshenRoutesThroughGate:
         assert gate_calls["args"][0] == "2"
         assert "called" not in direct, "freshen must not POST outside the gate"
 
+
+
+class TestPerWindowThresholds:
+    """`autoswitch.thresholds`: each gating window gets its own switch wall.
+
+    The engine decides on `oauth.switch_margin` — min over gating windows of
+    (wall - pct), the wall being the per-window override else the global
+    threshold — so one axis crossing ITS wall triggers a switch even while
+    the binding pct sits below the global threshold, and a candidate past
+    one of its own walls is never landed on.
+    """
+
+    def _harness(self, temp_home: Path, **settings_kwargs) -> EngineHarness:
+        h = EngineHarness(temp_home, **settings_kwargs)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def test_axis_past_its_wall_switches_below_the_global_threshold(
+        self, temp_home: Path
+    ):
+        h = self._harness(temp_home, thresholds="7d=80")
+        outcome = h.tick_with_usage({
+            # 7d at 85 is 5 past its own 80 wall; the binding pct (85) is
+            # still under the global 90 threshold.
+            "1": {"five_hour": {"pct": 50.0}, "seven_day": {"pct": 85.0}},
+            "2": {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 10.0}},
+            "3": {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 12.0}},
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_the_same_burn_without_the_wall_holds(self, temp_home: Path):
+        h = self._harness(temp_home)  # default settings: global 90 only
+        outcome = h.tick_with_usage({
+            "1": {"five_hour": {"pct": 50.0}, "seven_day": {"pct": 85.0}},
+            "2": {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 10.0}},
+            "3": {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 12.0}},
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert any(
+            getattr(e, "reason", None) == "below-threshold" for e in h.events
+        )
+
+    def test_candidate_past_its_own_wall_is_never_landed_on(
+        self, temp_home: Path
+    ):
+        """Account 3 offers the most headroom (18 pts) but sits past its 7d
+        wall; account 2, thinner on headroom, is the one inside all its
+        walls — the landing rule must pick it."""
+        h = self._harness(temp_home, thresholds="7d=80")
+        outcome = h.tick_with_usage({
+            "1": {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 85.0}},
+            "2": {"five_hour": {"pct": 85.0}, "seven_day": {"pct": 0.0}},
+            "3": {"five_hour": {"pct": 0.0}, "seven_day": {"pct": 82.0}},
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_malformed_thresholds_refuse_to_start(self, temp_home: Path):
+        """STRICT: a typo'd wall must stop the engine at construction, not
+        silently gate nothing while an unattended fleet burns past a limit."""
+        from claude_swap.exceptions import ConfigError
+
+        with pytest.raises(ConfigError, match="autoswitch.thresholds"):
+            EngineHarness(temp_home, thresholds="7d=oops")
+
+    def test_a_wall_on_an_unlisted_axis_warns_it_is_inert(
+        self, temp_home: Path, caplog
+    ):
+        """A spend/model wall gates only when its axis is enabled via
+        `autoswitch.model` — configured without it, the wall protects
+        nothing, and that must be said out loud (same shape as the
+        `_check_model_names` typo guard)."""
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            self._harness(temp_home, thresholds="spend=97,7d=98")
+        assert "spend" in caplog.text
+        assert "inert" in caplog.text
+
+    def test_walls_on_enabled_axes_do_not_warn(self, temp_home: Path, caplog):
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            self._harness(
+                temp_home, model="Fable,spend", thresholds="fable=96,spend=97"
+            )
+        assert "inert" not in caplog.text

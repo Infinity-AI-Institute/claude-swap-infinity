@@ -203,13 +203,17 @@ def plan_after_fetch(
     recent_429: bool,
     now: float,
     rng: Callable[[], float] = random.random,
+    window_thresholds: dict[str, float] | None = None,
 ) -> tuple[float, float]:
     """``(next_poll_at, interval_s)`` for an account just fetched successfully.
 
     Movement (binding pct changed ≥ ``MOVEMENT_DELTA_PCT`` since the previous
     poll) halves the interval, floored at ``MIN_INTERVAL_S`` — or drops to
     ``URGENT_INTERVAL_S`` when the active account is moving inside the
-    escalation band. No movement backs off ×1.5 toward the account's ceiling;
+    escalation band (within ``ESCALATION_MARGIN_PCT`` of its nearest switch
+    wall — ``oauth.switch_margin`` with ``window_thresholds``, so a
+    per-window wall tightens the cadence exactly where it tightens the
+    switch). No movement backs off ×1.5 toward the account's ceiling;
     unknown utilization uses the default. A recent 429 on this token floors
     the cadence at ``POST_429_MIN_INTERVAL_S`` (and suppresses urgent mode)
     until ``RECENT_429_WINDOW_S`` has passed. The scheduled time gets
@@ -235,12 +239,16 @@ def plan_after_fetch(
         # through 90s/135s polls that the budget never intended.
         moving = False
         interval = min(ceiling, max(MIN_INTERVAL_S, base * 1.5))
+    # Margin to the nearest switch wall (None exactly when new_pct is None:
+    # both read the same window set). Movement stays on raw binding_pct —
+    # burn is burn whichever wall is nearest.
+    margin = oauth.switch_margin(new_usage, models, threshold, window_thresholds)
     if (
         is_active
         and moving
         and not recent_429
-        and new_pct is not None
-        and new_pct >= threshold - ESCALATION_MARGIN_PCT
+        and margin is not None
+        and margin <= ESCALATION_MARGIN_PCT
     ):
         interval = URGENT_INTERVAL_S
     if recent_429:

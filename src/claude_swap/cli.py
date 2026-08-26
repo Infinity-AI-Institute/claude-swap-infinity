@@ -1302,23 +1302,47 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
                 json_output=args.json,
             )
         elif args.switch:
-            from claude_swap.settings import load_settings, parse_model_names
+            from claude_swap.exceptions import ConfigError
+            from claude_swap.settings import (
+                load_settings,
+                parse_model_names,
+                parse_window_thresholds,
+            )
 
-            # Only the usage-aware strategies read model limits: --model wins;
-            # otherwise the persistent autoswitch.model setting applies
-            # (announced by switch(), never silently).
+            # Only the usage-aware strategies read model limits and switch
+            # walls: --model wins; otherwise the persistent autoswitch.model
+            # setting applies (announced by switch(), never silently). The
+            # threshold and per-window walls come from settings the same way
+            # the model fallback does, so the strategies honor the same
+            # policy the auto engine enforces.
+            loaded = (
+                load_settings(switcher.backup_dir)
+                if args.strategy is not None
+                else None
+            )
             if args.strategy is None:
                 models, model_source = (), None
-            elif args.model is not None:
-                models, model_source = parse_model_names(args.model), "cli"
+                threshold, window_thresholds = 90.0, None
             else:
-                models = parse_model_names(load_settings(switcher.backup_dir).model)
-                model_source = "autoswitch.model" if models else None
+                if args.model is not None:
+                    models, model_source = parse_model_names(args.model), "cli"
+                else:
+                    models = parse_model_names(loaded.model)
+                    model_source = "autoswitch.model" if models else None
+                threshold = loaded.threshold
+                try:
+                    window_thresholds = parse_window_thresholds(loaded.thresholds)
+                except ValueError as e:
+                    # Strict, like the auto engine: a wall with a typo must
+                    # stop the strategy, not silently gate nothing.
+                    raise ConfigError(f"autoswitch.thresholds: {e}") from e
             payload = switcher.switch(
                 strategy=args.strategy,
                 json_output=args.json,
                 models=models,
                 model_source=model_source,
+                threshold=threshold,
+                window_thresholds=window_thresholds,
             )
             if payload is not None and models:
                 payload["models"] = list(models)
