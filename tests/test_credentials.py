@@ -271,3 +271,45 @@ class TestSecureStorageOverride:
         store = CredentialStore(_Host(tmp_path / "backups"))
         assert store._read_active_credentials().value == SECURE_PROFILE_CREDS
         assert seen == [keychain_service_name(str(secure))]
+
+
+@pytest.mark.parametrize("custom", [False, True])
+@pytest.mark.parametrize("mode", ["oauth", "managed", "fallback"])
+def test_active_writes_and_clears_stay_on_selected_profile(tmp_path, monkeypatch, custom, mode):
+    """Switching one profile must never overwrite or delete another login."""
+    config_home = tmp_path / "infinity" if custom else Path.home() / ".claude"
+    config_home.mkdir(parents=True, exist_ok=True)
+    if custom:
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_home))
+    else:
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", raising=False)
+    oauth_service = keychain_service_name(str(config_home)) if custom else CLAUDE_CODE_KEYCHAIN_SERVICE
+    managed_service = oauth_service.replace("Claude Code-credentials", "Claude Code", 1)
+    untouched = {
+        CLAUDE_CODE_KEYCHAIN_SERVICE: DEFAULT_PROFILE_CREDS,
+        CLAUDE_CODE_MANAGED_KEYCHAIN_SERVICE: "sk-ant-api03-default-fixture",
+    }
+    mapping = dict(untouched)
+    mapping[oauth_service] = CUSTOM_PROFILE_CREDS
+    mapping[managed_service] = "sk-ant-api03-old-selected-fixture"
+
+    def write(service, account, value):
+        if mode == "fallback":
+            raise OSError("Fixture Keychain write unavailable")
+        mapping[service] = value
+
+    monkeypatch.setattr("claude_swap.macos_keychain.get_password", lambda service, account: mapping.get(service))
+    monkeypatch.setattr("claude_swap.macos_keychain.set_password", write)
+    monkeypatch.setattr("claude_swap.macos_keychain.delete_password", lambda service, account: mapping.pop(service, None))
+    store = CredentialStore(_Host(tmp_path / "backups"))
+    value = "sk-ant-api03-new-selected-fixture" if mode == "managed" else SECURE_PROFILE_CREDS
+    store._write_credentials(value)
+    if custom:
+        assert {key: mapping.get(key) for key in untouched} == untouched
+    if mode == "fallback":
+        assert oauth_service not in mapping
+        assert (config_home / ".credentials.json").read_text() == value
+    else:
+        assert mapping[managed_service if mode == "managed" else oauth_service] == value
+    assert store._read_active_credentials().value == value
