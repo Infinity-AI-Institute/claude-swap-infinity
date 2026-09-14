@@ -13,6 +13,49 @@ from claude_swap.models import get_timestamp
 from claude_swap.vision import VisionClient
 
 
+def _valid_preferences(value):
+    return (
+        isinstance(value, dict)
+        and set(value) == {"alias", "disabled", "visionMigratedAliases"}
+        and isinstance(value["alias"], (str, type(None)))
+        and type(value["disabled"]) is bool
+        and isinstance(value["visionMigratedAliases"], list)
+        and all(
+            isinstance(alias, str) and alias for alias in value["visionMigratedAliases"]
+        )
+    )
+
+
+def _remember_preferences(data, accounts):
+    """Retain user choices without retaining removed accounts as usable members."""
+    saved = copy.deepcopy(data.get("visionPreferences", {}))
+    if not isinstance(saved, dict):
+        raise ConfigError("The saved Vision preferences need repair.")
+    for origin, logins in saved.items():
+        if not isinstance(origin, str) or not isinstance(logins, dict):
+            raise ConfigError("The saved Vision preferences need repair.")
+        for login, preference in logins.items():
+            if not isinstance(login, str) or not _valid_preferences(preference):
+                raise ConfigError("The saved Vision preferences need repair.")
+    for record in accounts.values():
+        if record.get("source") != "vision":
+            continue
+        origin, login = record.get("visionUrl"), record.get("visionLoginId")
+        preference = {
+            "alias": record.get("alias"),
+            "disabled": record.get("disabled", False),
+            "visionMigratedAliases": record.get("visionMigratedAliases", []),
+        }
+        if (
+            not isinstance(origin, str)
+            or not isinstance(login, str)
+            or not _valid_preferences(preference)
+        ):
+            raise ConfigError("The account's Vision preferences need repair.")
+        saved.setdefault(origin, {})[login] = copy.deepcopy(preference)
+    return saved
+
+
 def merge_accounts(
     data: dict[str, Any], items: list[dict[str, Any]], url: str
 ) -> dict[str, Any]:
@@ -47,6 +90,8 @@ def merge_accounts(
             "The account roster needs repair before Vision synchronization."
         )
     merged = copy.deepcopy(data)
+    preferences = _remember_preferences(data, accounts)
+    merged["visionPreferences"] = preferences
     local = {
         number: record
         for number, record in accounts.items()
@@ -64,7 +109,8 @@ def merge_accounts(
     names = {record.get("alias") for record in local.values() if record.get("alias")}
     remote = {}
     for item in items:
-        old_number, old = previous.get(item["login_id"], (None, {}))
+        remembered = preferences.get(url, {}).get(item["login_id"], {})
+        old_number, old = previous.get(item["login_id"], (None, remembered))
         if old_number is None:
             high_water += 1
             number = str(high_water)

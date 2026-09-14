@@ -168,3 +168,46 @@ def test_malformed_roster_is_not_partially_rewritten(data):
     with pytest.raises(ConfigError):
         merge_accounts(data, [item()], "https://vision.example.invalid")
     assert json.dumps(data) == before
+
+
+def test_switching_registry_origins_preserves_each_origins_preferences():
+    first = "https://first.example.invalid"
+    second = "https://second.example.invalid"
+    data = merge_accounts({}, [item()], first)
+    data["accounts"]["1"].update(alias="my-first", disabled=True)
+    data = merge_accounts(data, [item()], second)
+    second_row = next(iter(data["accounts"].values()))
+    assert second_row["disabled"] is False
+    second_row["alias"] = "my-second"
+    data = merge_accounts(data, [item()], first)
+    restored = next(iter(data["accounts"].values()))
+    assert restored["disabled"] is True
+    assert restored["alias"] == "my-first"
+    data = merge_accounts(data, [item()], second)
+    restored = next(iter(data["accounts"].values()))
+    assert restored["disabled"] is False
+    assert restored["alias"] == "my-second"
+
+
+def test_revocation_does_not_forget_an_explicit_disable_preference():
+    url = "https://vision.example.invalid"
+    data = merge_accounts({}, [item()], url)
+    data["accounts"]["1"]["disabled"] = True
+    data = merge_accounts(data, [], url)
+    assert data["accounts"] == {}
+    data = merge_accounts(data, [item()], url)
+    assert next(iter(data["accounts"].values()))["disabled"] is True
+
+
+@pytest.mark.parametrize(
+    "preference",
+    [
+        {"disabled": False},
+        {"alias": None, "disabled": "false", "visionMigratedAliases": []},
+    ],
+)
+def test_damaged_saved_preferences_do_not_silently_enable_accounts(preference):
+    url = "https://vision.example.invalid"
+    data = {"visionPreferences": {url: {item()["login_id"]: preference}}}
+    with pytest.raises(ConfigError, match="preferences need repair"):
+        merge_accounts(data, [item()], url)
