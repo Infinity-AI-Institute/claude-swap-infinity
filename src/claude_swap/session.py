@@ -523,6 +523,25 @@ class SessionManager:
 
         self.switcher.sync_vision_accounts()
         account_num, email, org_uuid = self.switcher.resolve_account(identifier)
+        remote = self.switcher._vision_account_record(account_num)
+        if remote is not None:
+            from claude_swap.vision import configured_client
+            from claude_swap.vision_session import prepare_launch
+
+            launch = prepare_launch(
+                self,
+                remote,
+                configured_client(),
+                share=share,
+                share_history=share_history,
+            )
+            print(
+                f"{accent('Launching')} Account-{account_num} ({email}) "
+                f"{muted('[Vision]')}"
+            )
+            self._exec(claude_bin, claude_args, env=launch.env)
+            raise AssertionError("unreachable")
+
         # Guard before the same-account direct-launch fast path below (which
         # _exec's claude and never returns) — and before setup_session.
         self._ensure_not_api_key(account_num, email)
