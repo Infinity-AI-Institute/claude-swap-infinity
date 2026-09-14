@@ -53,3 +53,16 @@ external network access and user-home reads, serves synthetic inference, then
 resumes the same native conversation with a second synthetic access token. It
 checks the bearer, conversation ID, retained message context, and absence of a
 local credential file. This does not establish live-provider or Linux acceptance.
+
+`ManagedLoginHandoff` implements recoverable registration for dedicated profiles
+under `vision-logins/<profile-id>`. Its caller must keep the profile lease across
+native login and upload. The journal is private, bounded, atomically replaced and
+fsynced before native credentials are removed. It retains both the plaintext seed
+and Keychain value until Vision confirms ownership, recovers lost replies with
+the original proof, and restores a cancelled grant without overwriting a newer
+login. An active or unreadable native session prevents handoff confirmation.
+
+This backend is not yet wired to the login CLI. It does not inventory existing
+default profiles, portable backups or external Claude homes; those remain a
+separate required integration before this series is complete. A dedicated profile
+must not be populated by copying an existing refresh-token backup into it.
