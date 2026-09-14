@@ -210,3 +210,59 @@ def test_lost_committed_reply_cannot_delete_a_new_login(setup):
         assert lease.upload()["state"] == "committed"
         assert lease.auth_path.read_text() == material("b")
         assert "synthetic-refresh-a" not in lease.journal_path.read_text()
+
+
+def test_native_refresh_locks_cover_registration_and_release_after_failure(setup):
+    lease, registry = setup
+    primary = lease.profile / ".oauth_refresh.lock"
+    legacy = lease.profile.with_name(lease.profile.name + ".lock")
+
+    def prepare(request, proof, credential):
+        assert primary.is_dir()
+        assert legacy.is_dir()
+        raise VisionError("service_unavailable")
+
+    registry.prepare_registration.side_effect = prepare
+    with lease, pytest.raises(VisionError):
+        lease.upload()
+    assert not primary.exists()
+    assert not legacy.exists()
+    assert lease.auth_path.read_text() == material()
+
+
+def test_busy_native_refresh_prevents_registration(setup, monkeypatch):
+    from claude_swap.exceptions import ClaudeCodeLockTimeout
+
+    lease, registry = setup
+    primary = lease.profile / ".oauth_refresh.lock"
+    primary.mkdir()
+    monkeypatch.setattr("claude_swap.claude_locks.DEFAULT_TIMEOUT_S", 0)
+    try:
+        with lease, pytest.raises(ClaudeCodeLockTimeout):
+            lease.upload()
+        registry.prepare_registration.assert_not_called()
+        assert not lease.journal_path.exists()
+        assert lease.auth_path.read_text() == material()
+    finally:
+        primary.rmdir()
+
+
+def test_cancel_restores_credential_under_native_refresh_locks(setup, monkeypatch):
+    lease, registry = setup
+    registry.confirm_registration.side_effect = VisionError("service_unavailable")
+    with lease:
+        with pytest.raises(VisionError):
+            lease.upload()
+        assert not lease.auth_path.exists()
+        original_write = _write_private
+
+        def checked_write(path, value):
+            if path == lease.auth_path:
+                assert (lease.profile / ".oauth_refresh.lock").is_dir()
+                assert lease.profile.with_name(lease.profile.name + ".lock").is_dir()
+            original_write(path, value)
+
+        monkeypatch.setattr("claude_swap.vision_handoff._write_private", checked_write)
+        lease.cancel()
+        assert lease.auth_path.read_text() == material()
+        assert not (lease.profile / ".oauth_refresh.lock").exists()

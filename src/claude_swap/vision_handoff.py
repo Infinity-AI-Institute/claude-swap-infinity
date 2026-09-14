@@ -14,9 +14,11 @@ import secrets
 import stat
 import tempfile
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 from claude_swap import macos_keychain
+from claude_swap.claude_locks import claude_credentials_lock
 from claude_swap.exceptions import SessionError
 from claude_swap.locking import FileLock
 from claude_swap.models import Platform
@@ -287,7 +289,21 @@ class ManagedLoginHandoff:
         ).hexdigest()
         return fingerprint, state
 
+    @contextmanager
+    def _native_refresh_lock(self):
+        # Exclude native refresh I/O as well as swap-managed operations. Live
+        # session checks remain necessary: a lock cannot evict an in-memory grant.
+        # Release before starting native auth login, which needs these locks too.
+        if not self.held:
+            raise SessionError("Managed login handoff requires its profile lock.")
+        with claude_credentials_lock(config_home=self.profile):
+            yield
+
     def prepare_login(self):
+        with self._native_refresh_lock():
+            return self._prepare_login_locked()
+
+    def _prepare_login_locked(self):
         """Do not overwrite an unresolved ownership transaction with a new login."""
         self._require_quiescent()
         journal = self._journal()
@@ -305,6 +321,10 @@ class ManagedLoginHandoff:
         self._finish(journal)
 
     def upload(self):
+        with self._native_refresh_lock():
+            return self._upload_locked()
+
+    def _upload_locked(self):
         if self.registry is None:
             raise SessionError("Sign in to Vision before uploading this login.")
         self._require_quiescent()
@@ -360,6 +380,10 @@ class ManagedLoginHandoff:
         return journal["receipt"]
 
     def cancel(self):
+        with self._native_refresh_lock():
+            return self._cancel_locked()
+
+    def _cancel_locked(self):
         if self.registry is None:
             raise SessionError("Sign in to Vision before cancelling this upload.")
         self._require_quiescent()
