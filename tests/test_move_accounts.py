@@ -509,6 +509,8 @@ class TestMoveUnreadableSourceIsNotAbsent:
         self, temp_home: Path, sample_sequence_data: dict
     ):
         switcher = ClaudeAccountSwitcher()
+        # This regression exercises unreadable files, not the macOS Keychain backend.
+        switcher.platform = Platform.LINUX
         self._write(switcher, sample_sequence_data)
         switcher._write_account_credentials("2", "account2@example.com", "live-rt")
         switcher._write_account_credentials("1", "account1@example.com", "rt-1")
