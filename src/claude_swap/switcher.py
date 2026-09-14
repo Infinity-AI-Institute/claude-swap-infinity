@@ -4678,6 +4678,27 @@ class ClaudeAccountSwitcher:
         fields, so the last-good measurement keeps being served
         (stale-on-error).
         """
+        roster = (self._get_sequence_data() or {}).get("accounts", {})
+        remote = {}
+        for info in accounts_info:
+            number = str(info[0])
+            record = roster.get(number, {})
+            if record.get("source") == "vision":
+                remote[number] = record
+        if remote:
+            from claude_swap.vision_usage import collect_usage
+
+            local = [info for info in accounts_info if str(info[0]) not in remote]
+            entries = {}
+            if local:
+                entries = self._collect_usage_entries(local, fetch, scheduled=scheduled)
+            try:
+                client = configured_vision_client()
+            except VisionError:
+                client = None
+            entries.update(collect_usage(remote, client))
+            return entries
+
         store = self._usage_store
         identities = {
             str(num): (email, org_uuid or "")

@@ -302,9 +302,16 @@ class UsageEntry:
     # Appended to preserve positional compatibility for the older read-model
     # fields while exposing whether a fetch lease is currently live.
     claim_until: float | None = None
+    # External observation owners can revoke decision trust before the local
+    # age limit expires, while retaining the measurement for display.
+    decision_blocked: bool = False
 
     def fresh(self, now: float, ttl: float = SERVE_TTL_S) -> bool:
-        return self.fetched_at is not None and (now - self.fetched_at) <= ttl
+        return (
+            not self.decision_blocked
+            and self.fetched_at is not None
+            and (now - self.fetched_at) <= ttl
+        )
 
     def in_backoff(self, now: float) -> bool:
         return self.backoff_until is not None and now < self.backoff_until
@@ -383,6 +390,8 @@ class UsageEntry:
         """
         if self.sentinel is not None:
             return self.sentinel
+        if self.decision_blocked:
+            return None
         if (
             self.last_good is not None
             and self.age_s is not None
