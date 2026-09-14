@@ -165,3 +165,35 @@ def test_status_proof_is_only_in_the_http_header(monkeypatch):
     assert PROOF not in sent[0].full_url
     assert sent[0].data is None
     assert sent[0].get_header("X-api-key") == "synthetic-key"
+
+
+def test_live_confirmation_sends_honest_acknowledgement(client):
+    client.confirm_registration(
+        REQUEST, PROOF, local_refreshers_stopped=False,
+        live_refresh_risk_acknowledged=True,
+    )
+    assert client.client.request.call_args.args[2] == {
+        "version": 1, "handoff_secret": PROOF,
+        "local_refreshers_stopped": False, "live_refresh_risk_acknowledged": True,
+    }
+
+
+@pytest.mark.parametrize("ack", [None, 1, "true"])
+def test_live_confirmation_rejects_non_boolean_acknowledgement(client, ack):
+    with pytest.raises(VisionError):
+        client.confirm_registration(
+            REQUEST, PROOF, local_refreshers_stopped=False,
+            live_refresh_risk_acknowledged=ack,
+        )
+    client.client.request.assert_not_called()
+
+
+def test_live_confirmation_never_retries_with_false_stopped_attestation(client):
+    client.client.request.side_effect = VisionError("invalid_request")
+    with pytest.raises(VisionError):
+        client.confirm_registration(
+            REQUEST, PROOF, local_refreshers_stopped=False,
+            live_refresh_risk_acknowledged=True,
+        )
+    client.client.request.assert_called_once()
+    assert client.client.request.call_args.args[2]["local_refreshers_stopped"] is False

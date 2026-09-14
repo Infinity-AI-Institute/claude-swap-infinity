@@ -1,7 +1,7 @@
 """Claude registration receipts and two-phase handoff transport.
 
-The caller must durably fence local refresh writers before confirming. This
-transport validates the attestation; it cannot establish process quiescence.
+The caller either fences local refresh writers or explicitly acknowledges live
+refresh risk. This transport validates that choice, not process quiescence.
 """
 
 from __future__ import annotations
@@ -152,19 +152,31 @@ class RegistrationClient:
         return registration_receipt(value, request_id)
 
     def confirm_registration(
-        self, request_id: str, proof: str, *, local_refreshers_stopped: bool
+        self,
+        request_id: str,
+        proof: str,
+        *,
+        local_refreshers_stopped: bool,
+        live_refresh_risk_acknowledged: bool = False,
     ) -> dict[str, Any]:
         registration_proof(request_id, proof)
-        if local_refreshers_stopped is not True:
+        if (
+            type(local_refreshers_stopped) is not bool
+            or type(live_refresh_risk_acknowledged) is not bool
+            or not (local_refreshers_stopped or live_refresh_risk_acknowledged)
+        ):
             raise VisionError("invalid_request")
+        body = {
+            "version": 1,
+            "handoff_secret": proof,
+            "local_refreshers_stopped": local_refreshers_stopped,
+        }
+        if live_refresh_risk_acknowledged:
+            body["live_refresh_risk_acknowledged"] = True
         value = self.client.request(
             "POST",
             f"/api/ai-accounts/registrations/{request_id}/confirm-handoff",
-            {
-                "version": 1,
-                "handoff_secret": proof,
-                "local_refreshers_stopped": True,
-            },
+            body,
         )
         return registration_receipt(value, request_id)
 

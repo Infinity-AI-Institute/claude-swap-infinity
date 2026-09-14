@@ -1,5 +1,6 @@
 """Existing-login transfer uses isolated synthetic backends and registry replies."""
 
+from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
@@ -716,3 +717,164 @@ def test_fresh_shell_extra_secure_profile_does_not_hide_other_native_writer(
     with pytest.raises(SessionError, match="selected login"):
         transaction.upload(source, preview["confirmation"])
     registry.prepare_registration.assert_not_called()
+
+
+def live_transaction(setup):
+    original, registry, source, _, native, backup, other = setup
+    transaction = ExistingLoginHandoff(
+        original.switcher, registry, original.request_id, allow_live_handoff=True
+    )
+    return transaction, registry, source, native, backup, other
+
+
+def test_live_handoff_is_explicit_and_reports_actual_refresh_risk(setup, monkeypatch):
+    transaction, registry, source, native, backup, other = live_transaction(setup)
+    monkeypatch.setattr(
+        "claude_swap.vision_inventory.profile_is_quiescent", lambda _: False
+    )
+    monkeypatch.setattr(
+        "claude_swap.vision_existing_handoff.scan_live_sessions",
+        lambda _: ([object()], 0),
+    )
+    unchanged = other.read_bytes()
+    preview = transaction.preview(source)
+    assert preview["allow_live_handoff"] is True
+    assert "retain" in preview["live_refresh_risk"]
+    assert transaction.upload(source, preview["confirmation"])["state"] == "committed"
+    registry.confirm_registration.assert_called_once_with(
+        transaction.request_id, registry.confirm_registration.call_args.args[1],
+        local_refreshers_stopped=False, live_refresh_risk_acknowledged=True,
+    )
+    assert not native.exists() and not backup.exists()
+    assert other.read_bytes() == unchanged
+    assert transaction._read()["allow_live_handoff"] is True
+
+
+def test_live_handoff_cannot_reuse_strict_preview(setup):
+    transaction, registry, source, _, _, _ = live_transaction(setup)
+    with pytest.raises(SessionError, match="preview changed"):
+        transaction.upload(source, setup[3])
+    registry.prepare_registration.assert_not_called()
+
+
+def test_live_handoff_recovery_requires_same_acknowledgement(setup):
+    transaction, registry, source, native, backup, _ = live_transaction(setup)
+    registry.confirm_registration.side_effect = VisionError("service_unavailable")
+    with pytest.raises(VisionError):
+        transaction.upload(source, transaction.preview(source)["confirmation"])
+    strict = ExistingLoginHandoff(transaction.switcher, registry, transaction.request_id)
+    with pytest.raises(SessionError, match="allow-live-handoff"):
+        strict.upload()
+    recovered = ExistingLoginHandoff(
+        transaction.switcher, registry, transaction.request_id, allow_live_handoff=True
+    )
+    # A lost commit reply is recovered by status; do not repeat confirmation.
+    assert recovered.upload()["state"] == "committed"
+    registry.confirm_registration.assert_called_once()
+    assert not native.exists() and not backup.exists()
+    registry.prepare_registration.assert_called_once()
+
+
+def test_live_handoff_keeps_unreadable_records_fail_closed(setup, monkeypatch):
+    transaction, registry, source, _, _, _ = live_transaction(setup)
+    monkeypatch.setattr(
+        "claude_swap.vision_existing_handoff.scan_live_sessions", lambda _: ([], 1)
+    )
+    with pytest.raises(SessionError, match="unreadable"):
+        transaction.upload(source, transaction.preview(source)["confirmation"])
+    registry.prepare_registration.assert_not_called()
+
+
+def test_live_handoff_changed_source_during_prepare_preserves_new_login(setup):
+    transaction, registry, source, native, _, _ = live_transaction(setup)
+
+    def prepare(request, proof, credential):
+        put(native, material("new"))
+        return receipt(request)
+
+    registry.prepare_registration.side_effect = prepare
+    with pytest.raises(SessionError, match="changed during registration"):
+        transaction.upload(source, transaction.preview(source)["confirmation"])
+    registry.confirm_registration.assert_not_called()
+    transaction.cancel()
+    assert native.read_text() == material("new")
+
+
+def test_live_handoff_rechecks_later_copy_during_retirement(setup, monkeypatch):
+    transaction, registry, source, _, _, _ = live_transaction(setup)
+    delete = transaction._delete
+    changed = []
+
+    def retire(first):
+        delete(first)
+        if not changed:
+            journal = transaction._read()
+            later = next(
+                item for item in journal["copies"]
+                if item["source"]["location"] != first.location
+            )
+            path = Path(later["source"]["location"])
+            put(path, material("new"), later["source"]["encoding"] == "base64")
+            changed.append((path, path.read_bytes()))
+
+    monkeypatch.setattr(transaction, "_delete", retire)
+    with pytest.raises(SessionError, match="changed during retirement"):
+        transaction.upload(source, transaction.preview(source)["confirmation"])
+    registry.confirm_registration.assert_not_called()
+    transaction.cancel()
+    assert changed[0][0].read_bytes() == changed[0][1]
+
+
+def test_cli_live_choice_survives_preview_apply_and_recovery(setup, monkeypatch):
+    from claude_swap.vision_cli import run_command
+
+    original, registry, source, _, native, _, _ = setup
+    monkeypatch.setattr("claude_swap.vision_cli.configured_client", lambda: registry.client)
+    monkeypatch.setattr("claude_swap.vision_cli.RegistrationClient", lambda _: registry)
+    # Routing is covered separately; this test exercises argument parsing and
+    # the actual handoff transaction while the selected native process is live.
+    monkeypatch.setattr(
+        ExistingLoginHandoff, "route_committed", lambda self: self._read()["receipt"]
+    )
+    monkeypatch.setattr(
+        "claude_swap.vision_inventory.profile_is_quiescent", lambda _: False
+    )
+    history = native.parent / "projects" / "conversation.jsonl"
+    history.parent.mkdir()
+    history.write_text("synthetic native conversation\n")
+    inode = history.stat().st_ino
+    args = ["migrate-login", source, "--allow-live-handoff"]
+    preview = run_command(args, original.switcher)
+    result = run_command(
+        args + ["--request-id", preview["request_id"], "--confirm", preview["confirmation"]],
+        original.switcher,
+    )
+    assert result["state"] == "committed"
+    assert run_command(
+        ["recover-migration", preview["request_id"], "--allow-live-handoff"],
+        original.switcher,
+    ) == result
+    assert history.stat().st_ino == inode
+    assert history.read_text() == "synthetic native conversation\n"
+
+
+def test_unsupported_live_confirmation_keeps_recoverable_escrow(setup):
+    transaction, registry, source, native, backup, _ = live_transaction(setup)
+    originals = {path: path.read_bytes() for path in (native, backup)}
+    registry.confirm_registration.side_effect = VisionError("invalid_request")
+    with pytest.raises(VisionError):
+        transaction.upload(source, transaction.preview(source)["confirmation"])
+    journal = transaction._read()
+    assert journal["receipt"]["state"] == "pending_handoff"
+    assert journal["credential"] is not None and journal["copies"]
+    registry.confirm_registration.assert_called_once()
+    assert registry.confirm_registration.call_args.kwargs == {
+        "local_refreshers_stopped": False,
+        "live_refresh_risk_acknowledged": True,
+    }
+    recovered = ExistingLoginHandoff(
+        transaction.switcher, registry, transaction.request_id, allow_live_handoff=True
+    )
+    assert recovered.cancel()["state"] == "cancelled"
+    assert all(path.read_bytes() == raw for path, raw in originals.items())
+    assert recovered._read()["credential"] is None

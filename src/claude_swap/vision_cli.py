@@ -267,10 +267,16 @@ def run_command(argv, switcher):
     migration.add_argument("--request-id")
     migration.add_argument("--confirm")
     migration.add_argument("--profile", action="append", default=[])
+    migration.add_argument(
+        "--allow-live-handoff",
+        action="store_true",
+        help="Import while sessions run; acknowledge their cached credentials may refresh later.",
+    )
     for command in ("recover-migration", "cancel-migration"):
         recovery = commands.add_parser(command)
         recovery.add_argument("request_id")
         recovery.add_argument("--profile", action="append", default=[])
+        recovery.add_argument("--allow-live-handoff", action="store_true")
     commands.add_parser("existing-logins").add_argument(
         "--profile", action="append", default=[]
     )
@@ -311,10 +317,19 @@ def run_command(argv, switcher):
         if args.command == "migrate-login" and args.request_id is None:
             if args.confirm is not None:
                 raise SessionError("Apply the preview with its original --request-id.")
-            transaction = ExistingLoginHandoff.new(switcher, registry, args.profile)
+            transaction = ExistingLoginHandoff.new(
+                switcher,
+                registry,
+                args.profile,
+                allow_live_handoff=args.allow_live_handoff,
+            )
         else:
             transaction = ExistingLoginHandoff(
-                switcher, registry, args.request_id, args.profile
+                switcher,
+                registry,
+                args.request_id,
+                args.profile,
+                allow_live_handoff=args.allow_live_handoff,
             )
         if args.command == "migrate-login" and args.confirm is None:
             return transaction.preview(args.source_id)
