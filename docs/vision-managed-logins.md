@@ -75,7 +75,12 @@ to bypass handoff.
 
 ## Transfer a selected existing login
 
-Exit the native sessions before transfer. Use a `source_id` from the inventory:
+Exit native sessions that can use the selected grant before transfer. This
+includes every known matching credential copy and its saved-slot session home;
+unrelated active profiles do not block the transfer. The selected writer scope
+is saved before any credential deletion and remains enforced during recovery.
+Older recovery journals lack that scope and conservatively require all known
+profiles to be idle. Use a `source_id` from the inventory:
 
 ```sh
 cswap vision migrate-login SOURCE_ID

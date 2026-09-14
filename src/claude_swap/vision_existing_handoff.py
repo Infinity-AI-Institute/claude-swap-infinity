@@ -20,6 +20,7 @@ from claude_swap.claude_locks import claude_credentials_lock
 from claude_swap.credentials import SECURITY_SERVICE
 from claude_swap.exceptions import SessionError
 from claude_swap.locking import FileLock
+from claude_swap.session import scan_live_sessions
 from claude_swap.vision_handoff import _read_private, _sync_directory, _write_private
 from claude_swap.vision_inventory import CredentialSource, _decode, capture_inventory
 from claude_swap.vision_registration import registration_proof, registration_receipt
@@ -63,7 +64,7 @@ class ExistingLoginHandoff:
             return None
         try:
             value = json.loads(raw)
-            if set(value) != {
+            fields = {
                 "version",
                 "request_id",
                 "proof",
@@ -77,9 +78,12 @@ class ExistingLoginHandoff:
                 "routing_complete",
                 "history_sources",
                 "history_snapshotted",
-            }:
+            }
+            if type(value["version"]) is not int or value["version"] not in {1, 2}:
                 raise ValueError()
-            if type(value["version"]) is not int or value["version"] != 1:
+            if value["version"] == 2:
+                fields.add("affected_profiles")
+            if set(value) != fields:
                 raise ValueError()
             registration_proof(value["request_id"], value["proof"])
             if (
@@ -104,6 +108,27 @@ class ExistingLoginHandoff:
             if type(value["history_snapshotted"]) is not bool:
                 raise ValueError()
             known = self._capture()
+            if value["version"] == 2:
+                affected = value["affected_profiles"]
+                known_profiles = set(known.profiles) | {
+                    self.switcher._session_dir(number, record["email"])
+                    for number, record in value["local_slots"].items()
+                }
+                if (
+                    not isinstance(affected, list)
+                    or len(affected) > 1000
+                    or any(not isinstance(path, str) for path in affected)
+                    or len(set(affected)) != len(affected)
+                    or not set(map(Path, affected)).issubset(known_profiles)
+                ):
+                    raise ValueError()
+                required = self._profiles_for_sources(
+                    known,
+                    [CredentialSource(**item["source"]) for item in value["copies"]],
+                    value["local_slots"],
+                )
+                if not required.issubset(set(map(Path, affected))):
+                    raise ValueError()
             known_ids = {item.source.id for item in known.copies}
             native_files = {profile / ".credentials.json" for profile in known.profiles}
             for item in value["copies"]:
@@ -163,8 +188,93 @@ class ExistingLoginHandoff:
                 "The existing-login transfer journal needs repair."
             ) from None
 
+    def _profiles_for_sources(self, inventory, sources, local_slots):
+        """Every native home or saved-slot home that can serve these copies."""
+        source_ids = {source.id for source in sources}
+        profiles = {
+            profile
+            for source_id, profile in inventory.profile_sources.items()
+            if source_id in source_ids
+        }
+        roster = self.switcher._get_sequence_data() or {}
+        for number, record in roster.get("accounts", {}).items():
+            if record.get("source") == "vision":
+                continue
+            email = record["email"]
+            slot_sources = []
+            for suffix in ("", ".prev"):
+                slot_sources.extend(
+                    [
+                        CredentialSource(
+                            "file",
+                            str(self.switcher._store._backup_enc_path(number, email))
+                            + suffix,
+                            encoding="base64",
+                        ),
+                        CredentialSource(
+                            "keychain",
+                            SECURITY_SERVICE,
+                            f"account-{number}-{email}{suffix}",
+                        ),
+                    ]
+                )
+            if number in local_slots or any(
+                source.id in source_ids for source in slot_sources
+            ):
+                profiles.add(self.switcher._session_dir(number, email))
+        # Preserve the old slot home even after committed routing removes its row.
+        for number, record in local_slots.items():
+            profiles.add(self.switcher._session_dir(number, record["email"]))
+        return profiles
+
+    def _selected_profiles(self, inventory, source_id):
+        selected = next(
+            (item for item in inventory.copies if item.source.id == source_id), None
+        )
+        if selected is None or selected.credential is None:
+            raise SessionError(
+                "Select a credential from the current migration inventory."
+            )
+        refresh_token = selected.credential["refreshToken"]
+        matching = [
+            item.source
+            for item in inventory.copies
+            if item.credential is not None
+            and item.credential["refreshToken"] == refresh_token
+        ]
+        return self._profiles_for_sources(
+            inventory, matching, self._local_slots(inventory, refresh_token)
+        )
+
+    @staticmethod
+    def _journal_profiles(journal, inventory):
+        # Old journals did not persist their writer scope. Never infer a smaller
+        # scope from remaining files after an interrupted deletion.
+        if journal["version"] == 1:
+            return set(inventory.profiles)
+        return set(map(Path, journal["affected_profiles"]))
+
+    @staticmethod
+    def _require_quiescent(inventory, affected_profiles):
+        if set(inventory.live_profiles) & affected_profiles:
+            raise SessionError(
+                "Exit native sessions using the selected login before transferring it."
+            )
+        # A malformed process record cannot prove which grant the process holds.
+        # Continue to fail closed even when its profile appears unrelated.
+        for profile in set(inventory.profiles) | affected_profiles:
+            sessions, unreadable = scan_live_sessions(profile)
+            if unreadable:
+                raise SessionError(
+                    "A native session record is unreadable; repair it before transferring a login."
+                )
+            if profile in affected_profiles and sessions:
+                raise SessionError(
+                    "Exit native sessions using the selected login before transferring it."
+                )
+
     @contextmanager
-    def _lease(self):
+    def _lease(self, source_id=None):
         if self.root.is_symlink():
             raise SessionError("Migration storage cannot be a symbolic link.")
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -172,22 +282,25 @@ class ExistingLoginHandoff:
             # Capture names before acquiring consume locks, then revalidate once
             # all locks are held. No provider HTTP runs under the roster lock.
             initial = self._capture()
+            journal = self._read()
+            affected = (
+                self._selected_profiles(initial, source_id)
+                if journal is None
+                else self._journal_profiles(journal, initial)
+            )
             roster = self.switcher._get_sequence_data() or {}
             slots = sorted(roster.get("accounts", {}))
             for number in slots:
                 locks.enter_context(
                     FileLock(self.switcher.credentials_dir / f".consume-{number}.lock")
                 )
-            for profile in initial.profiles:
+            for profile in sorted(affected):
                 if profile.parent == self.switcher.backup_dir / "vision-logins":
                     locks.enter_context(FileLock(profile / ".vision-auth.lock"))
                 if profile.is_dir():
                     locks.enter_context(claude_credentials_lock(config_home=profile))
             current = self._capture()
-            if current.live_profiles:
-                raise SessionError(
-                    "Exit the native sessions before transferring an existing login."
-                )
+            self._require_quiescent(current, affected)
             if (
                 _fingerprint(initial) != _fingerprint(current)
                 or initial.profiles != current.profiles
@@ -195,7 +308,7 @@ class ExistingLoginHandoff:
                 raise SessionError(
                     "Credential stores changed while acquiring migration locks; retry."
                 )
-            yield current
+            yield current, affected
 
     def _local_slots(self, inventory, refresh_token):
         """Bind only slots whose currently served backup is the selected grant."""
@@ -391,6 +504,20 @@ class ExistingLoginHandoff:
                     "Could not restore a migration Keychain copy."
                 ) from None
 
+    @staticmethod
+    def _require_known_copies(journal, inventory):
+        known = {CredentialSource(**item["source"]).id for item in journal["copies"]}
+        refresh_token = journal["credential"]["refreshToken"]
+        if any(
+            item.credential is not None
+            and item.credential["refreshToken"] == refresh_token
+            and item.source.id not in known
+            for item in inventory.copies
+        ):
+            raise SessionError(
+                "Another refresh copy appeared; cancel and repeat inventory."
+            )
+
     def _finish(self, journal):
         state = journal["receipt"]["state"]
         if state not in {"committed", "cancelled", "expired"}:
@@ -402,10 +529,8 @@ class ExistingLoginHandoff:
             raise SessionError(
                 "The account roster changed; reconcile slot ownership before restoring credentials."
             )
-        if self._capture().live_profiles:
-            raise SessionError(
-                "Exit native sessions before reconciling credential ownership."
-            )
+        current = self._capture()
+        self._require_quiescent(current, self._journal_profiles(journal, current))
         current_copies = [
             (item, CredentialSource(**item["source"]).read())
             for item in journal["copies"]
@@ -432,7 +557,7 @@ class ExistingLoginHandoff:
         self._save(journal)
 
     def upload(self, source_id=None, confirmation=None):
-        with self._lease() as inventory:
+        with self._lease(source_id) as (inventory, affected):
             journal = self._read()
             if journal is None:
                 expected = self.preview(source_id)["confirmation"]
@@ -456,7 +581,8 @@ class ExistingLoginHandoff:
                     inventory, selected.credential["refreshToken"]
                 )
                 journal = {
-                    "version": 1,
+                    "version": 2,
+                    "affected_profiles": sorted(map(str, affected)),
                     "request_id": self.request_id,
                     "proof": secrets.token_urlsafe(32),
                     "url": self.registry.client.url,
@@ -506,24 +632,14 @@ class ExistingLoginHandoff:
                             "The account roster changed during migration; reconcile this transfer."
                         )
                     current = self._capture()
-                    if current.live_profiles:
+                    self._require_quiescent(
+                        current, self._journal_profiles(journal, current)
+                    )
+                    if current.profiles != inventory.profiles:
                         raise SessionError(
-                            "A native session started during migration; exit it before retrying."
+                            "Known native profiles changed during migration; repeat inventory."
                         )
-                    known = {
-                        CredentialSource(**item["source"]).id
-                        for item in journal["copies"]
-                    }
-                    for item in current.copies:
-                        if (
-                            item.credential is not None
-                            and item.credential["refreshToken"]
-                            == journal["credential"]["refreshToken"]
-                            and item.source.id not in known
-                        ):
-                            raise SessionError(
-                                "Another refresh copy appeared; cancel and repeat inventory."
-                            )
+                    self._require_known_copies(journal, current)
                     for item in journal["copies"]:
                         source = CredentialSource(**item["source"])
                         raw = source.read()
@@ -540,10 +656,15 @@ class ExistingLoginHandoff:
                         raise SessionError(
                             "A native credential copy reappeared during migration."
                         )
-                    if self._capture().live_profiles:
+                    after_delete = self._capture()
+                    if after_delete.profiles != inventory.profiles:
                         raise SessionError(
-                            "A native session started during migration; exit it before retrying."
+                            "Known native profiles changed during migration; repeat inventory."
                         )
+                    self._require_known_copies(journal, after_delete)
+                    self._require_quiescent(
+                        after_delete, self._journal_profiles(journal, after_delete)
+                    )
                 journal["receipt"] = self.registry.confirm_registration(
                     self.request_id, proof, local_refreshers_stopped=True
                 )
