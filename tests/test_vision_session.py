@@ -250,7 +250,7 @@ def test_existing_native_credentials_and_history_are_untouched(setup, monkeypatc
     assert history.read_text() == "existing conversation"
 
 
-@pytest.mark.parametrize("state", ["current", "obsolete"])
+@pytest.mark.parametrize("state", ["current", "obsolete", "completed", "superseded"])
 def test_unavailable_current_generation_fails_without_polling(setup, monkeypatch, state):
     _, registry, record, _ = setup
     registry.credential.side_effect = VisionError("credential_unavailable")
@@ -265,7 +265,7 @@ def test_unavailable_current_generation_fails_without_polling(setup, monkeypatch
     sleep.assert_not_called()
 
 
-@pytest.mark.parametrize("state", ["current", "obsolete"])
+@pytest.mark.parametrize("state", ["current", "obsolete", "completed", "superseded"])
 def test_no_work_refresh_receipt_still_accepts_concurrent_successor(setup, state):
     _, registry, record, token = setup
     registry.credential.side_effect = [VisionError("credential_unavailable"), token]
