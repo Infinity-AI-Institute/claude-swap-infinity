@@ -670,3 +670,23 @@ def test_explicit_empty_secure_home_fences_custom_native_config_writer(
     with pytest.raises(SessionError, match="selected login"):
         transaction.upload(source, preview["confirmation"])
     registry.prepare_registration.assert_not_called()
+
+
+def test_previous_copy_fences_its_saved_slot_even_when_current_grant_differs(
+    setup, monkeypatch
+):
+    transaction, registry, source, _, _, _, _ = setup
+    routed_fixture(setup)
+    previous = (
+        transaction.switcher.credentials_dir / ".creds-2-other@example.invalid.enc.prev"
+    )
+    put(previous, material(), True)
+    slot_home = transaction.switcher._session_dir("2", "other@example.invalid")
+    preview = transaction.preview(source)
+    monkeypatch.setattr(
+        "claude_swap.vision_inventory.profile_is_quiescent",
+        lambda profile: profile != slot_home,
+    )
+    with pytest.raises(SessionError, match="selected login"):
+        transaction.upload(source, preview["confirmation"])
+    registry.prepare_registration.assert_not_called()
