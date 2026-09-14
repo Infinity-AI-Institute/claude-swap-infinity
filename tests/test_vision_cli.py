@@ -166,3 +166,92 @@ def test_reused_profile_alias_follows_new_verified_login(setup):
     second = run_command(["account-login", "work"], switcher)
     assert first["account_id"] != second["account_id"]
     assert switcher.resolve_account("work")[1] == "another@example.invalid"
+
+
+def test_opted_out_profile_runs_native_resume_without_registry_upload(setup):
+    switcher, client, native = setup
+    run_command(["auto-register", "off"], switcher)
+    run_command(["account-login", "work"], switcher)
+    login_env = native.call_args.kwargs["env"]
+    native.side_effect = None
+    native.return_value = SimpleNamespace(returncode=17)
+    with pytest.raises(SystemExit) as exited:
+        run_command(
+            ["account-run", "work", "--", "--resume", "conversation-id"], switcher
+        )
+    assert exited.value.code == 17
+    assert native.call_args.args[0] == [
+        "/synthetic/claude",
+        "--resume",
+        "conversation-id",
+    ]
+    assert native.call_args.kwargs["env"] == login_env
+    assert not (Path(login_env["CLAUDE_CONFIG_DIR"]) / ".oauth_refresh.lock").exists()
+    client.request.assert_not_called()
+
+
+def test_pending_handoff_blocks_local_run_even_with_upload_disabled(setup):
+    switcher, client, native = setup
+    client.request.side_effect = VisionError("service_unavailable")
+    with pytest.raises(VisionError):
+        run_command(["account-login", "work"], switcher)
+    run_command(["auto-register", "off"], switcher)
+    with pytest.raises(SessionError, match="Recover or cancel"):
+        run_command(["account-run", "work"], switcher)
+    native.assert_called_once()
+
+
+def test_committed_profile_cannot_restart_native_with_retired_refresh_grant(setup):
+    switcher, _, native = setup
+    run_command(["account-login", "work"], switcher)
+    with pytest.raises(SessionError, match="central"):
+        run_command(["account-run", "work"], switcher)
+    native.assert_called_once()
+
+
+def test_local_run_does_not_require_vision_configuration_when_opted_out(
+    setup, monkeypatch
+):
+    switcher, _, native = setup
+    run_command(["auto-register", "off"], switcher)
+    run_command(["account-login", "work"], switcher)
+    monkeypatch.setattr(
+        "claude_swap.vision_cli.configured_client",
+        Mock(side_effect=AssertionError("local launch must not load registry auth")),
+    )
+    native.side_effect = None
+    native.return_value = SimpleNamespace(returncode=0)
+    with pytest.raises(SystemExit) as exited:
+        run_command(["account-run", "work"], switcher)
+    assert exited.value.code == 0
+
+
+def test_changed_native_login_uploads_only_after_process_exit_when_enabled(setup):
+    switcher, client, native = setup
+    run_command(["auto-register", "off"], switcher)
+    run_command(["account-login", "work"], switcher)
+    run_command(["auto-register", "on"], switcher)
+
+    def relogin(argv, *, env, check):
+        from claude_swap.locking import FileLock
+
+        profile = Path(env["CLAUDE_CONFIG_DIR"])
+        competing_upload = FileLock(profile / ".vision-auth.lock", timeout=0)
+        try:
+            assert not competing_upload.acquire()
+        finally:
+            competing_upload.release()
+        client.request.assert_not_called()
+        path = Path(env["CLAUDE_CONFIG_DIR"]) / ".credentials.json"
+        _write_private(
+            path, path.read_text().replace("synthetic-refresh", "new-refresh")
+        )
+        assert not (path.parent / ".oauth_refresh.lock").exists()
+        return SimpleNamespace(returncode=0)
+
+    native.side_effect = relogin
+    with pytest.raises(SystemExit) as exited:
+        run_command(["account-run", "work"], switcher)
+    assert exited.value.code == 0
+    assert len(client.request.call_args_list) == 2
+    assert not list((switcher.backup_dir / "vision-logins").rglob(".credentials.json"))

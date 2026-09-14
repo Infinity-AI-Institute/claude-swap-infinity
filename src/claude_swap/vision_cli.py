@@ -19,6 +19,7 @@ from claude_swap.session import AUTH_OVERRIDE_ENV_VARS, _mkdir_private
 from claude_swap.vision import VisionError, configured_client
 from claude_swap.vision_handoff import (
     ManagedLoginHandoff,
+    _credential,
     _read_private,
     _write_private,
 )
@@ -168,6 +169,53 @@ def name_committed_login(switcher, client, name, receipt):
         _write_private(profiles.path, json.dumps(preferences))
 
 
+def _profile_environment(directory):
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in set(AUTH_OVERRIDE_ENV_VARS) | ROUTE_OVERRIDES
+        and key not in {"VISION_API_KEY", "VISION_API_URL"}
+    }
+    env["CLAUDE_CONFIG_DIR"] = str(directory)
+    env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] = str(directory)
+    return env
+
+
+def run_profile(switcher, name, native_args):
+    """Keep the ownership lease until the native local process has exited."""
+    profiles = ManagedProfiles(switcher.backup_dir)
+    profile_id = profiles.profile(name)
+    native = shutil.which("claude")
+    if native is None:
+        raise SessionError("Install Claude Code before running a provider profile.")
+    with ManagedLoginHandoff(switcher.backup_dir, profile_id, None) as lease:
+        lease.prepare_login()
+        before = lease._stores()
+        material = before["keychain"] or before["file"]
+        if material is None:
+            raise SessionError(
+                "This profile has no local login. Use its central account alias "
+                "with cswap run, or use account-login for a new login."
+            )
+        _credential(material)
+        # The managed lease prevents an upload while native holds refresh
+        # material in memory. Native refresh locks are released before launch.
+        result = subprocess.run(
+            [native, *native_args], env=_profile_environment(lease.profile), check=False
+        )
+        if (
+            result.returncode == 0
+            and profiles.read()["auto_register"]
+            and lease._stores() != before
+        ):
+            client = configured_client()
+            if client is not None:
+                lease.registry = RegistrationClient(client)
+                receipt = lease.upload()
+                name_committed_login(switcher, client, name, receipt)
+    raise SystemExit(result.returncode)
+
+
 def login_profile(switcher, name):
     profiles = ManagedProfiles(switcher.backup_dir)
     profile_id = profiles.profile(name, create=True)
@@ -179,14 +227,7 @@ def login_profile(switcher, name):
     with ManagedLoginHandoff(switcher.backup_dir, profile_id, registry) as lease:
         lease.prepare_login()
         before = lease._stores()
-        env = {
-            key: value
-            for key, value in os.environ.items()
-            if key not in set(AUTH_OVERRIDE_ENV_VARS) | ROUTE_OVERRIDES
-            and key not in {"VISION_API_KEY", "VISION_API_URL"}
-        }
-        env["CLAUDE_CONFIG_DIR"] = str(lease.profile)
-        env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] = str(lease.profile)
+        env = _profile_environment(lease.profile)
         result = subprocess.run([native, "auth", "login"], env=env, check=False)
         if result.returncode != 0:
             raise SystemExit(result.returncode)
@@ -215,6 +256,9 @@ def run_command(argv, switcher):
     commands.add_parser("cancel")
     for command in ("account-login", "upload", "cancel-upload"):
         commands.add_parser(command).add_argument("name")
+    local_run = commands.add_parser("account-run")
+    local_run.add_argument("name")
+    local_run.add_argument("native_args", nargs=argparse.REMAINDER)
     batch = commands.add_parser("batch-upload")
     batch.add_argument("names", nargs="+")
     batch.add_argument("--confirm")
@@ -250,6 +294,11 @@ def run_command(argv, switcher):
     if args.command == "auto-register":
         profiles.set_auto_register(args.value == "on")
         return {"auto_register": profiles.read()["auto_register"]}
+    if args.command == "account-run":
+        native_args = args.native_args
+        if native_args[:1] == ["--"]:
+            native_args = native_args[1:]
+        return run_profile(switcher, args.name, native_args)
     if args.command == "account-login":
         return login_profile(switcher, args.name)
     if args.command == "batch-upload":
