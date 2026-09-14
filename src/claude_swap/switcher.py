@@ -1043,6 +1043,8 @@ class ClaudeAccountSwitcher:
             raise ConfigError(f"Alias '{normalized}' is already used by account {conflict}")
 
         record["alias"] = normalized
+        # Explicit alias edits replace names retained by credential migration.
+        record.pop("visionMigratedAliases", None)
         data["lastUpdated"] = get_timestamp()
         self._write_json(self.sequence_file, data)
         return account_num, normalized
@@ -1069,8 +1071,9 @@ class ClaudeAccountSwitcher:
         if not record:
             raise AccountNotFoundError(f"Account-{account_num} does not exist")
 
-        if "alias" in record:
-            del record["alias"]
+        if "alias" in record or record.get("visionMigratedAliases"):
+            record.pop("alias", None)
+            record.pop("visionMigratedAliases", None)
             data["lastUpdated"] = get_timestamp()
             self._write_json(self.sequence_file, data)
         return account_num
@@ -1080,9 +1083,9 @@ class ClaudeAccountSwitcher:
         data = self._get_sequence_data_migrated()
         accounts = (data or {}).get("accounts", {})
         rows = [
-            (num, acc.get("alias"), acc.get("email", ""))
+            (num, alias, acc.get("email", ""))
             for num, acc in accounts.items()
-            if acc.get("alias")
+            for alias in self._account_aliases(acc)
         ]
         return sorted(rows, key=lambda r: int(r[0]))
 
@@ -3115,6 +3118,18 @@ class ClaudeAccountSwitcher:
         """Return display tag for an account's org context."""
         return org_name if org_name else "personal"
 
+    @staticmethod
+    def _account_aliases(account: dict) -> list[str]:
+        aliases = [account["alias"]] if account.get("alias") else []
+        if account.get("source") == "vision":
+            migrated = account.get("visionMigratedAliases", [])
+            if not isinstance(migrated, list) or any(
+                not isinstance(name, str) for name in migrated
+            ):
+                raise ConfigError("Migrated Vision aliases need repair.")
+            aliases.extend(name for name in migrated if name and name not in aliases)
+        return aliases
+
     def _find_account_by_alias(self, alias: str) -> str | None:
         """Return the account number whose alias matches (case-insensitive), if any.
 
@@ -3129,7 +3144,7 @@ class ClaudeAccountSwitcher:
             return None
         alias_key = alias.lower()
         for num, account in data.get("accounts", {}).items():
-            if (account.get("alias") or "").lower() == alias_key:
+            if any(name.lower() == alias_key for name in self._account_aliases(account)):
                 return num
         return None
 

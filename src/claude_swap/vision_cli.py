@@ -262,6 +262,15 @@ def run_command(argv, switcher):
     batch = commands.add_parser("batch-upload")
     batch.add_argument("names", nargs="+")
     batch.add_argument("--confirm")
+    migration = commands.add_parser("migrate-login")
+    migration.add_argument("source_id")
+    migration.add_argument("--request-id")
+    migration.add_argument("--confirm")
+    migration.add_argument("--profile", action="append", default=[])
+    for command in ("recover-migration", "cancel-migration"):
+        recovery = commands.add_parser(command)
+        recovery.add_argument("request_id")
+        recovery.add_argument("--profile", action="append", default=[])
     commands.add_parser("existing-logins").add_argument(
         "--profile", action="append", default=[]
     )
@@ -292,6 +301,32 @@ def run_command(argv, switcher):
             if result["state"] != "pending":
                 return result
             time.sleep(min(30, result["retry_after_seconds"]))
+    if args.command in {"migrate-login", "recover-migration", "cancel-migration"}:
+        from claude_swap.vision_existing_handoff import ExistingLoginHandoff
+
+        client = configured_client()
+        if client is None:
+            raise SessionError("Sign in to Vision before migrating an existing login.")
+        registry = RegistrationClient(client)
+        if args.command == "migrate-login" and args.request_id is None:
+            if args.confirm is not None:
+                raise SessionError("Apply the preview with its original --request-id.")
+            transaction = ExistingLoginHandoff.new(switcher, registry, args.profile)
+        else:
+            transaction = ExistingLoginHandoff(
+                switcher, registry, args.request_id, args.profile
+            )
+        if args.command == "migrate-login" and args.confirm is None:
+            return transaction.preview(args.source_id)
+        if args.command == "cancel-migration":
+            receipt = transaction.cancel()
+        elif args.command == "recover-migration":
+            receipt = transaction.upload()
+        else:
+            receipt = transaction.upload(args.source_id, args.confirm)
+        if receipt["state"] == "committed":
+            return transaction.route_committed()
+        return receipt
     if args.command == "existing-logins":
         from claude_swap.vision_inventory import capture_inventory
 

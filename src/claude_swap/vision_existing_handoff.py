@@ -16,11 +16,13 @@ from pathlib import Path
 
 from claude_swap import macos_keychain
 from claude_swap.claude_locks import claude_credentials_lock
+from claude_swap.credentials import SECURITY_SERVICE
 from claude_swap.exceptions import SessionError
 from claude_swap.locking import FileLock
 from claude_swap.vision_handoff import _read_private, _sync_directory, _write_private
 from claude_swap.vision_inventory import CredentialSource, _decode, capture_inventory
 from claude_swap.vision_registration import registration_proof, registration_receipt
+from claude_swap.vision_registry import merge_accounts
 
 
 def _fingerprint(inventory):
@@ -69,6 +71,8 @@ class ExistingLoginHandoff:
                 "credential",
                 "receipt",
                 "roster",
+                "local_slots",
+                "routing_complete",
             }:
                 raise ValueError()
             if type(value["version"]) is not int or value["version"] != 1:
@@ -82,6 +86,11 @@ class ExistingLoginHandoff:
             if value["extra_profiles"] != list(self.extra_profiles):
                 raise ValueError()
             if not isinstance(value["copies"], list) or len(value["copies"]) > 1000:
+                raise ValueError()
+            if (
+                not isinstance(value["local_slots"], dict)
+                or type(value["routing_complete"]) is not bool
+            ):
                 raise ValueError()
             known = self._capture()
             known_ids = {item.source.id for item in known.copies}
@@ -176,6 +185,142 @@ class ExistingLoginHandoff:
                     "Credential stores changed while acquiring migration locks; retry."
                 )
             yield current
+
+    def _local_slots(self, inventory, refresh_token):
+        """Bind only slots whose currently served backup is the selected grant."""
+        copies = {item.source.id: item for item in inventory.copies}
+        result = {}
+        roster = self.switcher._get_sequence_data() or {}
+        for number, record in roster.get("accounts", {}).items():
+            if record.get("source") == "vision":
+                continue
+            email = record["email"]
+            file_source = CredentialSource(
+                "file",
+                str(self.switcher._store._backup_enc_path(number, email)),
+                encoding="base64",
+            )
+            keychain_source = CredentialSource(
+                "keychain", SECURITY_SERVICE, f"account-{number}-{email}"
+            )
+            file_copy = copies.get(file_source.id)
+            keychain_copy = copies.get(keychain_source.id)
+            served = (
+                file_copy
+                if file_copy is not None and file_copy.raw is not None
+                else keychain_copy
+            )
+            if (
+                served is not None
+                and served.credential is not None
+                and served.credential["refreshToken"] == refresh_token
+            ):
+                result[number] = record
+        return result
+
+    def route_committed(self):
+        """Convert migrated slots to one verified remote row, preserving aliases."""
+        with self._lease():
+            journal = self._read()
+            if (
+                journal is None
+                or journal["receipt"] is None
+                or journal["receipt"]["state"] != "committed"
+            ):
+                raise SessionError(
+                    "Central ownership must commit before changing local account routes."
+                )
+            if journal["routing_complete"]:
+                return journal["receipt"]
+            receipt = journal["receipt"]
+            items = self.registry.client.discover()
+            target = next(
+                (
+                    item
+                    for item in items
+                    if item["login_id"] == receipt["login_id"]
+                    and item["account_id"] == receipt["account_id"]
+                ),
+                None,
+            )
+            if target is not None and (
+                target["email"] != receipt["email"]
+                or target["organization_id"] != receipt["organization_id"]
+            ):
+                raise SessionError(
+                    "The committed login identity changed; refresh registry discovery before routing."
+                )
+            if target is None:
+                raise SessionError(
+                    "The committed login is not currently authorized; recover routing after access is restored."
+                )
+            with FileLock(self.switcher.lock_file):
+                current = self.switcher._get_sequence_data() or {}
+                accounts = current.get("accounts", {})
+                for number, original in journal["local_slots"].items():
+                    row = accounts.get(number)
+                    if row is not None and row != original:
+                        raise SessionError(
+                            "A migrated slot was reassigned; reconcile its local route before retrying."
+                        )
+                prepared = dict(current)
+                prepared["visionLastSlot"] = max(
+                    current.get("visionLastSlot", 0),
+                    *(int(number) for number in accounts),
+                    0,
+                )
+                prepared["accounts"] = {
+                    number: row
+                    for number, row in accounts.items()
+                    if number not in journal["local_slots"]
+                }
+                merged = merge_accounts(prepared, items, self.registry.client.url)
+                remote = next(
+                    row
+                    for row in merged["accounts"].values()
+                    if row.get("visionLoginId") == receipt["login_id"]
+                    and row.get("visionUrl") == self.registry.client.url
+                )
+                other_names = {
+                    name
+                    for row in merged["accounts"].values()
+                    if row is not remote
+                    for name in self.switcher._account_aliases(row)
+                }
+                previous_remote = next(
+                    (
+                        row
+                        for row in accounts.values()
+                        if row.get("visionLoginId") == receipt["login_id"]
+                        and row.get("visionUrl") == self.registry.client.url
+                    ),
+                    None,
+                )
+                aliases = set(remote.get("visionMigratedAliases", []))
+                if previous_remote is not None:
+                    aliases.update(self.switcher._account_aliases(previous_remote))
+                for row in journal["local_slots"].values():
+                    alias = row.get("alias")
+                    if alias:
+                        if alias in other_names:
+                            raise SessionError(
+                                "A migrated alias is now used by another account; reconcile it before retrying."
+                            )
+                        aliases.add(alias)
+                if journal["local_slots"]:
+                    remote["disabled"] = remote.get("disabled", False) or all(
+                        row.get("disabled", False)
+                        for row in journal["local_slots"].values()
+                    )
+                remote["visionMigratedAliases"] = sorted(aliases)
+                if previous_remote is not None and previous_remote.get("alias"):
+                    remote["alias"] = previous_remote["alias"]
+                elif aliases:
+                    remote["alias"] = min(aliases)
+                self.switcher._write_json(self.switcher.sequence_file, merged)
+            journal["routing_complete"] = True
+            self._save(journal)
+            return receipt
 
     def preview(self, source_id):
         inventory = self._capture()
@@ -305,6 +450,10 @@ class ExistingLoginHandoff:
                     "credential": selected.credential,
                     "receipt": None,
                     "roster": self.switcher._get_sequence_data() or {},
+                    "local_slots": self._local_slots(
+                        inventory, selected.credential["refreshToken"]
+                    ),
+                    "routing_complete": False,
                 }
                 self._save(journal)
                 journal = self._read()

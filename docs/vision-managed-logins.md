@@ -1,7 +1,7 @@
 # Managed Claude logins (development branch)
 
 The Vision client commands below are implemented on this branch. They are not
-released yet; existing/default-profile migration and unattended session recovery
+released yet; native-history migration and unattended session recovery
 still need implementation and acceptance testing.
 
 ## Keep a managed login local
@@ -70,5 +70,47 @@ must be reconciled before inventorying existing credentials. Arbitrary portable
 exports elsewhere on disk are not searched.
 
 The result is an inventory, not an ownership transfer or proof that native
-refreshers have stopped. The existing-profile transfer command is not implemented
-yet; do not copy these credentials into a new managed profile to bypass handoff.
+refreshers have stopped. Do not copy these credentials into a new managed profile
+to bypass handoff.
+
+## Transfer a selected existing login
+
+Exit the native sessions before transfer. Use a `source_id` from the inventory:
+
+```sh
+cswap vision migrate-login SOURCE_ID
+cswap vision migrate-login SOURCE_ID --request-id REQUEST_ID --confirm CONFIRMATION
+```
+
+The first command returns the request ID, confirmation value and all known copies
+of the selected refresh grant. The second command applies that preview. Repeat
+any `--profile PATH` options used during inventory on both commands and recovery.
+A changed source, registry, API key or request ID requires a new preview.
+
+The transfer stores exact backend bytes in a private recovery journal before
+removing them. It waits for local refresh operations, takes native refresh locks,
+and refuses to confirm central ownership while a known native session is active
+or a credential source changes. It does not stop native sessions automatically.
+Unselected refresh grants remain local.
+
+After commit, slots whose current backup held the selected grant become one
+central account using provider-verified identity. Their aliases continue to resolve
+to that account, including after normal registry discovery. `cswap alias` listings
+include retained aliases. An explicit alias rename or removal replaces those
+retained names. Slots holding another grant are preserved.
+
+```sh
+cswap vision recover-migration REQUEST_ID
+cswap vision cancel-migration REQUEST_ID
+```
+
+Recovery reuses the original registration request and proof. Cancellation restores
+local bytes only after the registry confirms a cancelled or expired transfer; a
+committed transfer stays central. Newer local logins are preserved. If a slot was
+reassigned during transfer, recovery requires reconciling that local assignment
+before restoring credentials. Interrupted central routing can be retried with
+`recover-migration` without registering the login again.
+
+Native history files remain in their original profiles. Importing them into the
+central launch profile is not implemented yet, so native resume across this
+migration is still an unfinished acceptance requirement.

@@ -253,3 +253,156 @@ def test_busy_local_consumer_prevents_registration(setup, monkeypatch):
     ):
         transaction.upload(source, preview["confirmation"])
     registry.prepare_registration.assert_not_called()
+
+
+def routed_fixture(setup):
+    transaction, registry, source, _, _native, _backup, _other = setup
+    switcher = transaction.switcher
+    switcher._write_json(
+        switcher.sequence_file,
+        {
+            "accounts": {
+                "1": {"email": "test@example.invalid", "alias": "work"},
+                "2": {"email": "other@example.invalid", "alias": "other"},
+            },
+            "sequence": [1, 2],
+            "activeAccountNumber": 1,
+        },
+    )
+    registry.client.discover = Mock(
+        return_value=[
+            {
+                "account_id": "aia_00000000-0000-4000-8000-000000000002",
+                "login_id": "ail_00000000-0000-4000-8000-000000000003",
+                "provider": "claude",
+                "email": "synthetic@example.invalid",
+                "organization_id": "organization",
+                "subscription": {"plan": "max"},
+                "login_generation": 1,
+            }
+        ]
+    )
+    return transaction, registry, source
+
+
+def test_committed_route_uses_verified_identity_preserves_alias_and_other_account(
+    setup,
+):
+    transaction, registry, source = routed_fixture(setup)
+    preview = transaction.preview(source)
+    transaction.upload(source, preview["confirmation"])
+    transaction.route_committed()
+    switcher = transaction.switcher
+    number, email, organization = switcher.resolve_account("work")
+    assert int(number) > 2
+    assert (email, organization) == (
+        "synthetic@example.invalid",
+        "organization",
+    )
+    assert switcher.resolve_account("other")[0] == "2"
+    assert "1" not in switcher._get_sequence_data()["accounts"]
+    assert switcher._get_sequence_data()["activeAccountNumber"] is None
+    # Ordinary rediscovery must preserve migration alias routing.
+    switcher.sync_vision_accounts = Mock()
+    from claude_swap.vision_registry import RegistryPool
+
+    RegistryPool(switcher, registry.client).sync(force=True)
+    assert switcher.resolve_account("work")[0] == number
+
+
+def test_lost_routing_journal_write_replays_without_reassigning_slots(
+    setup, monkeypatch
+):
+    transaction, _, source = routed_fixture(setup)
+    transaction.upload(source, transaction.preview(source)["confirmation"])
+    save = transaction._save
+    monkeypatch.setattr(
+        transaction, "_save", Mock(side_effect=OSError("interrupted journal save"))
+    )
+    with pytest.raises(OSError):
+        transaction.route_committed()
+    first = transaction.switcher.resolve_account("work")
+    monkeypatch.setattr(transaction, "_save", save)
+    transaction.route_committed()
+    assert transaction.switcher.resolve_account("work") == first
+
+
+def test_migration_cli_preview_apply_and_recovery_are_bound_to_one_request(
+    setup, monkeypatch
+):
+    from claude_swap.vision_cli import run_command
+
+    transaction, registry, source = routed_fixture(setup)
+    switcher = transaction.switcher
+    monkeypatch.setattr(
+        "claude_swap.vision_cli.configured_client", lambda: registry.client
+    )
+    monkeypatch.setattr("claude_swap.vision_cli.RegistrationClient", lambda _: registry)
+    preview = run_command(["migrate-login", source], switcher)
+    registry.prepare_registration.assert_not_called()
+    result = run_command(
+        [
+            "migrate-login",
+            source,
+            "--request-id",
+            preview["request_id"],
+            "--confirm",
+            preview["confirmation"],
+        ],
+        switcher,
+    )
+    assert result["state"] == "committed"
+    assert switcher.resolve_account("work")[1] == "synthetic@example.invalid"
+    assert run_command(["recover-migration", preview["request_id"]], switcher) == result
+    registry.prepare_registration.assert_called_once()
+
+
+def test_duplicate_local_slots_keep_aliases_on_one_central_account(setup):
+    from claude_swap.exceptions import AccountNotFoundError, ConfigError
+
+    transaction, _registry, source = routed_fixture(setup)
+    switcher = transaction.switcher
+    roster = switcher._get_sequence_data()
+    roster["accounts"]["3"] = {"email": "duplicate@example.invalid", "alias": "second"}
+    roster["sequence"].append(3)
+    switcher._write_json(switcher.sequence_file, roster)
+    put(
+        switcher.credentials_dir / ".creds-3-duplicate@example.invalid.enc",
+        material(),
+        True,
+    )
+    transaction.upload(source, transaction.preview(source)["confirmation"])
+    transaction.route_committed()
+    number = switcher.resolve_account("work")[0]
+    assert switcher.resolve_account("second")[0] == number
+    assert len(switcher._get_sequence_data()["accounts"]) == 2
+    assert {row[1] for row in switcher.list_aliases()} == {"work", "second", "other"}
+    with pytest.raises(ConfigError):
+        switcher.set_alias("other", "second")
+    switcher.set_alias("work", "renamed")
+    assert switcher.resolve_account("renamed")[0] == number
+    with pytest.raises(AccountNotFoundError):
+        switcher.resolve_account("second")
+
+
+def test_migration_preserves_an_existing_remote_alias_and_disabled_preference(setup):
+    from claude_swap.vision_registry import merge_accounts
+
+    transaction, registry, source = routed_fixture(setup)
+    switcher = transaction.switcher
+    roster = merge_accounts(
+        switcher._get_sequence_data(), registry.client.discover(), registry.client.url
+    )
+    remote = next(
+        row for row in roster["accounts"].values() if row.get("source") == "vision"
+    )
+    remote["alias"] = "shared"
+    remote["disabled"] = True
+    switcher._write_json(switcher.sequence_file, roster)
+    transaction.upload(source, transaction.preview(source)["confirmation"])
+    transaction.route_committed()
+    number = switcher.resolve_account("work")[0]
+    assert switcher.resolve_account("shared")[0] == number
+    remote = switcher._get_sequence_data()["accounts"][number]
+    assert remote["alias"] == "shared"
+    assert remote["disabled"] is True

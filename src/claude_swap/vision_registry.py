@@ -29,6 +29,11 @@ def merge_accounts(
             or int(number) < 1
             or not isinstance(record, dict)
             or not isinstance(record.get("alias", ""), (str, type(None)))
+            or not isinstance(record.get("visionMigratedAliases", []), list)
+            or any(
+                not isinstance(alias, str) or not alias
+                for alias in record.get("visionMigratedAliases", [])
+            )
             or (
                 record.get("source") == "vision"
                 and not isinstance(record.get("visionLoginId"), str)
@@ -72,6 +77,10 @@ def merge_accounts(
             suffix += 1
             alias = f"{default_alias}-{suffix}"
         names.add(alias)
+        migrated_aliases = old.get("visionMigratedAliases", [])
+        if any(name in names and name != alias for name in migrated_aliases):
+            raise ConfigError("A migrated Vision alias conflicts with another account.")
+        names.update(migrated_aliases)
         remote[number] = {
             "email": item["email"],
             "uuid": item["login_id"],
@@ -80,6 +89,7 @@ def merge_accounts(
             "added": old.get("added") or get_timestamp(),
             "alias": alias,
             "disabled": old.get("disabled", False),
+            "visionMigratedAliases": old.get("visionMigratedAliases", []),
             "source": "vision",
             "visionUrl": url,
             "visionAccountId": item["account_id"],
