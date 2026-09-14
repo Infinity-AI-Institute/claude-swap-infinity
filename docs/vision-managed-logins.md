@@ -1,8 +1,8 @@
 # Managed Claude logins (development branch)
 
 The Vision client commands below are implemented on this branch. They are not
-released yet; native-history migration and unattended session recovery
-still need implementation and acceptance testing.
+released yet; unattended session recovery and full rollout acceptance
+still need implementation and testing.
 
 ## Keep a managed login local
 
@@ -111,6 +111,24 @@ reassigned during transfer, recovery requires reconciling that local assignment
 before restoring credentials. Interrupted central routing can be retried with
 `recover-migration` without registering the login again.
 
-Native history files remain in their original profiles. Importing them into the
-central launch profile is not implemented yet, so native resume across this
-migration is still an unfinished acceptance requirement.
+Before registration, migration snapshots `projects/` and `history.jsonl` from
+profiles holding the selected grant and the migrated slots' compatible session
+profiles. After ownership commits, that snapshot is imported into the stable
+central launch profile. Original histories remain unchanged. Authentication files,
+account configuration and settings are not imported.
+
+Resume with the original conversation ID after migration:
+
+```sh
+cswap run work -- --resume CONVERSATION_ID
+```
+
+Repeated imports preserve an already extended transcript and deduplicate history
+index entries. Divergent versions of the same conversation stop import and retain
+both copies for reconciliation. A pending-import marker blocks new central
+launches until `recover-migration` completes the import. Links to another known
+profile's shared history are supported; unknown or nested links are refused.
+
+Pinned Claude 2.1.270 has passed synthetic access-only inference and same-session
+resume after importing history into a different profile. The live multiuser pilot
+and clean EC2 rollout acceptance remain separate required checks.

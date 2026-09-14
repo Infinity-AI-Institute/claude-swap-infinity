@@ -13,6 +13,7 @@ from claude_swap import macos_keychain
 from claude_swap.exceptions import SessionError
 from claude_swap.models import Platform
 from claude_swap.vision import VisionClient, VisionError, registry_id
+from claude_swap.vision_history import HISTORY_MARKER
 
 # A selected Vision credential must not inherit another provider route or auth
 # source from the terminal that invoked the launcher.
@@ -64,6 +65,16 @@ def acquire_credential(client: VisionClient, record: dict, *, wait_seconds=90):
         time.sleep(min(1, max(0, deadline - time.monotonic())))
 
 
+def session_directory(backup_dir, url, login_id):
+    registry_id(login_id, "ail_")
+    return (
+        backup_dir
+        / "vision-sessions"
+        / hashlib.sha256(url.encode()).hexdigest()
+        / login_id
+    )
+
+
 def prepare_launch(
     manager,
     record: dict,
@@ -96,13 +107,20 @@ def prepare_launch(
     # data stable when permissions or local display preferences change.
     scope = hashlib.sha256(client.url.encode()).hexdigest()
     root = manager.switcher.backup_dir / "vision-sessions"
-    directory = root / scope / credential["login_id"]
+    directory = session_directory(
+        manager.switcher.backup_dir, client.url, credential["login_id"]
+    )
     for path in (root, root / scope, directory):
         if path.is_symlink() or (
             path.exists() and not stat.S_ISDIR(path.stat().st_mode)
         ):
             raise SessionError("The Vision session path must be a real directory.")
     _mkdir_private(directory)
+    marker = directory / HISTORY_MARKER
+    if marker.exists() or marker.is_symlink():
+        raise SessionError(
+            "Recover the pending migration history import before launching this account."
+        )
     # Never overwrite or silently adopt credentials created by a native login.
     # That grant needs the explicit ownership handoff before central use resumes.
     auth_path = directory / ".credentials.json"

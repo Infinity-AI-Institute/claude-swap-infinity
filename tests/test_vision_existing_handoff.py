@@ -406,3 +406,34 @@ def test_migration_preserves_an_existing_remote_alias_and_disabled_preference(se
     remote = switcher._get_sequence_data()["accounts"][number]
     assert remote["alias"] == "shared"
     assert remote["disabled"] is True
+
+
+def test_migration_snapshots_native_history_before_ownership_and_installs_for_central_alias(
+    setup,
+):
+    from claude_swap.vision_session import session_directory
+
+    transaction, registry, source = routed_fixture(setup)
+    native_profile = next(
+        item.source.location
+        for item in transaction._capture().copies
+        if item.source.id == source
+    )
+    from pathlib import Path
+
+    profile = Path(native_profile).parent
+    transcript = profile / "projects" / "project" / "session.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text("original conversation\n")
+    transaction.upload(source, transaction.preview(source)["confirmation"])
+    transcript.write_text("original conversation\nnew local session\n")
+    result = transaction.route_committed()
+    destination = session_directory(
+        transaction.switcher.backup_dir, registry.client.url, result["login_id"]
+    )
+    assert (
+        destination / "projects" / "project" / "session.jsonl"
+    ).read_text() == "original conversation\n"
+    assert not (destination / ".credentials.json").exists()
+    assert transcript.read_text().endswith("new local session\n")
+    assert not transaction.history_path.exists()

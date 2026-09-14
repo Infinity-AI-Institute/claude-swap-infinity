@@ -66,6 +66,7 @@ class Inventory:
     copies: tuple[CredentialCopy, ...] = field(repr=False)
     profiles: tuple[Path, ...]
     live_profiles: tuple[Path, ...]
+    profile_sources: dict[str, Path] = field(default_factory=dict, repr=False)
 
     def public(self):
         candidates = []
@@ -136,12 +137,15 @@ def _decode(source, raw):
 
 def capture_inventory(switcher, extra_profiles=()):
     sources = {}
+    profile_sources = {}
     profiles = set()
     is_macos = Platform.detect() == Platform.MACOS
     username = macos_keychain.keychain_account_name() if is_macos else ""
 
-    def add(source):
+    def add(source, native_profile=None):
         sources[source.id] = source
+        if native_profile is not None:
+            profile_sources[source.id] = native_profile
         if len(sources) > MAX_SOURCES:
             raise SessionError("Too many credential sources for one migration.")
 
@@ -165,12 +169,13 @@ def capture_inventory(switcher, extra_profiles=()):
             except (ValueError, TypeError, KeyError):
                 raise SessionError("A managed handoff journal needs repair.") from None
         profiles.add(path)
-        add(CredentialSource("file", str(path / ".credentials.json")))
+        add(CredentialSource("file", str(path / ".credentials.json")), path)
         if is_macos:
             add(
                 CredentialSource(
                     "keychain", keychain_service_name(native_path), username
-                )
+                ),
+                path,
             )
 
     default = get_default_claude_config_home()
@@ -182,7 +187,10 @@ def capture_inventory(switcher, extra_profiles=()):
     for path in extra_profiles:
         profile(path)
     if is_macos:
-        add(CredentialSource("keychain", CLAUDE_CODE_KEYCHAIN_SERVICE, username))
+        add(
+            CredentialSource("keychain", CLAUDE_CODE_KEYCHAIN_SERVICE, username),
+            default.absolute(),
+        )
 
     # Include orphaned files as well as current roster slots. Previous and
     # stashed generations can still be restored by the legacy recovery code.
@@ -225,6 +233,8 @@ def capture_inventory(switcher, extra_profiles=()):
     # Directory scans also find detached native profiles no longer in the roster.
     for name in ("sessions", "vision-logins"):
         for path in _directory_entries(switcher.backup_dir / name):
+            if path.name.endswith(".lock"):
+                continue  # Native proper-lockfile directories are not profiles.
             if path.is_symlink():
                 raise SessionError("A migration profile cannot be a symbolic link.")
             if path.is_dir():
@@ -235,6 +245,8 @@ def capture_inventory(switcher, extra_profiles=()):
         if not scope.is_dir():
             continue
         for path in _directory_entries(scope):
+            if path.name.endswith(".lock"):
+                continue
             profile(path)
 
     copies = []
@@ -249,4 +261,5 @@ def capture_inventory(switcher, extra_profiles=()):
         tuple(copies),
         ordered_profiles,
         tuple(path for path in ordered_profiles if not profile_is_quiescent(path)),
+        profile_sources,
     )

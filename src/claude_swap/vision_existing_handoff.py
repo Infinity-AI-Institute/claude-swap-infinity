@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import secrets
+import shutil
 import uuid
 from contextlib import ExitStack, contextmanager
 from dataclasses import asdict
@@ -20,9 +21,11 @@ from claude_swap.credentials import SECURITY_SERVICE
 from claude_swap.exceptions import SessionError
 from claude_swap.locking import FileLock
 from claude_swap.vision_handoff import _read_private, _sync_directory, _write_private
+from claude_swap.vision_history import copy_history, install_history
 from claude_swap.vision_inventory import CredentialSource, _decode, capture_inventory
 from claude_swap.vision_registration import registration_proof, registration_receipt
 from claude_swap.vision_registry import merge_accounts
+from claude_swap.vision_session import session_directory
 
 
 def _fingerprint(inventory):
@@ -42,6 +45,7 @@ class ExistingLoginHandoff:
         self.extra_profiles = tuple(str(path) for path in extra_profiles)
         self.root = switcher.backup_dir / "vision-migrations"
         self.path = self.root / (request_id + ".json")
+        self.history_path = self.root / (request_id + ".history")
 
     @classmethod
     def new(cls, switcher, registry, extra_profiles=()):
@@ -73,6 +77,8 @@ class ExistingLoginHandoff:
                 "roster",
                 "local_slots",
                 "routing_complete",
+                "history_sources",
+                "history_snapshotted",
             }:
                 raise ValueError()
             if type(value["version"]) is not int or value["version"] != 1:
@@ -91,6 +97,13 @@ class ExistingLoginHandoff:
                 not isinstance(value["local_slots"], dict)
                 or type(value["routing_complete"]) is not bool
             ):
+                raise ValueError()
+            if not isinstance(value["history_sources"], list) or any(
+                not isinstance(path, str) or not Path(path).is_absolute()
+                for path in value["history_sources"]
+            ):
+                raise ValueError()
+            if type(value["history_snapshotted"]) is not bool:
                 raise ValueError()
             known = self._capture()
             known_ids = {item.source.id for item in known.copies}
@@ -231,6 +244,8 @@ class ExistingLoginHandoff:
                     "Central ownership must commit before changing local account routes."
                 )
             if journal["routing_complete"]:
+                if self.history_path.exists():
+                    shutil.rmtree(self.history_path)
                 return journal["receipt"]
             receipt = journal["receipt"]
             items = self.registry.client.discover()
@@ -254,6 +269,19 @@ class ExistingLoginHandoff:
                 raise SessionError(
                     "The committed login is not currently authorized; recover routing after access is restored."
                 )
+            if not journal["history_snapshotted"]:
+                raise SessionError(
+                    "The migration history snapshot is incomplete; recover the transfer first."
+                )
+            install_history(
+                self.history_path,
+                session_directory(
+                    self.switcher.backup_dir,
+                    self.registry.client.url,
+                    receipt["login_id"],
+                ),
+                self.request_id,
+            )
             with FileLock(self.switcher.lock_file):
                 current = self.switcher._get_sequence_data() or {}
                 accounts = current.get("accounts", {})
@@ -320,6 +348,7 @@ class ExistingLoginHandoff:
                 self.switcher._write_json(self.switcher.sequence_file, merged)
             journal["routing_complete"] = True
             self._save(journal)
+            shutil.rmtree(self.history_path)
             return receipt
 
     def preview(self, source_id):
@@ -437,6 +466,27 @@ class ExistingLoginHandoff:
                     and item.credential["refreshToken"]
                     == selected.credential["refreshToken"]
                 ]
+                local_slots = self._local_slots(
+                    inventory, selected.credential["refreshToken"]
+                )
+                history_sources = {
+                    inventory.profile_sources[item.source.id]
+                    for item in matching
+                    if item.source.id in inventory.profile_sources
+                }
+                for number, row in local_slots.items():
+                    profile = self.switcher._session_dir(number, row["email"])
+                    credentials = [
+                        item.credential
+                        for item in inventory.copies
+                        if inventory.profile_sources.get(item.source.id) == profile
+                        and item.credential is not None
+                    ]
+                    if not credentials or all(
+                        value["refreshToken"] == selected.credential["refreshToken"]
+                        for value in credentials
+                    ):
+                        history_sources.add(profile)
                 journal = {
                     "version": 1,
                     "request_id": self.request_id,
@@ -450,10 +500,10 @@ class ExistingLoginHandoff:
                     "credential": selected.credential,
                     "receipt": None,
                     "roster": self.switcher._get_sequence_data() or {},
-                    "local_slots": self._local_slots(
-                        inventory, selected.credential["refreshToken"]
-                    ),
+                    "local_slots": local_slots,
                     "routing_complete": False,
+                    "history_sources": sorted(str(path) for path in history_sources),
+                    "history_snapshotted": False,
                 }
                 self._save(journal)
                 journal = self._read()
@@ -464,6 +514,18 @@ class ExistingLoginHandoff:
             }:
                 self._finish(journal)
                 return journal["receipt"]
+            if not journal["history_snapshotted"]:
+                known_profiles = set(inventory.profiles)
+                history_sources = [Path(path) for path in journal["history_sources"]]
+                if not set(history_sources).issubset(known_profiles):
+                    raise SessionError(
+                        "A migration history source is no longer in the known profile inventory."
+                    )
+                copy_history(
+                    history_sources, self.history_path, known_profiles=known_profiles
+                )
+                journal["history_snapshotted"] = True
+                self._save(journal)
             proof = journal["proof"]
             if journal["receipt"] is None or journal["receipt"]["state"] == "preparing":
                 for item in journal["copies"]:

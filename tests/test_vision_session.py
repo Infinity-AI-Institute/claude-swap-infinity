@@ -206,3 +206,13 @@ def test_keychain_native_login_or_unknown_store_blocks_remote_launch(
     assert "secret-bearing" not in str(error.value)
     lookup.assert_called_once_with(keychain_service_name(first.directory), "test-user")
     manager._sync_sharing.assert_not_called()
+
+
+def test_unfinished_history_import_blocks_central_launch(setup):
+    from claude_swap.vision_history import HISTORY_MARKER
+
+    manager, registry, record, _ = setup
+    launch = prepare_launch(manager, record, registry, share=False, share_history=False)
+    (launch.directory / HISTORY_MARKER).write_text("pending")
+    with pytest.raises(SessionError, match="history import"):
+        prepare_launch(manager, record, registry, share=False, share_history=False)

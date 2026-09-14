@@ -15,7 +15,8 @@ import pytest
 from claude_swap.session import SessionManager
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.vision import VisionClient
-from claude_swap.vision_session import prepare_launch
+from claude_swap.vision_history import copy_history, install_history
+from claude_swap.vision_session import prepare_launch, session_directory
 
 NATIVE_HASH = "a506b6d970a4cf44f6abdb53a81ddcd5d3b0ce042a95c502fe9d1f946bdb8807"
 TOKEN = "synthetic-vision-native-token"
@@ -25,7 +26,10 @@ TOKEN = "synthetic-vision-native-token"
     sys.platform != "darwin" or not os.environ.get("CLAUDE_NATIVE_TEST_BINARY"),
     reason="Requires explicit pinned native binary and macOS sandbox-exec",
 )
-def test_prepared_access_only_launch_reaches_native_inference(temp_home, monkeypatch):
+@pytest.mark.parametrize("migrate_history", [False, True])
+def test_prepared_access_only_launch_reaches_native_inference(
+    temp_home, monkeypatch, migrate_history
+):
     native = Path(os.environ["CLAUDE_NATIVE_TEST_BINARY"]).resolve()
     assert hashlib.sha256(native.read_bytes()).hexdigest() == NATIVE_HASH
     requests = []
@@ -201,11 +205,29 @@ def test_prepared_access_only_launch_reaches_native_inference(temp_home, monkeyp
             "accessToken": TOKEN + "-2",
             "generation": 2,
         }
+        if migrate_history:
+            migrated_login = "ail_00000000-0000-4000-8000-000000000002"
+            record["visionLoginId"] = migrated_login
+            registry.credential.return_value["login_id"] = migrated_login
+            snapshot = temp_home / "migration-history"
+            copy_history([launch.directory], snapshot)
+            install_history(
+                snapshot,
+                session_directory(
+                    manager.switcher.backup_dir, registry.url, migrated_login
+                ),
+                "synthetic-migration",
+            )
         resumed = prepare_launch(
             manager, record, registry, share=False, share_history=False
         )
-        assert resumed.directory == launch.directory
-        env["CLAUDE_CODE_OAUTH_TOKEN"] = resumed.env["CLAUDE_CODE_OAUTH_TOKEN"]
+        assert (resumed.directory != launch.directory) is migrate_history
+        for key in (
+            "CLAUDE_CONFIG_DIR",
+            "CLAUDE_SECURESTORAGE_CONFIG_DIR",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+        ):
+            env[key] = resumed.env[key]
         result = subprocess.run(
             command + ["--resume", session_id],
             cwd=temp_home,
