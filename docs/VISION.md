@@ -7,7 +7,11 @@ Vision is configured. Existing-profile handoff and automatic recovery during a
 running session remain in progress. Do not release this integration until the
 remaining client and deployment acceptance checks pass.
 
-Set `VISION_API_KEY` to your own Vision API key. `VISION_API_URL` defaults to
+Sign in with `cswap vision login`, open the printed approval URL in your browser,
+and compare the displayed code before approving. The CLI saves a registry-only
+key privately; it does not print it. Alternatively, set `VISION_API_KEY` to your
+own Vision API key, which takes precedence over the saved sign-in.
+`VISION_API_URL` defaults to
 `https://vision.infinity.inc`; an override must be an HTTPS origin, except for
 loopback HTTP during local integration testing. The client does not follow HTTP
 redirects. No provider credential is required to discover accounts or read usage.
@@ -108,3 +112,25 @@ cswap vision profiles
 An explicit upload remains available when auto-register is off. A pending upload
 must be recovered or cancelled before starting another login in the same profile.
 The profile listing contains names, IDs and the upload preference, never secrets.
+
+
+## Browser sign-in recovery
+
+`cswap vision login --no-wait` prints public approval metadata and returns.
+`cswap vision status` polls the pending request and saves its issued key;
+`cswap vision cancel` cancels it and removes any matching partially saved key.
+Interrupted polling reuses the original proof and honors the saved next-poll time.
+The approval URL must belong to the requested Vision origin. To use an isolated
+local stack, put `--url http://localhost:PORT` before the command name.
+
+Private proofs and keys live under `vision-auth/` in the backup directory, outside
+preferences. A key is saved durably before pending proofs are removed, allowing a
+lost response or local write failure to recover the same issued key. Cancellation
+keeps recovery state until the server confirms cancellation. Keys and device
+proofs never appear in command output or approval URLs.
+
+`tests/test_vision_stack.py` is an opt-in real local-stack test using
+`VISION_TEST_URL`, `SUPABASE_URL`, and `SUPABASE_ANON_KEY`. It requires loopback
+origins and the local seeded administrator, approves its own request, checks
+registry access and hardware denial, revokes its key, then checks revocation. It
+uses no provider credentials and cleans up its own request/key in a finalizer.

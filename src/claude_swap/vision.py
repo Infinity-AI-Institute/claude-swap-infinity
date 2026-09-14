@@ -19,6 +19,7 @@ import urllib.request
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from claude_swap.exceptions import ClaudeSwitchError
@@ -56,13 +57,19 @@ ERROR_CODES = {
 
 
 class VisionError(ClaudeSwitchError):
-    def __init__(self, code: str, status: int | None = None):
+    def __init__(
+        self,
+        code: str,
+        status: int | None = None,
+        retry_after_seconds: int | None = None,
+    ):
         self.code = (
             code
             if isinstance(code, str) and code in ERROR_CODES
             else "service_unavailable"
         )
         self.status = status
+        self.retry_after_seconds = retry_after_seconds
         super().__init__(f"Vision account registry: {self.code}.")
 
 
@@ -142,24 +149,14 @@ class NoRedirects(urllib.request.HTTPRedirectHandler):
         raise VisionError("service_unavailable", code)
 
 
-@dataclass(repr=False)
-class VisionClient:
-    url: str
-    api_key: str = field(repr=False)
+class VisionTransport:
+    """Bounded public transport; browser initiation sends no registry API key."""
 
-    def __post_init__(self):
-        self.url = origin(self.url)
-        if (
-            not isinstance(self.api_key, str)
-            or not 1 <= len(self.api_key) <= 4096
-            or any(c in self.api_key for c in "\r\n")
-        ):
-            raise VisionError("unauthorized")
+    def __init__(self, url: str):
+        self.url = origin(url)
 
-    @property
-    def scope(self) -> str:
-        """Nonsecret stable namespace; never use a local alias as provider identity."""
-        return hashlib.sha256(self.url.encode()).hexdigest()
+    def _headers(self):
+        return {"Accept": "application/json"}
 
     def request(
         self,
@@ -171,7 +168,7 @@ class VisionClient:
     ) -> Any:
         if not path.startswith("/api/") or any(c in path for c in "#\r\n"):
             raise VisionError("invalid_request")
-        headers = {"Accept": "application/json", "X-Api-Key": self.api_key}
+        headers = self._headers()
         if handoff_secret is not None:
             if not isinstance(handoff_secret, str) or not re.fullmatch(
                 r"[A-Za-z0-9_-]{43}", handoff_secret
@@ -196,7 +193,16 @@ class VisionClient:
                     code = raw.get("error", {}).get("code")
                 except (ValueError, AttributeError, OSError):
                     code = "service_unavailable"
-            raise VisionError(code, error.code) from None
+            retry_after = None
+            raw_retry = error.headers.get("Retry-After", "") if error.headers else ""
+            if (
+                len(raw_retry) <= 4
+                and raw_retry.isascii()
+                and raw_retry.isdigit()
+                and 1 <= int(raw_retry) <= 3600
+            ):
+                retry_after = int(raw_retry)
+            raise VisionError(code, error.code, retry_after) from None
         except VisionError:
             raise
         except (OSError, urllib.error.URLError, ValueError):
@@ -221,6 +227,29 @@ class VisionClient:
             return raw["data"]
         except (OSError, ValueError):
             raise VisionError("service_unavailable") from None
+
+
+@dataclass(repr=False)
+class VisionClient(VisionTransport):
+    url: str
+    api_key: str = field(repr=False)
+
+    def __post_init__(self):
+        self.url = origin(self.url)
+        if (
+            not isinstance(self.api_key, str)
+            or not 1 <= len(self.api_key) <= 4096
+            or any(c in self.api_key for c in "\r\n")
+        ):
+            raise VisionError("unauthorized")
+
+    @property
+    def scope(self) -> str:
+        """Nonsecret stable namespace; never use a local alias as provider identity."""
+        return hashlib.sha256(self.url.encode()).hexdigest()
+
+    def _headers(self):
+        return {"Accept": "application/json", "X-Api-Key": self.api_key}
 
     def discover(self) -> list[dict[str, Any]]:
         result, cursor = [], None
@@ -389,10 +418,38 @@ class VisionClient:
         return value
 
 
-def configured_client() -> VisionClient | None:
+def configured_client(state_root: Path | None = None) -> VisionClient | None:
+    """Use an explicit environment key before this installation's saved sign-in."""
+    from claude_swap.paths import get_backup_root
+    from claude_swap.vision_state import VisionState
+
     key = os.environ.get("VISION_API_KEY")
-    if not key:
+    if key:
+        return VisionClient(
+            os.environ.get("VISION_API_URL", "https://vision.infinity.inc"), key
+        )
+    saved = VisionState(
+        state_root if state_root is not None else get_backup_root()
+    ).read("key")
+    if saved is None:
         return None
-    return VisionClient(
-        os.environ.get("VISION_API_URL", "https://vision.infinity.inc"), key
-    )
+    if (
+        not isinstance(saved, dict)
+        or set(saved) != {"version", "url", "request_id", "key_id", "api_key"}
+        or type(saved["version"]) is not int
+        or saved["version"] != 1
+        or not isinstance(saved["api_key"], str)
+        or not re.fullmatch(r"vsk_[0-9a-f]{40}", saved["api_key"])
+    ):
+        raise VisionError("invalid_request")
+    registry_id(saved["request_id"], "")
+    registry_id(saved["key_id"], "vkey_")
+    saved_url = origin(saved["url"])
+    override = os.environ.get("VISION_API_URL")
+    if override and origin(override) != saved_url:
+        from claude_swap.exceptions import SessionError
+
+        raise SessionError(
+            "Saved Vision sign-in belongs to another origin; sign in there separately."
+        )
+    return VisionClient(saved_url, saved["api_key"])

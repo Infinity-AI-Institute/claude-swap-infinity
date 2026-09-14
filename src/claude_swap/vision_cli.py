@@ -6,8 +6,10 @@ import argparse
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
+import time
 import uuid
 
 from claude_swap.exceptions import ClaudeSwitchError, SessionError
@@ -23,6 +25,7 @@ from claude_swap.vision_handoff import (
 from claude_swap.vision_registration import RegistrationClient
 from claude_swap.vision_registry import RegistryPool
 from claude_swap.vision_session import ROUTE_OVERRIDES
+from claude_swap.vision_signin import VisionSignIn
 
 
 class ManagedProfiles:
@@ -201,13 +204,44 @@ def login_profile(switcher, name):
 
 def run_command(argv, switcher):
     parser = argparse.ArgumentParser(prog="cswap vision")
+    parser.add_argument(
+        "--url", default=os.environ.get("VISION_API_URL", "https://vision.infinity.inc")
+    )
     commands = parser.add_subparsers(dest="command", required=True)
+    browser = commands.add_parser("login")
+    browser.add_argument("--host-label", default=socket.gethostname())
+    browser.add_argument("--no-wait", action="store_true")
+    commands.add_parser("status")
+    commands.add_parser("cancel")
     for command in ("account-login", "upload", "cancel-upload"):
         commands.add_parser(command).add_argument("name")
     commands.add_parser("profiles")
     commands.add_parser("auto-register").add_argument("value", choices=("on", "off"))
     args = parser.parse_args(argv)
     profiles = ManagedProfiles(switcher.backup_dir)
+    if args.command in {"login", "status", "cancel"}:
+        if args.command == "login" and os.environ.get("VISION_API_KEY"):
+            client = configured_client()
+            return {"state": "configured", "source": "environment", "url": client.url}
+        flow = VisionSignIn(switcher.backup_dir, args.url)
+        if args.command == "cancel":
+            return flow.cancel()
+        if args.command == "status":
+            if flow.state.read("pending") is not None:
+                return flow.poll()
+            client = configured_client(switcher.backup_dir)
+            if client is None:
+                return {"state": "signed_out"}
+            return {"state": "signed_in", "url": client.url}
+        public = flow.begin(args.host_label)
+        if args.no_wait:
+            return public
+        print(json.dumps(public), flush=True)
+        while True:
+            result = flow.poll()
+            if result["state"] != "pending":
+                return result
+            time.sleep(min(30, result["retry_after_seconds"]))
     if args.command == "profiles":
         return profiles.read()
     if args.command == "auto-register":
