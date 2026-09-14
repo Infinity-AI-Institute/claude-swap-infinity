@@ -52,11 +52,27 @@ It rejects redirects and forwards only message and token-count routes. It never
 writes a refresh token or copies the local account backup. An unavailable
 credential requests recovery from Vision with the observed generation and waits
 up to 90 seconds. Revoked access
-fails without requesting refresh. The native profile lives under
-`vision-sessions/<registry-hash>/<login-id>` in the backup directory, preserving
-conversation history across alias changes and credential generations. Native
-arguments, including `--resume`, pass through unchanged. A local credential file
-in that profile is preserved and blocks launch until ownership handoff is resolved.
+fails without requesting refresh. Claude keeps its existing native config and
+conversation home (`CLAUDE_CONFIG_DIR`, or `~/.claude` when unset). Swapping
+accounts changes credentials, not the session store: `--resume` and `--continue`
+work across accounts and after restarting without copying conversations.
+Only secure credential storage is isolated under
+`vision-sessions/<registry-hash>/<login-id>` in the backup directory, using native
+`CLAUDE_SECURESTORAGE_CONFIG_DIR`. Existing local credentials are untouched.
+A credential in that isolated store blocks launch until ownership handoff is
+resolved. Sharing flags do not alter the existing native home for Vision launches.
+
+Conversations created by earlier versions under
+`<backup>/vision-sessions/<registry-hash>/<login-id>` remain untouched. To resume
+one, select that existing directory as the native home:
+
+```sh
+CLAUDE_CONFIG_DIR=/absolute/path/to/the/old/vision-sessions/registry-hash/login-id \
+  cswap run work -- --resume CONVERSATION_ID
+```
+
+Keep that native home selected when changing accounts. No copy or import is
+required, and new default launches use the ordinary native home.
 
 Request-time selection reads the complete central usage snapshot and chooses among
 enabled, authorized remote logins. It uses the existing threshold, per-window
@@ -95,7 +111,7 @@ The native macOS qualification uses Claude 2.1.270 with SHA-256
 `a506b6d970a4cf44f6abdb53a81ddcd5d3b0ce042a95c502fe9d1f946bdb8807`.
 `tests/test_vision_native.py` opts in via `CLAUDE_NATIVE_TEST_BINARY`: it blocks
 external network access and user-home reads and serves synthetic inference. The
-cases cover native resume, resume after history migration, token rotation between
+cases cover native resume across accounts, preexisting default-home resume, token rotation between
 two turns of one live process, and quota-driven account switching between two turns
 of one live process. Another case rejects the first access token and verifies
 recovery without replacing the native process. A provider-429 case verifies

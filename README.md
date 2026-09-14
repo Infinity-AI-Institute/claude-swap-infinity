@@ -129,7 +129,9 @@ cswap run 2 -- --resume         # everything after '--' is forwarded to claude
 cswap run 2 --share-history     # share your chat history with this account too
 ```
 
-Sessions use your normal `~/.claude` setup (settings, CLAUDE.md, skills, MCP servers, etc.), but each account keeps its own chat history — pass `--share-history` if you want your accounts to continue the same conversations.
+For Vision accounts, Claude keeps its existing native home and conversations across credential changes; `--resume` needs no session transfer or `--share-history`. The sharing options below apply to local accounts.
+
+Local-account sessions use your normal `~/.claude` setup (settings, CLAUDE.md, skills, MCP servers, etc.), but each account keeps its own chat history — pass `--share-history` if you want your accounts to continue the same conversations.
 
 <details>
 <summary>Sharing details — MCP servers & chat history</summary>

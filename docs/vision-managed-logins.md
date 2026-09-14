@@ -111,27 +111,23 @@ reassigned during transfer, recovery requires reconciling that local assignment
 before restoring credentials. Interrupted central routing can be retried with
 `recover-migration` without registering the login again.
 
-Before registration, migration snapshots `projects/` and `history.jsonl` from
-profiles holding the selected grant and the migrated slots' compatible session
-profiles. After ownership commits, that snapshot is imported into the stable
-central launch profile. Original histories remain unchanged. Authentication files,
-account configuration and settings are not imported.
-
-Resume with the original conversation ID after migration:
+Credential handoff leaves native conversations in their existing directory. No
+session snapshot, import, or transfer is needed. Resume using the same native
+home and original conversation ID after handoff or an account switch:
 
 ```sh
 cswap run work -- --resume CONVERSATION_ID
 ```
 
-Repeated imports preserve an already extended transcript and deduplicate history
-index entries. Divergent versions of the same conversation stop import and retain
-both copies for reconciliation. A pending-import marker blocks new central
-launches until `recover-migration` completes the import. Links to another known
-profile's shared history are supported; unknown or nested links are refused.
+For a conversation created under an explicitly selected native profile, retain
+that profile when launching (for example, `CLAUDE_CONFIG_DIR=/path/to/profile`).
+The wrapper isolates credential storage independently; it does not relocate or
+merge conversations from other native homes.
 
-Pinned Claude 2.1.270 has passed synthetic access-only inference and same-session
-resume after importing history into a different profile. The live multiuser pilot
-and clean EC2 rollout acceptance remain separate required checks.
+Pinned Claude 2.1.270 has passed synthetic access-only inference, cold resume after
+an account change, and resume of a conversation created in the default native
+home. The live multiuser pilot and clean EC2 rollout acceptance remain separate
+required checks.
 
 ## Central credentials during a native session
 

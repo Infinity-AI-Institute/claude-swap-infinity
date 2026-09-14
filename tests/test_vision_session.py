@@ -1,6 +1,7 @@
 """Remote launch receives access-only auth and preserves native session identity."""
 
 from datetime import UTC, datetime
+from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
@@ -64,7 +65,9 @@ def test_launch_passes_only_access_token_and_scrubs_inherited_auth_routes(
     launch = prepare_launch(manager, record, registry, share=False, share_history=False)
     assert launch.env["CLAUDE_CODE_OAUTH_TOKEN"] == "synthetic-access-token"
     assert "must-not-inherit" not in launch.env.values()
-    assert launch.env["CLAUDE_CONFIG_DIR"] == str(launch.directory)
+    assert "CLAUDE_CONFIG_DIR" not in launch.env
+    assert launch.directory == Path.home() / ".claude"
+    assert launch.env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] != str(launch.directory)
     assert "synthetic-access-token" not in repr(launch)
     assert not (launch.directory / ".credentials.json").exists()
     assert all(
@@ -78,6 +81,7 @@ def test_launch_passes_only_access_token_and_scrubs_inherited_auth_routes(
 def test_relogin_generation_and_alias_changes_preserve_native_history(setup):
     manager, registry, record, token = setup
     first = prepare_launch(manager, record, registry, share=False, share_history=False)
+    first.directory.mkdir(parents=True, exist_ok=True)
     history = first.directory / "history.jsonl"
     history.write_text("synthetic native conversation\n")
     registry.credential.return_value = {
@@ -142,17 +146,22 @@ def test_disabled_or_other_registry_selection_never_delivers_credentials(setup, 
 def test_existing_native_login_is_preserved_and_requires_handoff(setup):
     manager, registry, record, _ = setup
     launch = prepare_launch(manager, record, registry, share=False, share_history=False)
-    auth = launch.directory / ".credentials.json"
+    auth = Path(launch.env["CLAUDE_SECURESTORAGE_CONFIG_DIR"]) / ".credentials.json"
     auth.write_text("synthetic native login")
     with pytest.raises(SessionError, match="handoff"):
         prepare_launch(manager, record, registry, share=False, share_history=False)
     assert auth.read_text() == "synthetic native login"
 
 
+@pytest.mark.parametrize("windows", [False, True])
 def test_remote_run_bypasses_local_bootstrap_and_preserves_resume_arguments(
-    setup, monkeypatch
+    setup, monkeypatch, windows
 ):
     manager, registry, record, _ = setup
+    if windows:
+        from claude_swap.models import Platform
+
+        manager.switcher.platform = Platform.WINDOWS
     manager.switcher.backup_dir.mkdir(parents=True, exist_ok=True)
     manager.switcher._write_json(
         manager.switcher.sequence_file,
@@ -172,7 +181,10 @@ def test_remote_run_bypasses_local_bootstrap_and_preserves_resume_arguments(
     monkeypatch.setattr("claude_swap.vision_proxy.run_native", runner)
     with pytest.raises(SystemExit):
         manager.run(
-            "1", ["--resume", "synthetic-session", "--model", "sonnet"], share=False
+            "1",
+            ["--resume", "synthetic-session", "--model", "sonnet"],
+            share=False,
+            share_history=windows,
         )
     assert runner.call_args.args[:2] == (
         "/synthetic/claude",
@@ -205,15 +217,34 @@ def test_keychain_native_login_or_unknown_store_blocks_remote_launch(
     with pytest.raises(SessionError) as error:
         prepare_launch(manager, record, registry, share=False, share_history=False)
     assert "secret-bearing" not in str(error.value)
-    lookup.assert_called_once_with(keychain_service_name(first.directory), "test-user")
+    lookup.assert_called_once_with(
+        keychain_service_name(first.env["CLAUDE_SECURESTORAGE_CONFIG_DIR"]), "test-user"
+    )
     manager._sync_sharing.assert_not_called()
 
 
-def test_unfinished_history_import_blocks_central_launch(setup):
-    from claude_swap.vision_history import HISTORY_MARKER
-
-    manager, registry, record, _ = setup
-    launch = prepare_launch(manager, record, registry, share=False, share_history=False)
-    (launch.directory / HISTORY_MARKER).write_text("pending")
-    with pytest.raises(SessionError, match="history import"):
-        prepare_launch(manager, record, registry, share=False, share_history=False)
+def test_existing_native_credentials_and_history_are_untouched(setup, monkeypatch):
+    manager, registry, record, token = setup
+    native = Path.home() / "custom-native"
+    native.mkdir()
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(native))
+    credentials = native / ".credentials.json"
+    credentials.write_text("existing local credentials")
+    history = native / "history.jsonl"
+    history.write_text("existing conversation")
+    first = prepare_launch(manager, record, registry, share=False, share_history=False)
+    registry.credential.return_value = {
+        **token,
+        "login_id": "ail_00000000-0000-4000-8000-000000000002",
+    }
+    second = prepare_launch(manager, record, registry, share=True, share_history=True)
+    assert first.directory == second.directory == native
+    assert (
+        first.env["CLAUDE_CONFIG_DIR"] == second.env["CLAUDE_CONFIG_DIR"] == str(native)
+    )
+    assert (
+        first.env["CLAUDE_SECURESTORAGE_CONFIG_DIR"]
+        != second.env["CLAUDE_SECURESTORAGE_CONFIG_DIR"]
+    )
+    assert credentials.read_text() == "existing local credentials"
+    assert history.read_text() == "existing conversation"
