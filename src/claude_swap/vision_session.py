@@ -12,8 +12,8 @@ from pathlib import Path
 from claude_swap import macos_keychain
 from claude_swap.exceptions import SessionError
 from claude_swap.models import Platform
+from claude_swap.paths import get_claude_config_home
 from claude_swap.vision import VisionClient, VisionError, registry_id
-from claude_swap.vision_history import HISTORY_MARKER
 
 # A selected Vision credential must not inherit another provider route or auth
 # source from the terminal that invoked the launcher.
@@ -30,7 +30,7 @@ ROUTE_OVERRIDES = {
 
 @dataclass(frozen=True)
 class RemoteLaunch:
-    directory: Path
+    directory: Path  # Existing native config/conversation home, not credential storage.
     generation: int
     expires_at: str | None
     env: dict[str, str] = field(repr=False)
@@ -113,7 +113,7 @@ def recover_rejected_credential(client, rejected, *, wait_seconds=90):
         time.sleep(min(1, max(0, deadline - time.monotonic())))
 
 
-def session_directory(backup_dir, url, login_id):
+def credential_directory(backup_dir, url, login_id):
     registry_id(login_id, "ail_")
     return (
         backup_dir
@@ -151,30 +151,27 @@ def prepare_launch(
             "Vision account identity changed; synchronize the roster and retry."
         )
 
-    # Identity, rather than alias or transient roster slot, keeps native resume
-    # data stable when permissions or local display preferences change.
+    # Isolate secure storage only. Native config and conversations remain in
+    # the caller's existing home across accounts, origins, and process restarts.
     scope = hashlib.sha256(client.url.encode()).hexdigest()
     root = manager.switcher.backup_dir / "vision-sessions"
-    directory = session_directory(
+    directory = credential_directory(
         manager.switcher.backup_dir, client.url, credential["login_id"]
     )
     for path in (root, root / scope, directory):
         if path.is_symlink() or (
             path.exists() and not stat.S_ISDIR(path.stat().st_mode)
         ):
-            raise SessionError("The Vision session path must be a real directory.")
+            raise SessionError(
+                "The Vision credential storage path must be a real directory."
+            )
     _mkdir_private(directory)
-    marker = directory / HISTORY_MARKER
-    if marker.exists() or marker.is_symlink():
-        raise SessionError(
-            "Recover the pending migration history import before launching this account."
-        )
     # Never overwrite or silently adopt credentials created by a native login.
     # That grant needs the explicit ownership handoff before central use resumes.
     auth_path = directory / ".credentials.json"
     if auth_path.exists() or auth_path.is_symlink():
         raise SessionError(
-            "This Vision session contains a local login that needs handoff."
+            "This Vision credential store contains a local login that needs handoff."
         )
     if Platform.detect() == Platform.MACOS:
         try:
@@ -184,22 +181,25 @@ def prepare_launch(
             )
         except macos_keychain.KEYCHAIN_ERRORS:
             raise SessionError(
-                "The Vision session Keychain entry is unavailable; unlock it and retry."
+                "The Vision credential Keychain entry is unavailable; unlock it and retry."
             ) from None
         if native_login is not None:
             raise SessionError(
-                "This Vision session contains a local Keychain login that needs handoff."
+                "This Vision credential store contains a local Keychain login that needs handoff."
             )
-    manager._sync_sharing(directory, share, share_history)
     env = {
         key: value
         for key, value in os.environ.items()
         if key not in set(AUTH_OVERRIDE_ENV_VARS) | ROUTE_OVERRIDES
         and key not in {"VISION_API_KEY", "VISION_API_URL"}
     }
-    env["CLAUDE_CONFIG_DIR"] = str(directory)
+    # Preserve the original variable, including its absence: native global
+    # config resolves differently for unset versus explicit ~/.claude.
     env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] = str(directory)
     env["CLAUDE_CODE_OAUTH_TOKEN"] = credential["accessToken"]
     return RemoteLaunch(
-        directory, credential["generation"], credential["expires_at"], env
+        get_claude_config_home(),
+        credential["generation"],
+        credential["expires_at"],
+        env,
     )

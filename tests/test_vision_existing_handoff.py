@@ -408,12 +408,10 @@ def test_migration_preserves_an_existing_remote_alias_and_disabled_preference(se
     assert remote["disabled"] is True
 
 
-def test_migration_snapshots_native_history_before_ownership_and_installs_for_central_alias(
+def test_credential_handoff_leaves_native_history_in_place(
     setup,
 ):
-    from claude_swap.vision_session import session_directory
-
-    transaction, registry, source = routed_fixture(setup)
+    transaction, _registry, source = routed_fixture(setup)
     native_profile = next(
         item.source.location
         for item in transaction._capture().copies
@@ -427,13 +425,6 @@ def test_migration_snapshots_native_history_before_ownership_and_installs_for_ce
     transcript.write_text("original conversation\n")
     transaction.upload(source, transaction.preview(source)["confirmation"])
     transcript.write_text("original conversation\nnew local session\n")
-    result = transaction.route_committed()
-    destination = session_directory(
-        transaction.switcher.backup_dir, registry.client.url, result["login_id"]
-    )
-    assert (
-        destination / "projects" / "project" / "session.jsonl"
-    ).read_text() == "original conversation\n"
-    assert not (destination / ".credentials.json").exists()
+    transaction.route_committed()
     assert transcript.read_text().endswith("new local session\n")
     assert not transaction.history_path.exists()

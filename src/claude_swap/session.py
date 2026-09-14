@@ -514,12 +514,6 @@ class SessionManager:
             raise SessionError(
                 "'claude' was not found on PATH. Install Claude Code first."
             )
-        if share_history and self.switcher.platform == Platform.WINDOWS:
-            raise SessionError(
-                "--share-history is not supported on Windows yet: sharing uses "
-                "re-synced copies there, which would fork the history instead "
-                "of sharing it."
-            )
 
         self.switcher.sync_vision_accounts()
         account_num, email, org_uuid = self.switcher.resolve_account(identifier)
@@ -546,6 +540,13 @@ class SessionManager:
                 claude_bin, claude_args, launch, client, remote, switcher=self.switcher
             )
             raise AssertionError("unreachable")
+
+        if share_history and self.switcher.platform == Platform.WINDOWS:
+            raise SessionError(
+                "--share-history is not supported on Windows yet: sharing uses "
+                "re-synced copies there, which would fork the history instead "
+                "of sharing it."
+            )
 
         # Guard before the same-account direct-launch fast path below (which
         # _exec's claude and never returns) — and before setup_session.

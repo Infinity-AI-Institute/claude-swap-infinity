@@ -19,10 +19,9 @@ from claude_swap.session import SessionManager
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.usage_store import UsageEntry
 from claude_swap.vision import VisionClient
-from claude_swap.vision_history import copy_history, install_history
 from claude_swap.vision_pool import CentralPoolCredential
 from claude_swap.vision_proxy import CentralCredential, InferenceProxy
-from claude_swap.vision_session import prepare_launch, session_directory
+from claude_swap.vision_session import prepare_launch
 
 NATIVE_HASH = "a506b6d970a4cf44f6abdb53a81ddcd5d3b0ce042a95c502fe9d1f946bdb8807"
 TOKEN = "synthetic-vision-native-token"
@@ -33,12 +32,11 @@ TOKEN = "synthetic-vision-native-token"
     reason="Requires explicit pinned native binary and macOS sandbox-exec",
 )
 @pytest.mark.parametrize(
-    "mode", ["resume", "migrate", "proxy", "pool", "recover", "rate"]
+    "mode", ["resume", "account", "existing", "proxy", "pool", "recover", "rate"]
 )
 def test_prepared_access_only_launch_reaches_native_inference(
     temp_home, monkeypatch, mode
 ):
-    migrate_history = mode == "migrate"
     native = Path(os.environ["CLAUDE_NATIVE_TEST_BINARY"]).resolve()
     assert hashlib.sha256(native.read_bytes()).hexdigest() == NATIVE_HASH
     requests = []
@@ -144,6 +142,20 @@ def test_prepared_access_only_launch_reaches_native_inference(
         "email": "synthetic@example.invalid",
         "organizationUuid": "organization",
     }
+    native_home = temp_home / ".claude"
+    native_home.mkdir(exist_ok=True)
+    local_auth = native_home / ".credentials.json"
+    local_bytes = json.dumps(
+        {
+            "claudeAiOauth": {
+                "accessToken": "expired-local-access",
+                "refreshToken": "must-never-refresh-local-token",
+                "expiresAt": 1,
+                "scopes": ["user:inference", "user:profile"],
+            }
+        }
+    )
+    local_auth.write_text(local_bytes)
     launch = prepare_launch(manager, record, registry, share=False, share_history=False)
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Provider)
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -175,6 +187,7 @@ def test_prepared_access_only_launch_reaches_native_inference(
             "CLAUDE_SECURESTORAGE_CONFIG_DIR",
             "CLAUDE_CODE_OAUTH_TOKEN",
         )
+        if key in launch.env
     }
     env.update(
         {
@@ -212,6 +225,10 @@ def test_prepared_access_only_launch_reaches_native_inference(
         "--model",
         "claude-sonnet-4-6",
     ]
+    if mode == "existing":
+        # First process is ordinary native Claude, with its default native store.
+        env.pop("CLAUDE_CONFIG_DIR", None)
+        env.pop("CLAUDE_SECURESTORAGE_CONFIG_DIR", None)
     try:
         if mode in {"proxy", "pool", "recover", "rate"}:
             result, session_id = _two_proxy_turns(
@@ -242,29 +259,22 @@ def test_prepared_access_only_launch_reaches_native_inference(
                 "accessToken": TOKEN + "-2",
                 "generation": 2,
             }
-            if migrate_history:
-                migrated_login = "ail_00000000-0000-4000-8000-000000000002"
-                record["visionLoginId"] = migrated_login
-                registry.credential.return_value["login_id"] = migrated_login
-                snapshot = temp_home / "migration-history"
-                copy_history([launch.directory], snapshot)
-                install_history(
-                    snapshot,
-                    session_directory(
-                        manager.switcher.backup_dir, registry.url, migrated_login
-                    ),
-                    "synthetic-migration",
-                )
+            if mode in {"account", "existing"}:
+                record["visionLoginId"] = "ail_00000000-0000-4000-8000-000000000002"
+                registry.credential.return_value["login_id"] = record["visionLoginId"]
             resumed = prepare_launch(
                 manager, record, registry, share=False, share_history=False
             )
-            assert (resumed.directory != launch.directory) is migrate_history
+            assert resumed.directory == launch.directory
             for key in (
                 "CLAUDE_CONFIG_DIR",
                 "CLAUDE_SECURESTORAGE_CONFIG_DIR",
                 "CLAUDE_CODE_OAUTH_TOKEN",
             ):
-                env[key] = resumed.env[key]
+                if key in resumed.env:
+                    env[key] = resumed.env[key]
+                else:
+                    env.pop(key, None)
             result = subprocess.run(
                 command + ["--resume", session_id],
                 cwd=temp_home,
@@ -279,6 +289,10 @@ def test_prepared_access_only_launch_reaches_native_inference(
         server.shutdown()
         server.server_close()
     assert result.returncode == 0, "Pinned native synthetic inference failed"
+    assert local_auth.read_text() == local_bytes
+    assert not (
+        Path(launch.env["CLAUDE_SECURESTORAGE_CONFIG_DIR"]) / "projects"
+    ).exists()
     assert requests == [
         {
             "path": "/v1/messages",
@@ -300,7 +314,9 @@ def test_prepared_access_only_launch_reaches_native_inference(
         event.get("type") == "result" and event.get("session_id") == session_id
         for event in events
     )
-    assert not (launch.directory / ".credentials.json").exists()
+    assert not (
+        Path(launch.env["CLAUDE_SECURESTORAGE_CONFIG_DIR"]) / ".credentials.json"
+    ).exists()
 
 
 def _two_proxy_turns(command, env, registry, cwd, *, advance=None):
