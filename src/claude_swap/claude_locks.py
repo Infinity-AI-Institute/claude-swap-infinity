@@ -155,7 +155,9 @@ def proper_lockfile(
 
 
 @contextmanager
-def claude_credentials_lock(*, timeout: float | None = None):
+def claude_credentials_lock(
+    *, timeout: float | None = None, config_home: Path | None = None
+):
     """Hold Claude Code's credential-refresh locks, in CC's own order.
 
     2.1.218 takes ``<config-home>/.oauth_refresh.lock`` first, then the
@@ -165,14 +167,26 @@ def claude_credentials_lock(*, timeout: float | None = None):
     and exclusion holds even after CC drops the legacy lock. Both use CC's
     60s staleness — never steal a lock a live CC may still hold.
     """
+    # Explicit profiles must not briefly mutate the process-wide environment:
+    # another thread may be refreshing the default profile concurrently.
+    primary = (
+        config_home / ".oauth_refresh.lock"
+        if config_home is not None
+        else oauth_refresh_lock_dir()
+    )
+    legacy = (
+        config_home.with_name(config_home.name + ".lock")
+        if config_home is not None
+        else credentials_lock_dir()
+    )
     with (
         proper_lockfile(
-            oauth_refresh_lock_dir(),
+            primary,
             timeout=timeout,
             staleness=CREDENTIALS_STALENESS_S,
         ),
         proper_lockfile(
-            credentials_lock_dir(),
+            legacy,
             timeout=timeout,
             staleness=CREDENTIALS_STALENESS_S,
         ),

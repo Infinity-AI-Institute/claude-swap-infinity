@@ -1364,7 +1364,7 @@ class TestRunAutoResolve:
             def run(self, identifier, claude_args, share=True, share_history=False):
                 calls.append(("run", identifier, claude_args, share, share_history))
 
-            def exec_default(self, claude_args):
+            def exec_default(self, claude_args, *, share=True, share_history=False):
                 calls.append(("exec_default", claude_args))
 
         return FakeSessionManager

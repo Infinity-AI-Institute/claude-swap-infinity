@@ -208,7 +208,9 @@ Examples:
                     "launching the default account."
                 )
             )
-        manager.exec_default(tail)
+        manager.exec_default(
+            tail, share=not args.no_share, share_history=args.share_history
+        )
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
         sys.exit(1)
@@ -918,6 +920,12 @@ def main() -> None:
         printer.set_theme(name)
     except Exception:
         pass  # theme is cosmetic; never block the CLI on it
+
+    if argv and argv[0] == "vision":
+        from claude_swap.vision_cli import main as vision_main
+
+        vision_main(argv[1:])
+        return
 
     # `run` and `auto` keep their dedicated pre-dispatch parsers.
     if argv and argv[0] == "run":

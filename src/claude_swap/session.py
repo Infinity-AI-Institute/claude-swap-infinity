@@ -521,7 +521,32 @@ class SessionManager:
                 "of sharing it."
             )
 
+        self.switcher.sync_vision_accounts()
         account_num, email, org_uuid = self.switcher.resolve_account(identifier)
+        remote = self.switcher._vision_account_record(account_num)
+        if remote is not None:
+            from claude_swap.vision import configured_client
+            from claude_swap.vision_proxy import run_native
+            from claude_swap.vision_session import prepare_launch
+
+            client = configured_client()
+
+            launch = prepare_launch(
+                self,
+                remote,
+                client,
+                share=share,
+                share_history=share_history,
+            )
+            print(
+                f"{accent('Launching')} Account-{account_num} ({email}) "
+                f"{muted('[Vision]')}"
+            )
+            run_native(
+                claude_bin, claude_args, launch, client, remote, switcher=self.switcher
+            )
+            raise AssertionError("unreachable")
+
         # Guard before the same-account direct-launch fast path below (which
         # _exec's claude and never returns) — and before setup_session.
         self._ensure_not_api_key(account_num, email)
@@ -571,15 +596,35 @@ class SessionManager:
         env["CLAUDE_CONFIG_DIR"] = str(session_dir)
         self._exec(claude_bin, claude_args, env=env)
 
-    def exec_default(self, claude_args: list[str]) -> NoReturn:
-        """Launch plain Claude Code with the current default login.
+    def exec_default(
+        self, claude_args: list[str], *, share: bool = True, share_history: bool = False
+    ) -> NoReturn:
+        """Use the authorized Vision pool when configured, otherwise native defaults.
 
-        Used by `cswap run` (no account) when the cwd has no mapping, or its
-        mapped account no longer exists. Equivalent to typing `claude`
-        directly: the unmodified environment is passed through (no session
-        profile, no auth-override scrubbing), so whatever the default login
-        resolves to is what runs.
+        No explicit account or directory mapping is required on a clean machine.
+        Local-only installations retain the unmodified native environment.
         """
+        from claude_swap.vision import configured_client
+        from claude_swap.vision_registry import RegistryPool
+
+        client = configured_client()
+        if client is not None:
+            RegistryPool(self.switcher, client).sync()
+            with FileLock(self.switcher.lock_file):
+                roster = self.switcher._get_sequence_data() or {}
+            for number in roster.get("sequence", []):
+                row = roster.get("accounts", {}).get(str(number), {})
+                if (
+                    row.get("source") == "vision"
+                    and row.get("visionUrl") == client.url
+                    and not row.get("disabled", False)
+                ):
+                    self.run(
+                        str(number), claude_args, share=share, share_history=share_history
+                    )
+                    return  # Only reachable when the native handoff is mocked.
+            raise SessionError("No enabled Claude account is authorized through Vision.")
+
         claude_bin = shutil.which("claude")
         if not claude_bin:
             raise SessionError(
