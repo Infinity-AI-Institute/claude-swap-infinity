@@ -68,6 +68,12 @@ class CentralCredential:
         with self.lock:
             return recover_rejected_credential(self.client, rejected)
 
+    def record_rate_limit(self, credential, retry_after):
+        pass
+
+    def rate_limited(self, credential, retry_after, *, model=None):
+        return None
+
 
 class InferenceProxy:
     def __init__(self, credentials, *, upstream=UPSTREAM):
@@ -111,7 +117,7 @@ class InferenceProxy:
             def log_message(self, *_args):
                 pass
 
-            def _error(self, status, message):
+            def _error(self, status, message, retry_after=None):
                 body = json.dumps(
                     {
                         "type": "error",
@@ -122,6 +128,8 @@ class InferenceProxy:
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
                 self.send_header("Cache-Control", "no-store")
+                if retry_after is not None:
+                    self.send_header("Retry-After", str(retry_after))
                 self.send_header("Connection", "close")
                 self.end_headers()
                 self.close_connection = True
@@ -179,6 +187,7 @@ class InferenceProxy:
                     self._error(
                         status,
                         "Central credentials are unavailable; " + error.code + ".",
+                        error.retry_after_seconds,
                     )
                     return
                 except ClaudeSwitchError:
@@ -206,10 +215,31 @@ class InferenceProxy:
                                 401, "Central login reauthentication is required."
                             )
                             return
+                        credential = replacement
                         response = proxy.open_message(
-                            self.path, body, headers, replacement
+                            self.path, body, headers, credential
                         )
+                    elif response.status == 429:
+                        try:
+                            replacement = proxy.credentials.rate_limited(
+                                credential,
+                                response.headers.get("Retry-After"),
+                                model=model,
+                            )
+                        except BaseException:
+                            response.close()
+                            raise
+                        if replacement is not None:
+                            response.close()
+                            credential = replacement
+                            response = proxy.open_message(
+                                self.path, body, headers, credential
+                            )
                     with response:
+                        if response.status == 429:
+                            proxy.credentials.record_rate_limit(
+                                credential, response.headers.get("Retry-After")
+                            )
                         status = response.status
                         if 300 <= status < 400:
                             self._error(
@@ -232,7 +262,11 @@ class InferenceProxy:
                             self.wfile.flush()
                 except VisionError as error:
                     status = error.status if error.status in {401, 403, 429} else 503
-                    self._error(status, "Central credential recovery is unavailable.")
+                    self._error(
+                        status,
+                        "Central credential recovery is unavailable.",
+                        error.retry_after_seconds,
+                    )
                 except ClaudeSwitchError:
                     self._error(503, "No central login is available for recovery.")
                 except (urllib.error.URLError, TimeoutError):

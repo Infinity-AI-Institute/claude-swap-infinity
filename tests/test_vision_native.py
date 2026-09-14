@@ -32,7 +32,9 @@ TOKEN = "synthetic-vision-native-token"
     sys.platform != "darwin" or not os.environ.get("CLAUDE_NATIVE_TEST_BINARY"),
     reason="Requires explicit pinned native binary and macOS sandbox-exec",
 )
-@pytest.mark.parametrize("mode", ["resume", "migrate", "proxy", "pool", "recover"])
+@pytest.mark.parametrize(
+    "mode", ["resume", "migrate", "proxy", "pool", "recover", "rate"]
+)
 def test_prepared_access_only_launch_reaches_native_inference(
     temp_home, monkeypatch, mode
 ):
@@ -63,16 +65,18 @@ def test_prepared_access_only_launch_reaches_native_inference(
                     "stream": body.get("stream"),
                 }
             )
-            if mode == "recover" and len(requests) == 1:
+            if mode in {"recover", "rate"} and len(requests) == 1:
                 registry.credential.return_value = {
                     **registry.credential.return_value,
                     "generation": 2,
                     "accessToken": TOKEN + "-2",
                 }
-                self.send_response(401)
+                self.send_response(429 if mode == "rate" else 401)
+                if mode == "rate":
+                    self.send_header("Retry-After", "120")
                 self.end_headers()
                 return
-            expected_count = 3 if mode == "recover" else 2
+            expected_count = 3 if mode in {"recover", "rate"} else 2
             if requests[-1]["path"] != "/v1/messages" or len(requests) > expected_count:
                 self.send_error(403)
                 return
@@ -146,9 +150,9 @@ def test_prepared_access_only_launch_reaches_native_inference(
     port = server.server_address[1]
     proxy = None
     advance = None
-    if mode in {"proxy", "pool", "recover"}:
+    if mode in {"proxy", "pool", "recover", "rate"}:
         credentials = CentralCredential(registry, record)
-        if mode == "pool":
+        if mode in {"pool", "rate"}:
             credentials, advance = _native_pool(manager, registry, record, monkeypatch)
         proxy = InferenceProxy(credentials, upstream=f"http://127.0.0.1:{port}")
         proxy.__enter__()
@@ -209,7 +213,7 @@ def test_prepared_access_only_launch_reaches_native_inference(
         "claude-sonnet-4-6",
     ]
     try:
-        if mode in {"proxy", "pool", "recover"}:
+        if mode in {"proxy", "pool", "recover", "rate"}:
             result, session_id = _two_proxy_turns(
                 command, env, registry, temp_home, advance=advance
             )
@@ -282,7 +286,7 @@ def test_prepared_access_only_launch_reaches_native_inference(
             "api_key": False,
             "stream": True,
         }
-    ] * (3 if mode == "recover" else 2)
+    ] * (3 if mode in {"recover", "rate"} else 2)
     events = [
         json.loads(line) for line in result.stdout.splitlines() if line.startswith(b"{")
     ]
@@ -290,7 +294,7 @@ def test_prepared_access_only_launch_reaches_native_inference(
         event.get("type") == "result" and not event.get("is_error") for event in events
     )
     assert message_counts[-1] > message_counts[0]
-    if mode == "recover":
+    if mode in {"recover", "rate"}:
         assert message_counts[0] == message_counts[1]
     assert any(
         event.get("type") == "result" and event.get("session_id") == session_id

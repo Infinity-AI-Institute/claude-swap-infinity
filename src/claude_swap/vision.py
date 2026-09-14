@@ -48,6 +48,7 @@ ERROR_CODES = {
     "expired",
     "conflict",
     "slow_down",
+    "rate_limited",
     "pending",
     "denied",
     "cancelled",

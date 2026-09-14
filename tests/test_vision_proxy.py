@@ -32,6 +32,14 @@ def upstream():
                 self.send_response(401)
                 self.end_headers()
                 return
+            if (
+                b"limited" in body
+                and self.headers.get("Authorization") != "Bearer spare"
+            ):
+                self.send_response(429)
+                self.send_header("Retry-After", "120")
+                self.end_headers()
+                return
             if b"redirect" in body:
                 self.send_response(307)
                 self.send_header("Location", "/stolen")
@@ -243,3 +251,60 @@ def test_no_successor_returns_401_without_replaying_old_token(upstream):
             request(proxy, body=b'{"reject":true}')
         assert error.value.code == 401
     assert len(seen) == 1
+
+
+def test_rate_limit_replays_on_one_other_account(upstream):
+    url, seen = upstream
+    credentials = Mock()
+    credential = {"accessToken": "limited"}
+    credentials.get.return_value = credential
+    credentials.rate_limited.return_value = {"accessToken": "spare"}
+    with (
+        InferenceProxy(credentials, upstream=url) as proxy,
+        request(proxy, body=b'{"limited":true}') as response,
+    ):
+        assert response.read() == b"data: synthetic\n\n"
+    credentials.rate_limited.assert_called_once_with(credential, "120", model=None)
+    assert len(seen) == 2
+    credentials.recover.assert_not_called()
+
+
+def test_no_spare_account_preserves_provider_retry_after(upstream):
+    url, seen = upstream
+    credentials = Mock()
+    credentials.get.return_value = {"accessToken": "limited"}
+    credentials.rate_limited.return_value = None
+    with InferenceProxy(credentials, upstream=url) as proxy:
+        with pytest.raises(urllib.error.HTTPError) as error:
+            request(proxy, body=b'{"limited":true}')
+        assert error.value.code == 429
+        assert error.value.headers["Retry-After"] == "120"
+    assert len(seen) == 1
+
+
+def test_second_rate_limit_is_recorded_without_third_request(upstream):
+    url, seen = upstream
+    credentials = Mock()
+    credentials.get.return_value = {"accessToken": "limited"}
+    second = {"accessToken": "also-limited"}
+    credentials.rate_limited.return_value = second
+    with InferenceProxy(credentials, upstream=url) as proxy:
+        with pytest.raises(urllib.error.HTTPError) as error:
+            request(proxy, body=b'{"limited":true}')
+        assert error.value.code == 429
+    assert len(seen) == 2
+    credentials.record_rate_limit.assert_called_once_with(second, "120")
+
+
+def test_locally_blocked_pool_returns_retry_after_without_provider_request(upstream):
+    url, seen = upstream
+    credentials = Mock()
+    credentials.get.side_effect = VisionError(
+        "rate_limited", status=429, retry_after_seconds=90
+    )
+    with InferenceProxy(credentials, upstream=url) as proxy:
+        with pytest.raises(urllib.error.HTTPError) as error:
+            request(proxy)
+        assert error.value.code == 429
+        assert error.value.headers["Retry-After"] == "90"
+    assert seen == []

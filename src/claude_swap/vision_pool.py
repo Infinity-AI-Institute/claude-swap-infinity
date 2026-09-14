@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import math
 import threading
 import time
+from email.utils import parsedate_to_datetime
 
 from claude_swap.autoswitch import rank_candidates
 from claude_swap.exceptions import ConfigError, SessionError
@@ -19,6 +21,25 @@ from claude_swap.vision_proxy import CentralCredential
 from claude_swap.vision_registry import RegistryPool
 from claude_swap.vision_session import recover_rejected_credential
 from claude_swap.vision_usage import read_usage
+
+
+class NoCentralQuota(SessionError):
+    """No enabled account can be selected using current quota evidence."""
+
+
+def retry_delay(value, now):
+    """Honor provider delta-seconds and HTTP-date Retry-After values."""
+    if isinstance(value, str) and len(value) <= 128:
+        value = value.strip()
+        if value.isascii() and value.isdecimal() and len(value) <= 10:
+            return max(1, int(value))
+        try:
+            date = parsedate_to_datetime(value)
+            if date.utcoffset() is not None:
+                return max(1, math.ceil(date.timestamp() - now))
+        except (ValueError, TypeError, OverflowError):
+            pass
+    return 60
 
 
 def request_models(model, configured):
@@ -48,6 +69,7 @@ class CentralPoolCredential:
         self.last_switch = None
         self.lock = threading.RLock()
         self.rejected = {}
+        self.rate_limits = {}
 
     def _records(self):
         self.pool.sync()
@@ -68,6 +90,8 @@ class CentralPoolCredential:
                 raise ConfigError("The account roster needs repair.")
             if row.get("source") != "vision" or row.get("visionUrl") != self.client.url:
                 continue
+            if self.rate_limits.get(row["visionAccountId"], 0) > self.clock():
+                continue
             login = row["visionLoginId"]
             rejected = self.rejected.get(login)
             if rejected is not None:
@@ -86,7 +110,7 @@ class CentralPoolCredential:
         with self.lock:
             records = self._records()
             if not records:
-                raise SessionError("No enabled central Claude login is available.")
+                self._unavailable("No enabled central Claude login is available.")
             now = self.clock()
             settings = load_settings(self.switcher.backup_dir)
             models = request_models(model, settings.model)
@@ -163,7 +187,7 @@ class CentralPoolCredential:
                 )
             selected = ordered[0] if ordered else self.current
             if selected not in records or (forced and not ordered):
-                raise SessionError(
+                self._unavailable(
                     "No enabled central Claude login has known quota available."
                 )
             credential = CentralCredential(self.client, records[selected]).get(
@@ -187,3 +211,34 @@ class CentralPoolCredential:
             )
             self.pool.sync(force=True)
             return self.get(model=model)
+
+    def _unavailable(self, message):
+        remaining = [deadline - self.clock() for deadline in self.rate_limits.values()]
+        remaining = [delay for delay in remaining if delay > 0]
+        if remaining:
+            raise VisionError(
+                "rate_limited",
+                status=429,
+                retry_after_seconds=max(1, math.ceil(min(remaining))),
+            )
+        raise NoCentralQuota(message)
+
+    def record_rate_limit(self, credential, retry_after):
+        with self.lock:
+            account = credential["account_id"]
+            deadline = self.clock() + retry_delay(retry_after, self.clock())
+            # Quota belongs to the account, not the token generation or login.
+            # A refresh or another login must not bypass the provider's delay.
+            self.rate_limits[account] = max(self.rate_limits.get(account, 0), deadline)
+
+    def rate_limited(self, credential, retry_after, *, model=None):
+        with self.lock:
+            self.record_rate_limit(credential, retry_after)
+            try:
+                return self.get(model=model)
+            except NoCentralQuota:
+                return None
+            except VisionError as error:
+                if error.code == "rate_limited":
+                    return None
+                raise

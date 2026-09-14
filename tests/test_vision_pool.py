@@ -10,7 +10,7 @@ from claude_swap.settings import AutoSwitchSettings
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.usage_store import UsageEntry
 from claude_swap.vision import VisionClient, VisionError
-from claude_swap.vision_pool import CentralPoolCredential, request_models
+from claude_swap.vision_pool import CentralPoolCredential, request_models, retry_delay
 
 NOW = 1_800_000_000.0
 
@@ -228,3 +228,68 @@ def test_new_generation_can_reenter_pool_before_rejection_cooldown(setup):
     pool.pool.sync(force=True)
     observations[item(3)["login_id"]] = observation(3, 100)
     assert pool.get()["accessToken"] == "synthetic-successor"
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (None, 60),
+        ("invalid", 60),
+        ("120", 120),
+        ("0", 1),
+        ("１２", 60),
+        ("99999999999", 60),
+    ],
+)
+def test_retry_after_delta_parsing(value, expected):
+    assert retry_delay(value, NOW) == expected
+
+
+def test_retry_after_http_date():
+    from email.utils import format_datetime
+
+    value = format_datetime(datetime.fromtimestamp(NOW + 125, UTC), usegmt=True)
+    assert retry_delay(value, NOW) == 125
+
+
+def test_rate_limit_selects_another_account_without_refresh(setup):
+    pool, _, client, _, _, _ = setup
+    credential = pool.get()
+    assert pool.rate_limited(credential, "120")["accessToken"] == "synthetic-token-3"
+    assert pool.rate_limits[credential["account_id"]] == NOW + 120
+    client.refresh.assert_not_called()
+
+
+def test_rate_limit_survives_new_generation_until_retry_deadline(setup):
+    pool, _, client, observations, clock, _ = setup
+    credential = pool.get()
+    pool.rate_limited(credential, "120")
+    client.discover.return_value[1]["login_generation"] = 2
+    pool.pool.sync(force=True)
+    observations[item(3)["login_id"]] = observation(3, 100)
+    assert pool.get()["accessToken"] == "synthetic-token-1"
+    clock.return_value = NOW + 121
+    observations[item(1)["login_id"]] = observation(1, 100)
+    assert pool.get()["accessToken"] == "synthetic-token-2"
+
+
+def test_all_accounts_limited_returns_remaining_retry_delay(setup):
+    pool, _, client, _, clock, _ = setup
+    first = pool.get()
+    second = pool.rate_limited(first, "120")
+    third = pool.rate_limited(second, "180")
+    assert pool.rate_limited(third, "240") is None
+    calls = client.credential.call_count
+    clock.return_value += 30
+    with pytest.raises(VisionError) as error:
+        pool.get()
+    assert error.value.status == 429
+    assert error.value.retry_after_seconds == 90
+    assert client.credential.call_count == calls
+
+
+def test_all_logins_for_limited_account_are_excluded(setup):
+    pool, _, client, _, _, _ = setup
+    client.discover.return_value[2]["account_id"] = item(2)["account_id"]
+    credential = pool.get()
+    assert pool.rate_limited(credential, "120")["accessToken"] == "synthetic-token-1"

@@ -76,7 +76,18 @@ It respects the server's refresh scheduling and does not refresh subscription-on
 tokens. If the rejected login cannot recover, it is excluded for 60 seconds (or
 until a new discovered generation appears) and selection tries another account
 with known quota. A second 401 is returned without another replay. Transport
-failures and partial streams are not replayed by the adapter. Provider 429 recovery remains unfinished.
+failures and partial streams are not replayed by the adapter.
+
+An explicit provider 429 records an account-wide retry deadline and may replay
+once on another account with fresh known quota. All logins and credential
+generations for the limited account share that deadline. `Retry-After` accepts
+delta seconds or an HTTP date; missing or malformed values use 60 seconds.
+A second 429 is returned without another replay, and its account deadline
+is also recorded. With no eligible alternative, native receives the provider's
+429 and retry header. Subsequent requests during a fully blocked pool receive 429
+with the earliest remaining delay without sending provider requests. These
+backoffs are local to the running adapter; central usage remains authoritative
+for selection across processes and hosts.
 
 The native macOS qualification uses Claude 2.1.270 with SHA-256
 `a506b6d970a4cf44f6abdb53a81ddcd5d3b0ce042a95c502fe9d1f946bdb8807`.
@@ -85,9 +96,10 @@ external network access and user-home reads and serves synthetic inference. The
 cases cover native resume, resume after history migration, token rotation between
 two turns of one live process, and quota-driven account switching between two turns
 of one live process. Another case rejects the first access token and verifies
-recovery without replacing the native process. They check the bearer, conversation
-ID, retained message context, and absence of a local credential file. This does not establish
-live-provider or Linux acceptance.
+recovery without replacing the native process. A provider-429 case verifies
+account fallback within the same conversation. They check the bearer, conversation
+ID, retained message context, and absence of a local credential file. This does
+not establish live-provider or Linux acceptance.
 
 `ManagedLoginHandoff` implements recoverable registration for dedicated profiles
 under `vision-logins/<profile-id>`. Its caller must keep the profile lease across
