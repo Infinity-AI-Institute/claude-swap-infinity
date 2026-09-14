@@ -50,3 +50,25 @@ It does not replace a running process's credentials. An upload failure preserves
 the recovery journal; retry `upload personal` or use `cancel-upload personal`.
 Cancellation restores local credentials only when the registry confirms that
 ownership was not committed, and never overwrites a newer local login.
+
+## Inspect existing credentials before migration
+
+```sh
+cswap vision existing-logins
+cswap vision existing-logins --profile /path/to/existing/claude-profile
+```
+
+This read-only inventory reports source IDs, storage locations, and which known
+sources contain the same refresh token. It examines the default and active native
+profiles, saved file and Keychain backups, retained previous generations, orphaned
+recovery files, and detached swap-managed profiles. Repeated `--profile` options
+include additional native profiles. Credential values are never printed.
+
+Unreadable or malformed credential sources stop the inventory. A live or
+unreadable native session is reported explicitly. Pending managed handoff escrow
+must be reconciled before inventorying existing credentials. Arbitrary portable
+exports elsewhere on disk are not searched.
+
+The result is an inventory, not an ownership transfer or proof that native
+refreshers have stopped. The existing-profile transfer command is not implemented
+yet; do not copy these credentials into a new managed profile to bypass handoff.

@@ -262,6 +262,9 @@ def run_command(argv, switcher):
     batch = commands.add_parser("batch-upload")
     batch.add_argument("names", nargs="+")
     batch.add_argument("--confirm")
+    commands.add_parser("existing-logins").add_argument(
+        "--profile", action="append", default=[]
+    )
     commands.add_parser("profiles")
     commands.add_parser("auto-register").add_argument("value", choices=("on", "off"))
     args = parser.parse_args(argv)
@@ -289,6 +292,10 @@ def run_command(argv, switcher):
             if result["state"] != "pending":
                 return result
             time.sleep(min(30, result["retry_after_seconds"]))
+    if args.command == "existing-logins":
+        from claude_swap.vision_inventory import capture_inventory
+
+        return capture_inventory(switcher, args.profile).public()
     if args.command == "profiles":
         return profiles.read()
     if args.command == "auto-register":
