@@ -369,8 +369,6 @@ class VisionClient(VisionTransport):
             )
         ):
             raise VisionError("service_unavailable")
-        if "inference" not in capabilities:
-            raise VisionError("credential_unavailable")
         try:
             verified = datetime.fromisoformat(value["verified_at"])
             if verified.utcoffset() is None:
