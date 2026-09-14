@@ -521,6 +521,7 @@ class SessionManager:
                 "of sharing it."
             )
 
+        self.switcher.sync_vision_accounts()
         account_num, email, org_uuid = self.switcher.resolve_account(identifier)
         # Guard before the same-account direct-launch fast path below (which
         # _exec's claude and never returns) — and before setup_session.

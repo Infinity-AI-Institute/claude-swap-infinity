@@ -83,6 +83,8 @@ from claude_swap.paths import (
     migrate_legacy_backup_dir,
 )
 from claude_swap.process_detection import get_running_instances
+from claude_swap.vision import VisionError, configured_client as configured_vision_client
+from claude_swap.vision_registry import RegistryPool
 from claude_swap import poll_policy
 from claude_swap.settings import (
     load_settings,
@@ -391,6 +393,23 @@ class ClaudeAccountSwitcher:
         from claude_swap.migrations import run_migrations
 
         run_migrations(self)
+
+    def sync_vision_accounts(self, *, force: bool = False) -> bool:
+        """Refresh optional registry membership outside credential/native locks."""
+        try:
+            client = configured_vision_client()
+            if client is None:
+                return False
+            changed = RegistryPool(self, client).sync(force=force)
+        except VisionError as error:
+            # Keep independent local profiles available during a registry outage.
+            # Remote launch must still obtain an authorized credential from Vision.
+            if getattr(self, "_vision_sync_error", None) != error.code:
+                self._logger.warning("Vision account synchronization failed: %s", error.code)
+            self._vision_sync_error = error.code
+            return False
+        self._vision_sync_error = None
+        return changed
 
     def _is_running_in_container(self) -> bool:
         """Check if running inside a container."""
@@ -813,7 +832,18 @@ class ClaudeAccountSwitcher:
         else:
             self._invalidate_session_credentials(account_num, email)
 
+    def _vision_account_record(
+        self, account_num: str, *, strict: bool = True
+    ) -> dict | None:
+        data = self._read_json(self.sequence_file, strict=strict) or {}
+        record = data.get("accounts", {}).get(str(account_num), {})
+        return record if record.get("source") == "vision" else None
+
     def _read_account_credentials(self, account_num: str, email: str) -> str:
+        # Preserve read-only backup recovery when a local roster is damaged.
+        # Mutation paths still require a readable roster.
+        if self._vision_account_record(account_num, strict=False) is not None:
+            return ""
         return self._store._read_account_credentials(account_num, email)
 
     def _write_account_credentials(
@@ -850,6 +880,8 @@ class ClaudeAccountSwitcher:
         ``Exception`` disarmed exactly that guard for every write routing
         through here.
         """
+        if self._vision_account_record(account_num) is not None:
+            raise ConfigError("Vision account credentials cannot be stored locally.")
         self._store._write_account_credentials(account_num, email, credentials)
         try:
             self._post_backup_write(account_num, email)
@@ -1734,6 +1766,7 @@ class ClaudeAccountSwitcher:
         eligible (on-demand callers). ``scheduled=True`` preserves valid
         future plans while still allowing due plans to beat the serve TTL.
         """
+        self.sync_vision_accounts()
         accounts_info = self._build_accounts_info()
         return self._collect_usage_entries(
             accounts_info, fetch=fetch, scheduled=scheduled
@@ -1750,6 +1783,7 @@ class ClaudeAccountSwitcher:
         account eligible; a set restricts which accounts *may* be fetched
         this pass.
         """
+        self.sync_vision_accounts()
         accounts_info = self._build_accounts_info()
         entries = self._collect_usage_entries(accounts_info, fetch=fetch)
         seq_data = self._get_sequence_data() or {}
@@ -2687,6 +2721,8 @@ class ClaudeAccountSwitcher:
     def _read_account_credentials_ex(
         self, account_num: str, email: str
     ) -> tuple[str, bool]:
+        if self._vision_account_record(account_num, strict=False) is not None:
+            return "", False
         return self._store._read_account_credentials_ex(account_num, email)
 
     def list_unclaimed_credentials(self) -> dict[str, dict]:
@@ -3771,9 +3807,12 @@ class ClaudeAccountSwitcher:
             org_name = account.get("organizationName", "") or ""
             org_uuid = account.get("organizationUuid", "") or ""
             alias = account.get("alias", "") or ""
-            is_active = str(num) == active_num
+            is_remote = account.get("source") == "vision"
+            is_active = str(num) == active_num and not is_remote
 
-            if is_active:
+            if is_remote:
+                creds = ""  # Registry entries never read a local refresh-token backup.
+            elif is_active:
                 active = self._read_active_credentials()
                 creds = active.value or ""
                 self._record_active_verdict(active)
@@ -5199,6 +5238,7 @@ class ClaudeAccountSwitcher:
         watch view's adaptive set); ``None`` — the CLI default — leaves every
         stale account eligible.
         """
+        self.sync_vision_accounts()
         if not self.sequence_file.exists():
             # JSON mode must never prompt — emit an empty list instead of the
             # interactive first-run setup.
