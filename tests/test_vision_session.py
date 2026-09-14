@@ -168,17 +168,18 @@ def test_remote_run_bypasses_local_bootstrap_and_preserves_resume_arguments(
         "claude_swap.session.shutil.which", lambda _: "/synthetic/claude"
     )
     manager.setup_session = Mock(side_effect=AssertionError("local bootstrap"))
-    manager._exec = Mock(side_effect=SystemExit(0))
+    runner = Mock(side_effect=SystemExit(0))
+    monkeypatch.setattr("claude_swap.vision_proxy.run_native", runner)
     with pytest.raises(SystemExit):
         manager.run(
             "1", ["--resume", "synthetic-session", "--model", "sonnet"], share=False
         )
-    assert manager._exec.call_args.args == (
+    assert runner.call_args.args[:2] == (
         "/synthetic/claude",
         ["--resume", "synthetic-session", "--model", "sonnet"],
     )
     assert (
-        manager._exec.call_args.kwargs["env"]["CLAUDE_CODE_OAUTH_TOKEN"]
+        runner.call_args.args[2].env["CLAUDE_CODE_OAUTH_TOKEN"]
         == "synthetic-access-token"
     )
 

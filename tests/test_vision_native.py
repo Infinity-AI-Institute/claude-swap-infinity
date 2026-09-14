@@ -4,10 +4,13 @@ import hashlib
 import http.server
 import json
 import os
+import queue
 import subprocess
 import sys
+import tempfile
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -16,6 +19,7 @@ from claude_swap.session import SessionManager
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.vision import VisionClient
 from claude_swap.vision_history import copy_history, install_history
+from claude_swap.vision_proxy import CentralCredential, InferenceProxy
 from claude_swap.vision_session import prepare_launch, session_directory
 
 NATIVE_HASH = "a506b6d970a4cf44f6abdb53a81ddcd5d3b0ce042a95c502fe9d1f946bdb8807"
@@ -26,10 +30,11 @@ TOKEN = "synthetic-vision-native-token"
     sys.platform != "darwin" or not os.environ.get("CLAUDE_NATIVE_TEST_BINARY"),
     reason="Requires explicit pinned native binary and macOS sandbox-exec",
 )
-@pytest.mark.parametrize("migrate_history", [False, True])
+@pytest.mark.parametrize("mode", ["resume", "migrate", "proxy"])
 def test_prepared_access_only_launch_reaches_native_inference(
-    temp_home, monkeypatch, migrate_history
+    temp_home, monkeypatch, mode
 ):
+    migrate_history = mode == "migrate"
     native = Path(os.environ["CLAUDE_NATIVE_TEST_BINARY"]).resolve()
     assert hashlib.sha256(native.read_bytes()).hexdigest() == NATIVE_HASH
     requests = []
@@ -127,6 +132,13 @@ def test_prepared_access_only_launch_reaches_native_inference(
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Provider)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     port = server.server_address[1]
+    proxy = None
+    if mode == "proxy":
+        proxy = InferenceProxy(
+            CentralCredential(registry, record), upstream=f"http://127.0.0.1:{port}"
+        )
+        proxy.__enter__()
+        port = proxy.server.server_port
     # Only the synthetic endpoint is reachable. Helpers, Keychain access, and
     # reads of user homes are denied by the kernel, independently of CLI flags.
     sandbox = f'''(version 1)
@@ -159,6 +171,8 @@ def test_prepared_access_only_launch_reaches_native_inference(
             "DISABLE_ERROR_REPORTING": "1",
         }
     )
+    if proxy is not None:
+        env = proxy.environment(env)
     command = [
         "/usr/bin/sandbox-exec",
         "-p",
@@ -181,62 +195,67 @@ def test_prepared_access_only_launch_reaches_native_inference(
         "claude-sonnet-4-6",
     ]
     try:
-        result = subprocess.run(
-            command,
-            cwd=temp_home,
-            env=env,
-            capture_output=True,
-            timeout=30,
-            check=False,
-        )
-        assert result.returncode == 0, "Pinned native synthetic inference failed"
-        first_events = [
-            json.loads(line)
-            for line in result.stdout.splitlines()
-            if line.startswith(b"{")
-        ]
-        session_id = next(
-            event["session_id"]
-            for event in first_events
-            if event.get("type") == "result"
-        )
-        registry.credential.return_value = {
-            **registry.credential.return_value,
-            "accessToken": TOKEN + "-2",
-            "generation": 2,
-        }
-        if migrate_history:
-            migrated_login = "ail_00000000-0000-4000-8000-000000000002"
-            record["visionLoginId"] = migrated_login
-            registry.credential.return_value["login_id"] = migrated_login
-            snapshot = temp_home / "migration-history"
-            copy_history([launch.directory], snapshot)
-            install_history(
-                snapshot,
-                session_directory(
-                    manager.switcher.backup_dir, registry.url, migrated_login
-                ),
-                "synthetic-migration",
+        if mode == "proxy":
+            result, session_id = _two_proxy_turns(command, env, registry, temp_home)
+        else:
+            result = subprocess.run(
+                command,
+                cwd=temp_home,
+                env=env,
+                capture_output=True,
+                timeout=30,
+                check=False,
             )
-        resumed = prepare_launch(
-            manager, record, registry, share=False, share_history=False
-        )
-        assert (resumed.directory != launch.directory) is migrate_history
-        for key in (
-            "CLAUDE_CONFIG_DIR",
-            "CLAUDE_SECURESTORAGE_CONFIG_DIR",
-            "CLAUDE_CODE_OAUTH_TOKEN",
-        ):
-            env[key] = resumed.env[key]
-        result = subprocess.run(
-            command + ["--resume", session_id],
-            cwd=temp_home,
-            env=env,
-            capture_output=True,
-            timeout=30,
-            check=False,
-        )
+            assert result.returncode == 0, "Pinned native synthetic inference failed"
+            first_events = [
+                json.loads(line)
+                for line in result.stdout.splitlines()
+                if line.startswith(b"{")
+            ]
+            session_id = next(
+                event["session_id"]
+                for event in first_events
+                if event.get("type") == "result"
+            )
+            registry.credential.return_value = {
+                **registry.credential.return_value,
+                "accessToken": TOKEN + "-2",
+                "generation": 2,
+            }
+            if migrate_history:
+                migrated_login = "ail_00000000-0000-4000-8000-000000000002"
+                record["visionLoginId"] = migrated_login
+                registry.credential.return_value["login_id"] = migrated_login
+                snapshot = temp_home / "migration-history"
+                copy_history([launch.directory], snapshot)
+                install_history(
+                    snapshot,
+                    session_directory(
+                        manager.switcher.backup_dir, registry.url, migrated_login
+                    ),
+                    "synthetic-migration",
+                )
+            resumed = prepare_launch(
+                manager, record, registry, share=False, share_history=False
+            )
+            assert (resumed.directory != launch.directory) is migrate_history
+            for key in (
+                "CLAUDE_CONFIG_DIR",
+                "CLAUDE_SECURESTORAGE_CONFIG_DIR",
+                "CLAUDE_CODE_OAUTH_TOKEN",
+            ):
+                env[key] = resumed.env[key]
+            result = subprocess.run(
+                command + ["--resume", session_id],
+                cwd=temp_home,
+                env=env,
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
     finally:
+        if proxy is not None:
+            proxy.__exit__()
         server.shutdown()
         server.server_close()
     assert result.returncode == 0, "Pinned native synthetic inference failed"
@@ -264,3 +283,73 @@ def test_prepared_access_only_launch_reaches_native_inference(
         for event in events
     )
     assert not (launch.directory / ".credentials.json").exists()
+
+
+def _two_proxy_turns(command, env, registry, cwd):
+    """Keep one pinned native process alive while its upstream token changes."""
+    argv = [arg for arg in command if arg != "Reply with OK."]
+    argv += ["--input-format", "stream-json"]
+    lines = queue.Queue()
+    with (
+        tempfile.TemporaryFile() as stderr,
+        subprocess.Popen(
+            argv,
+            cwd=cwd,
+            env=env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=stderr,
+        ) as child,
+    ):
+
+        def read_output():
+            for line in child.stdout:
+                lines.put(line)
+
+        reader = threading.Thread(target=read_output, daemon=True)
+        reader.start()
+        try:
+            session_id = ""
+            result_lines = []
+            for turn in range(2):
+                assert child.poll() is None, (
+                    "Native process exited before the next turn"
+                )
+                if turn:
+                    registry.credential.return_value = {
+                        **registry.credential.return_value,
+                        "accessToken": TOKEN + "-2",
+                        "generation": 2,
+                    }
+                request = {
+                    "type": "user",
+                    "message": {"role": "user", "content": "Reply with OK."},
+                    "parent_tool_use_id": None,
+                    "session_id": session_id,
+                }
+                child.stdin.write(json.dumps(request).encode() + b"\n")
+                child.stdin.flush()
+                while True:
+                    line = lines.get(timeout=25)
+                    result_lines.append(line)
+                    if not line.startswith(b"{"):
+                        continue
+                    event = json.loads(line)
+                    if event.get("type") == "result":
+                        assert not event.get("is_error"), (
+                            "Native proxy inference failed"
+                        )
+                        if session_id:
+                            assert event["session_id"] == session_id
+                        session_id = event["session_id"]
+                        break
+            child.stdin.close()
+            child.wait(timeout=15)
+            return SimpleNamespace(
+                returncode=child.returncode, stdout=b"".join(result_lines)
+            ), session_id
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait(timeout=5)
+            reader.join(timeout=5)

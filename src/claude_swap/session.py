@@ -526,12 +526,15 @@ class SessionManager:
         remote = self.switcher._vision_account_record(account_num)
         if remote is not None:
             from claude_swap.vision import configured_client
+            from claude_swap.vision_proxy import run_native
             from claude_swap.vision_session import prepare_launch
+
+            client = configured_client()
 
             launch = prepare_launch(
                 self,
                 remote,
-                configured_client(),
+                client,
                 share=share,
                 share_history=share_history,
             )
@@ -539,7 +542,7 @@ class SessionManager:
                 f"{accent('Launching')} Account-{account_num} ({email}) "
                 f"{muted('[Vision]')}"
             )
-            self._exec(claude_bin, claude_args, env=launch.env)
+            run_native(claude_bin, claude_args, launch, client, remote)
             raise AssertionError("unreachable")
 
         # Guard before the same-account direct-launch fast path below (which

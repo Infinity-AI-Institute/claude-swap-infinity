@@ -132,3 +132,29 @@ profile's shared history are supported; unknown or nested links are refused.
 Pinned Claude 2.1.270 has passed synthetic access-only inference and same-session
 resume after importing history into a different profile. The live multiuser pilot
 and clean EC2 rollout acceptance remain separate required checks.
+
+## Central credentials during a native session
+
+Central-account launches keep a local adapter running beside Claude:
+
+```text
+native message request
+    -> obtain the current authorized Vision access credential
+    -> attach it to the fixed Anthropic message endpoint
+    -> stream the response back to the same native process
+```
+
+The adapter binds to loopback and gives the native process a random per-process
+capability. Provider access tokens stay in the adapter; no provider refresh token
+is delivered to either component. Only `/v1/messages` and its `count_tokens`
+endpoint are forwarded. Provider redirects are rejected, and Vision revocation
+blocks subsequent credential issuance before another upstream request.
+
+Native arguments, terminal input/output and exit status are preserved. Terminal
+Ctrl+C remains available to Claude to cancel a turn or exit. The adapter stops
+when its child exits. It does not replay an upstream request after an uncertain
+connection failure or replace credentials inside native storage.
+
+Pinned Claude 2.1.270 has completed two synthetic turns in one process with a
+central access-token change between turns and the same conversation ID. Automatic
+quota-driven account switching and in-session relogin recovery remain unfinished.
