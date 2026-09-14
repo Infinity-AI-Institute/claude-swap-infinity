@@ -75,7 +75,17 @@ to bypass handoff.
 
 ## Transfer a selected existing login
 
-Exit the native sessions before transfer. Use a `source_id` from the inventory:
+A grant found only in saved backups fences its matching saved-slot session
+homes, including retained previous copies. Unrelated active native profiles do
+not block that case. If any matching copy is in a native credential store,
+all known native profiles must be idle: Claude can use an arbitrary separate
+secure-storage directory, and the migration shell cannot prove where a running
+process obtained its credentials.
+
+The writer scope is saved before credential deletion and remains enforced during
+recovery. Older recovery journals lack that scope and also require all known
+profiles idle. Unreadable session records anywhere in inventory remain a blocker.
+Use a `source_id` from the inventory:
 
 ```sh
 cswap vision migrate-login SOURCE_ID
