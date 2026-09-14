@@ -95,8 +95,10 @@ def test_successful_login_uploads_by_default_and_alias_runs_verified_remote(setu
 
 def test_persistent_opt_out_keeps_native_login_local(setup):
     switcher, client, _ = setup
-    assert run_command(["auto-register", "off"], switcher) == {"auto_register": False}
-    assert ManagedProfiles(switcher.backup_dir).read()["auto_register"] is False
+    assert run_command(["auto-register", "off"], switcher) == {
+        "auto_register": False, "url": client.url
+    }
+    assert ManagedProfiles(switcher.backup_dir).auto_register(client.url) is False
     assert run_command(["account-login", "work"], switcher)["state"] == "local"
     client.request.assert_not_called()
     assert list((switcher.backup_dir / "vision-logins").rglob(".credentials.json"))
@@ -255,3 +257,86 @@ def test_changed_native_login_uploads_only_after_process_exit_when_enabled(setup
     assert exited.value.code == 0
     assert len(client.request.call_args_list) == 2
     assert not list((switcher.backup_dir / "vision-logins").rglob(".credentials.json"))
+
+
+def test_auto_registration_choices_are_independent_per_normalized_deployment(setup):
+    switcher, client, _ = setup
+    a = client.url
+    b = "https://other-vision.example.invalid"
+    run_command(["--url", a + "/", "auto-register", "off"], switcher)
+    preferences = ManagedProfiles(switcher.backup_dir)
+    assert preferences.auto_register(a) is False
+    assert preferences.auto_register(b) is True
+    run_command(["--url", b, "auto-register", "off"], switcher)
+    run_command(["--url", a, "auto-register", "on"], switcher)
+    reopened = ManagedProfiles(switcher.backup_dir)
+    assert reopened.auto_register(a) is True
+    assert reopened.auto_register(b) is False
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_legacy_upload_preference_remains_fallback_after_origin_override(setup, legacy):
+    switcher, client, _ = setup
+    profiles = ManagedProfiles(switcher.backup_dir)
+    profiles.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _write_private(profiles.path, json.dumps({
+        "version": 1, "auto_register": legacy, "profiles": {},
+    }))
+    other = "https://other-vision.example.invalid"
+    assert profiles.auto_register(client.url) is legacy
+    assert profiles.auto_register(other) is legacy
+    profiles.set_auto_register(not legacy, client.url)
+    reopened = ManagedProfiles(switcher.backup_dir)
+    assert reopened.read()["version"] == 2
+    assert reopened.auto_register(client.url) is not legacy
+    assert reopened.auto_register(other) is legacy
+
+
+def test_login_uses_current_origin_preference_and_discloses_before_native(setup, capsys):
+    switcher, client, native = setup
+    profiles = ManagedProfiles(switcher.backup_dir)
+    profiles.set_auto_register(False, client.url)
+    original_native = native.side_effect
+
+    def launch(*args, **kwargs):
+        disclosure = capsys.readouterr().err
+        assert "disabled" in disclosure and client.url in disclosure
+        assert f"cswap vision --url {client.url} auto-register off" in disclosure
+        return original_native(*args, **kwargs)
+
+    native.side_effect = launch
+    assert run_command(["account-login", "work"], switcher)["state"] == "local"
+    client.request.assert_not_called()
+    assert profiles.auto_register("https://other-vision.example.invalid") is True
+
+
+def test_vision_key_setup_discloses_enabled_destination_and_opt_out(setup, monkeypatch, capsys):
+    switcher, client, _ = setup
+    monkeypatch.setenv("VISION_API_KEY", "synthetic-key")
+    assert run_command(["login"], switcher)["state"] == "configured"
+    text = capsys.readouterr().err
+    assert "enabled" in text and client.url in text
+    assert f"cswap vision --url {client.url} auto-register off" in text
+    client.request.assert_not_called()
+
+
+def test_malformed_origin_preference_cannot_reset_existing_opt_out(setup):
+    switcher, client, _ = setup
+    profiles = ManagedProfiles(switcher.backup_dir)
+    profiles.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _write_private(profiles.path, json.dumps({
+        "version": 2, "auto_register": False, "profiles": {}, "bindings": {},
+        "auto_register_by_origin": {client.url: "true"},
+    }))
+    with pytest.raises(SessionError, match="refusing to reset"):
+        profiles.auto_register(client.url)
+
+
+def test_unconfigured_provider_login_discloses_local_only(setup, monkeypatch, capsys):
+    switcher, client, _ = setup
+    monkeypatch.setattr("claude_swap.vision_cli.configured_client", lambda: None)
+    assert run_command(["account-login", "work"], switcher)["state"] == "local"
+    disclosure = capsys.readouterr().err
+    assert "Vision is not configured; this login stays local" in disclosure
+    assert "auto-register off" in disclosure
+    client.request.assert_not_called()
