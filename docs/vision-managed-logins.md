@@ -15,7 +15,9 @@ cswap run -- --resume CONVERSATION_ID
 
 These clients need no provider login or copied provider home. Vision delivers
 verified access credentials without a separate native-inference qualification
-gate; the native Claude CLI and provider determine whether inference succeeds. To register a new
+gate; the native Claude CLI and provider determine whether inference succeeds.
+Periodic Vision inference checks remain useful advisory health observations,
+not a prerequisite for credential delivery. To register a new
 provider login deliberately, use `cswap vision account-login work`, then
 `cswap run work` after registration and use authorization complete. Existing
 native credentials can instead use the selected-login transfer below.
