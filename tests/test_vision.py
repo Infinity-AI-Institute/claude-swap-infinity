@@ -104,7 +104,7 @@ def test_bad_second_page_cannot_return_a_partial_pool(second):
 
 @pytest.mark.parametrize("kind", ["login_oauth", "subscription_oauth_token"])
 @pytest.mark.parametrize("unknown_expiry", [False, True])
-def test_both_subscription_kinds_accept_only_verified_inference_credentials(
+def test_both_subscription_kinds_accept_verified_access_credentials(
     kind, unknown_expiry
 ):
     registry = client()
@@ -123,7 +123,6 @@ def test_both_subscription_kinds_accept_only_verified_inference_credentials(
     [
         {"provider": "codex"},
         {"refreshToken": "forbidden-private-refresh"},
-        {"capabilities": ["identity"]},
         {"generation": True},
         {"expires_at": "2000-01-01T00:00:00Z"},
         {"verified_at": None},
@@ -131,7 +130,7 @@ def test_both_subscription_kinds_accept_only_verified_inference_credentials(
         {"login_id": item(2)["login_id"]},
     ],
 )
-def test_invalid_or_unqualified_delivery_is_refused_without_retaining_secret_errors(
+def test_invalid_delivery_is_refused_without_retaining_secret_errors(
     change,
 ):
     registry = client()
@@ -178,3 +177,12 @@ def test_refresh_request_is_generation_fenced_and_never_calls_a_provider():
     )
     assert registry.request.call_args.args[2] == {"version": 1, "generation": 1}
     assert registry.request.call_args.args[1].endswith("/refresh")
+
+
+@pytest.mark.parametrize("kind", ["login_oauth", "subscription_oauth_token"])
+@pytest.mark.parametrize("capabilities", [[], ["identity"], ["profile"]])
+def test_provider_verified_access_does_not_require_inference_qualification(kind, capabilities):
+    registry = client()
+    value = {**credential(kind), "capabilities": capabilities}
+    registry.request = Mock(return_value=value)
+    assert registry.credential(value["account_id"], value["login_id"]) == value

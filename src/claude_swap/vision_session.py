@@ -51,6 +51,11 @@ def acquire_credential(client: VisionClient, record: dict, *, wait_seconds=90):
     receipt = client.refresh(account, login, generation)
     if receipt["state"] == "reauth_required":
         raise SessionError("The Vision login needs reauthentication before launch.")
+    # A current/obsolete receipt schedules no recovery work. Re-read once in
+    # case another owner already published a successor, then surface issuance
+    # failure instead of polling an unrelated broker error for 90 seconds.
+    if receipt["state"] in {"current", "obsolete"}:
+        return client.credential(account, login)
     deadline = time.monotonic() + wait_seconds
     while True:
         try:

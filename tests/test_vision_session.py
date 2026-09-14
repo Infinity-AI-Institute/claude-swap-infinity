@@ -248,3 +248,27 @@ def test_existing_native_credentials_and_history_are_untouched(setup, monkeypatc
     )
     assert credentials.read_text() == "existing local credentials"
     assert history.read_text() == "existing conversation"
+
+
+@pytest.mark.parametrize("state", ["current", "obsolete"])
+def test_unavailable_current_generation_fails_without_polling(setup, monkeypatch, state):
+    _, registry, record, _ = setup
+    registry.credential.side_effect = VisionError("credential_unavailable")
+    registry.refresh.return_value = {"state": state}
+    sleep = Mock(side_effect=AssertionError("No refresh job exists to wait for"))
+    monkeypatch.setattr("claude_swap.vision_session.time.sleep", sleep)
+    with pytest.raises(VisionError) as error:
+        acquire_credential(registry, record)
+    assert error.value.code == "credential_unavailable"
+    assert registry.credential.call_count == 2
+    registry.refresh.assert_called_once()
+    sleep.assert_not_called()
+
+
+@pytest.mark.parametrize("state", ["current", "obsolete"])
+def test_no_work_refresh_receipt_still_accepts_concurrent_successor(setup, state):
+    _, registry, record, token = setup
+    registry.credential.side_effect = [VisionError("credential_unavailable"), token]
+    registry.refresh.return_value = {"state": state}
+    assert acquire_credential(registry, record) == token
+    assert registry.credential.call_count == 2
