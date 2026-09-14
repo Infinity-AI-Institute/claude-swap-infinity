@@ -215,6 +215,9 @@ def run_command(argv, switcher):
     commands.add_parser("cancel")
     for command in ("account-login", "upload", "cancel-upload"):
         commands.add_parser(command).add_argument("name")
+    batch = commands.add_parser("batch-upload")
+    batch.add_argument("names", nargs="+")
+    batch.add_argument("--confirm")
     commands.add_parser("profiles")
     commands.add_parser("auto-register").add_argument("value", choices=("on", "off"))
     args = parser.parse_args(argv)
@@ -249,6 +252,16 @@ def run_command(argv, switcher):
         return {"auto_register": profiles.read()["auto_register"]}
     if args.command == "account-login":
         return login_profile(switcher, args.name)
+    if args.command == "batch-upload":
+        from claude_swap.vision_batch import BatchUpload
+
+        client = configured_client()
+        if client is None:
+            raise SessionError("Sign in to Vision before preparing an upload batch.")
+        batch = BatchUpload(switcher, client)
+        if args.confirm is None:
+            return batch.preview(args.names)
+        return batch.apply(args.names, args.confirm)
     profile_id = profiles.profile(args.name)
     client = configured_client()
     if client is None:

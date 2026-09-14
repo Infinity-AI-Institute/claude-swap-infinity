@@ -7,6 +7,7 @@ they cannot be adopted through this dedicated-profile API.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import secrets
@@ -102,6 +103,15 @@ def _credential(material: str) -> dict[str, str]:
         ) from None
 
 
+def _keychain_call(operation, *args):
+    try:
+        return operation(*args)
+    except macos_keychain.KEYCHAIN_ERRORS:
+        raise SessionError(
+            "The managed Keychain entry is unavailable; unlock it and retry."
+        ) from None
+
+
 class ManagedLoginHandoff:
     def __init__(
         self, backup_dir: Path, profile_id: str, registry: RegistrationClient | None
@@ -145,7 +155,8 @@ class ManagedLoginHandoff:
     def _stores(self) -> dict[str, str | None]:
         keychain = None
         if Platform.detect() == Platform.MACOS:
-            keychain = macos_keychain.get_password(
+            keychain = _keychain_call(
+                macos_keychain.get_password,
                 keychain_service_name(self.profile),
                 macos_keychain.keychain_account_name(),
             )
@@ -205,7 +216,8 @@ class ManagedLoginHandoff:
         # The journal already durably holds both backend copies. Missing copies
         # here mean an interrupted fence, not permission to regenerate a grant.
         if current["keychain"] is not None:
-            macos_keychain.delete_password(
+            _keychain_call(
+                macos_keychain.delete_password,
                 keychain_service_name(self.profile),
                 macos_keychain.keychain_account_name(),
             )
@@ -227,7 +239,8 @@ class ManagedLoginHandoff:
                 current["keychain"] is not None
                 and current["keychain"] == old["keychain"]
             ):
-                macos_keychain.delete_password(
+                _keychain_call(
+                    macos_keychain.delete_password,
                     keychain_service_name(self.profile),
                     macos_keychain.keychain_account_name(),
                 )
@@ -248,13 +261,31 @@ class ManagedLoginHandoff:
                 return
             old = journal["stores"]
             if old["keychain"] is not None and current["keychain"] is None:
-                macos_keychain.set_password(
+                _keychain_call(
+                    macos_keychain.set_password,
                     keychain_service_name(self.profile),
                     macos_keychain.keychain_account_name(),
                     old["keychain"],
                 )
             if old["file"] is not None and current["file"] is None:
                 _write_private(self.auth_path, old["file"])
+
+    def preview(self):
+        """Bind a preview to current native bytes and any pending transaction."""
+        self._require_quiescent()
+        stores = self._stores()
+        journal = self._journal()
+        material = stores["keychain"] or stores["file"]
+        if material is not None:
+            _credential(material)
+        elif journal is None:
+            raise SessionError("This profile has no login or recoverable upload.")
+        receipt = journal["receipt"] if journal is not None else None
+        state = receipt["state"] if receipt is not None else "local_unverified"
+        fingerprint = hashlib.sha256(
+            json.dumps({"stores": stores, "journal": journal}, sort_keys=True).encode()
+        ).hexdigest()
+        return fingerprint, state
 
     def prepare_login(self):
         """Do not overwrite an unresolved ownership transaction with a new login."""

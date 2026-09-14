@@ -134,3 +134,21 @@ proofs never appear in command output or approval URLs.
 origins and the local seeded administrator, approves its own request, checks
 registry access and hardware denial, revokes its key, then checks revocation. It
 uses no provider credentials and cleans up its own request/key in a finalizer.
+
+## Selected managed-profile batches
+
+Preview only the named profiles, then pass the returned confirmation value:
+
+```sh
+cswap vision batch-upload first second
+cswap vision batch-upload first second --confirm CONFIRMATION
+```
+
+Preview performs no registry request and shows no credential material. Confirmation
+binds the ordered selection, exact local store/transaction state, registry origin
+and API key. Changed credentials or a changed key require a new preview. Apply
+checks each profile again under its handoff lease; one unavailable profile does
+not abandon the remaining selection. Each successful item uses the same durable
+registration recovery as a single upload. Profiles not selected are untouched.
+This command currently selects dedicated managed profiles; inventory and handoff
+of existing default/external profiles remains separate required work.
