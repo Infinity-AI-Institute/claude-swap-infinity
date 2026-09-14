@@ -9,7 +9,9 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from claude_swap import macos_keychain
 from claude_swap.exceptions import SessionError
+from claude_swap.models import Platform
 from claude_swap.vision import VisionClient, VisionError, registry_id
 
 # A selected Vision credential must not inherit another provider route or auth
@@ -70,7 +72,11 @@ def prepare_launch(
     share: bool,
     share_history: bool,
 ) -> RemoteLaunch:
-    from claude_swap.session import AUTH_OVERRIDE_ENV_VARS, _mkdir_private
+    from claude_swap.session import (
+        AUTH_OVERRIDE_ENV_VARS,
+        _mkdir_private,
+        keychain_service_name,
+    )
 
     if client is None or record.get("visionUrl") != client.url:
         raise SessionError(
@@ -104,6 +110,20 @@ def prepare_launch(
         raise SessionError(
             "This Vision session contains a local login that needs handoff."
         )
+    if Platform.detect() == Platform.MACOS:
+        try:
+            native_login = macos_keychain.get_password(
+                keychain_service_name(directory),
+                macos_keychain.keychain_account_name(),
+            )
+        except macos_keychain.KEYCHAIN_ERRORS:
+            raise SessionError(
+                "The Vision session Keychain entry is unavailable; unlock it and retry."
+            ) from None
+        if native_login is not None:
+            raise SessionError(
+                "This Vision session contains a local Keychain login that needs handoff."
+            )
     manager._sync_sharing(directory, share, share_history)
     env = {
         key: value

@@ -181,3 +181,28 @@ def test_remote_run_bypasses_local_bootstrap_and_preserves_resume_arguments(
         manager._exec.call_args.kwargs["env"]["CLAUDE_CODE_OAUTH_TOKEN"]
         == "synthetic-access-token"
     )
+
+
+@pytest.mark.parametrize("unreadable", [False, True])
+def test_keychain_native_login_or_unknown_store_blocks_remote_launch(
+    setup, monkeypatch, unreadable
+):
+    from claude_swap import macos_keychain
+    from claude_swap.models import Platform
+    from claude_swap.session import keychain_service_name
+
+    manager, registry, record, _ = setup
+    monkeypatch.setattr(Platform, "detect", lambda: Platform.LINUX)
+    first = prepare_launch(manager, record, registry, share=False, share_history=False)
+    monkeypatch.setattr(Platform, "detect", lambda: Platform.MACOS)
+    lookup = Mock(return_value="synthetic Keychain login")
+    if unreadable:
+        lookup.side_effect = OSError("secret-bearing backend details")
+    monkeypatch.setattr(macos_keychain, "get_password", lookup)
+    monkeypatch.setattr(macos_keychain, "keychain_account_name", lambda: "test-user")
+    manager._sync_sharing = Mock()
+    with pytest.raises(SessionError) as error:
+        prepare_launch(manager, record, registry, share=False, share_history=False)
+    assert "secret-bearing" not in str(error.value)
+    lookup.assert_called_once_with(keychain_service_name(first.directory), "test-user")
+    manager._sync_sharing.assert_not_called()
