@@ -2,9 +2,10 @@
 
 This branch can discover authorized Claude accounts and display their centrally
 observed usage. Explicit `cswap run ACCOUNT` also launches a remote account with
-an access-only credential. Login handoff and automatic recovery during a running
-session remain in progress. Do not release this integration until the remaining
-client and deployment acceptance checks pass.
+an access-only credential. Managed provider login now uploads by default when
+Vision is configured. Existing-profile handoff and automatic recovery during a
+running session remain in progress. Do not release this integration until the
+remaining client and deployment acceptance checks pass.
 
 Set `VISION_API_KEY` to your own Vision API key. `VISION_API_URL` defaults to
 `https://vision.infinity.inc`; an override must be an HTTPS origin, except for
@@ -62,7 +63,48 @@ and Keychain value until Vision confirms ownership, recovers lost replies with
 the original proof, and restores a cancelled grant without overwriting a newer
 login. An active or unreadable native session prevents handoff confirmation.
 
-This backend is not yet wired to the login CLI. It does not inventory existing
-default profiles, portable backups or external Claude homes; those remain a
+The managed login CLI uses this backend. It does not inventory existing default
+profiles, portable backups or external Claude homes; those remain a
 separate required integration before this series is complete. A dedicated profile
 must not be populated by copying an existing refresh-token backup into it.
+
+
+## Managed provider login
+
+With your Vision key configured, run:
+
+```sh
+cswap vision account-login work
+cswap run work
+```
+
+The first command starts `claude auth login` in a dedicated private profile. A
+successful login that changes credential material uploads by default, completes
+handoff after the native login process exits, and maps `work` to the verified
+remote login when the alias is available. A failed or unchanged login does not
+upload. If Vision is not configured, the login stays local; no fabricated key is
+used. The returned registration receipt contains no provider token or handoff proof.
+
+To retain managed login credentials locally, persist the opt-out before login:
+
+```sh
+cswap vision auto-register off
+cswap vision account-login personal
+```
+
+`cswap vision auto-register on` re-enables automatic upload for future managed
+logins. The preference is read back after writing and checked again after native
+login exits; damaged preferences fail explicitly instead of reverting to upload.
+Existing default-profile logins are not intercepted by this command yet.
+
+Recover or cancel an interrupted upload with its existing name:
+
+```sh
+cswap vision upload work
+cswap vision cancel-upload work
+cswap vision profiles
+```
+
+An explicit upload remains available when auto-register is off. A pending upload
+must be recovered or cancelled before starting another login in the same profile.
+The profile listing contains names, IDs and the upload preference, never secrets.

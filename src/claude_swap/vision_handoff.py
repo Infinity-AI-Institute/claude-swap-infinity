@@ -103,7 +103,9 @@ def _credential(material: str) -> dict[str, str]:
 
 
 class ManagedLoginHandoff:
-    def __init__(self, backup_dir: Path, profile_id: str, registry: RegistrationClient):
+    def __init__(
+        self, backup_dir: Path, profile_id: str, registry: RegistrationClient | None
+    ):
         try:
             if str(uuid.UUID(profile_id)) != profile_id:
                 raise ValueError()
@@ -162,7 +164,11 @@ class ManagedLoginHandoff:
                 != {"version", "url", "request_id", "proof", "stores", "receipt"}
                 or type(value["version"]) is not int
                 or value["version"] != 1
-                or value["url"] != self.registry.client.url
+                or not isinstance(value["url"], str)
+                or (
+                    self.registry is not None
+                    and value["url"] != self.registry.client.url
+                )
             ):
                 raise ValueError()
             registration_proof(value["request_id"], value["proof"])
@@ -250,7 +256,26 @@ class ManagedLoginHandoff:
             if old["file"] is not None and current["file"] is None:
                 _write_private(self.auth_path, old["file"])
 
+    def prepare_login(self):
+        """Do not overwrite an unresolved ownership transaction with a new login."""
+        self._require_quiescent()
+        journal = self._journal()
+        if journal is None:
+            return
+        receipt = journal["receipt"]
+        if receipt is None or receipt["state"] not in {
+            "committed",
+            "cancelled",
+            "expired",
+        }:
+            raise SessionError(
+                "Recover or cancel the pending upload before logging in again."
+            )
+        self._finish(journal)
+
     def upload(self):
+        if self.registry is None:
+            raise SessionError("Sign in to Vision before uploading this login.")
         self._require_quiescent()
         journal = self._journal()
         if journal is not None and journal["receipt"] is not None:
@@ -304,6 +329,8 @@ class ManagedLoginHandoff:
         return journal["receipt"]
 
     def cancel(self):
+        if self.registry is None:
+            raise SessionError("Sign in to Vision before cancelling this upload.")
         self._require_quiescent()
         journal = self._journal()
         if journal is None:
