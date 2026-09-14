@@ -25,6 +25,13 @@ def upstream():
         def do_POST(self):
             body = self.rfile.read(int(self.headers["Content-Length"]))
             requests.append((dict(self.headers), self.path, body))
+            if (
+                b"reject" in body
+                and self.headers.get("Authorization") != "Bearer recovered"
+            ):
+                self.send_response(401)
+                self.end_headers()
+                return
             if b"redirect" in body:
                 self.send_response(307)
                 self.send_header("Location", "/stolen")
@@ -192,3 +199,47 @@ def test_invalid_message_does_not_acquire_credentials(upstream, body):
         assert error.value.code == 400
     credentials.get.assert_not_called()
     assert seen == []
+
+
+def test_explicit_401_recovers_once_before_replaying_message(upstream):
+    url, seen = upstream
+    credentials = Mock()
+    rejected = {"accessToken": "rejected"}
+    credentials.get.return_value = rejected
+    credentials.recover.return_value = {"accessToken": "recovered"}
+    with (
+        InferenceProxy(credentials, upstream=url) as proxy,
+        request(proxy, body=b'{"reject":true,"model":"sonnet"}') as response,
+    ):
+        assert response.read() == b"data: synthetic\n\n"
+    credentials.recover.assert_called_once_with(rejected, model="sonnet")
+    assert [row[0]["Authorization"] for row in seen] == [
+        "Bearer rejected",
+        "Bearer recovered",
+    ]
+    assert seen[0][2] == seen[1][2]
+
+
+def test_second_401_is_returned_without_another_replay(upstream):
+    url, seen = upstream
+    credentials = Mock()
+    credentials.get.return_value = {"accessToken": "rejected"}
+    credentials.recover.return_value = {"accessToken": "also-rejected"}
+    with InferenceProxy(credentials, upstream=url) as proxy:
+        with pytest.raises(urllib.error.HTTPError) as error:
+            request(proxy, body=b'{"reject":true}')
+        assert error.value.code == 401
+    assert len(seen) == 2
+    assert credentials.recover.call_count == 1
+
+
+def test_no_successor_returns_401_without_replaying_old_token(upstream):
+    url, seen = upstream
+    credentials = Mock()
+    credentials.get.return_value = {"accessToken": "rejected"}
+    credentials.recover.return_value = None
+    with InferenceProxy(credentials, upstream=url) as proxy:
+        with pytest.raises(urllib.error.HTTPError) as error:
+            request(proxy, body=b'{"reject":true}')
+        assert error.value.code == 401
+    assert len(seen) == 1

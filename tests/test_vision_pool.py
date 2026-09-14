@@ -58,6 +58,7 @@ def setup(temp_home, monkeypatch):
             "email": row["email"],
             "organization_id": row["organization_id"],
             "generation": 1,
+            "kind": "login_oauth",
             "accessToken": f"synthetic-token-{index}",
         }
 
@@ -192,3 +193,38 @@ def test_malformed_threshold_settings_fail_before_credential_issue(setup, monkey
     with pytest.raises(ConfigError, match="threshold settings"):
         pool.get()
     client.credential.assert_not_called()
+
+
+def test_rejected_token_uses_another_account_and_avoids_immediate_return(setup):
+    pool, _, client, observations, _, _ = setup
+    client.refresh.side_effect = None
+    client.refresh.return_value = {"state": "current"}
+    rejected = pool.get()
+    assert rejected["accessToken"] == "synthetic-token-2"
+    assert pool.recover(rejected)["accessToken"] == "synthetic-token-3"
+    observations[item(3)["login_id"]] = observation(3, 100)
+    assert pool.get()["accessToken"] == "synthetic-token-1"
+    client.refresh.assert_called_once_with(
+        item(2)["account_id"], item(2)["login_id"], 1
+    )
+
+
+def test_new_generation_can_reenter_pool_before_rejection_cooldown(setup):
+    pool, _, client, observations, _, _ = setup
+    client.refresh.side_effect = None
+    client.refresh.return_value = {"state": "current"}
+    rejected = pool.get()
+    assert pool.recover(rejected)["accessToken"] == "synthetic-token-3"
+    previous_credential = client.credential.side_effect
+
+    def credential(account, login):
+        token = previous_credential(account, login)
+        if login == rejected["login_id"]:
+            token.update(generation=2, accessToken="synthetic-successor")
+        return token
+
+    client.credential.side_effect = credential
+    client.discover.return_value[1]["login_generation"] = 2
+    pool.pool.sync(force=True)
+    observations[item(3)["login_id"]] = observation(3, 100)
+    assert pool.get()["accessToken"] == "synthetic-successor"

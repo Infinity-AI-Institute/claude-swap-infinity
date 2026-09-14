@@ -5,8 +5,9 @@ observed usage. Explicit `cswap run ACCOUNT` also launches a remote account with
 an access-only credential. Managed provider login now uploads by default when
 Vision is configured. Existing-profile handoff is available through the migration
 commands in [vision-managed-logins.md](vision-managed-logins.md). Automatic
-recovery after provider authentication errors remains in progress. Do not release
-this integration until the remaining client and deployment acceptance checks pass.
+recovery from provider authentication rejection now requests a successor from
+Vision or selects another eligible account. Do not release this integration until
+the remaining client and deployment acceptance checks pass.
 
 Sign in with `cswap vision login`, open the printed approval URL in your browser,
 and compare the displayed code before approving. The CLI saves a registry-only
@@ -69,7 +70,13 @@ or stale observations never qualify a new account. If observations are unavailab
 the existing authorized login may continue; the client does not infer spare quota
 from a failed observation. If the current account is known exhausted and no eligible
 account has known headroom, the adapter returns an error before provider inference.
-Provider 401/429 response recovery and earned-reset integration remain unfinished.
+An explicit provider 401 can trigger one replay before any response is sent to
+native. Recovery accepts only a newer central generation with a different token.
+It respects the server's refresh scheduling and does not refresh subscription-only
+tokens. If the rejected login cannot recover, it is excluded for 60 seconds (or
+until a new discovered generation appears) and selection tries another account
+with known quota. A second 401 is returned without another replay. Transport
+failures and partial streams are not replayed by the adapter. Provider 429 recovery remains unfinished.
 
 The native macOS qualification uses Claude 2.1.270 with SHA-256
 `a506b6d970a4cf44f6abdb53a81ddcd5d3b0ce042a95c502fe9d1f946bdb8807`.
@@ -77,8 +84,9 @@ The native macOS qualification uses Claude 2.1.270 with SHA-256
 external network access and user-home reads and serves synthetic inference. The
 cases cover native resume, resume after history migration, token rotation between
 two turns of one live process, and quota-driven account switching between two turns
-of one live process. They check the bearer, conversation ID, retained message
-context, and absence of a local credential file. This does not establish
+of one live process. Another case rejects the first access token and verifies
+recovery without replacing the native process. They check the bearer, conversation
+ID, retained message context, and absence of a local credential file. This does not establish
 live-provider or Linux acceptance.
 
 `ManagedLoginHandoff` implements recoverable registration for dedicated profiles

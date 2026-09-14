@@ -32,7 +32,7 @@ TOKEN = "synthetic-vision-native-token"
     sys.platform != "darwin" or not os.environ.get("CLAUDE_NATIVE_TEST_BINARY"),
     reason="Requires explicit pinned native binary and macOS sandbox-exec",
 )
-@pytest.mark.parametrize("mode", ["resume", "migrate", "proxy", "pool"])
+@pytest.mark.parametrize("mode", ["resume", "migrate", "proxy", "pool", "recover"])
 def test_prepared_access_only_launch_reaches_native_inference(
     temp_home, monkeypatch, mode
 ):
@@ -63,7 +63,17 @@ def test_prepared_access_only_launch_reaches_native_inference(
                     "stream": body.get("stream"),
                 }
             )
-            if requests[-1]["path"] != "/v1/messages" or len(requests) > 2:
+            if mode == "recover" and len(requests) == 1:
+                registry.credential.return_value = {
+                    **registry.credential.return_value,
+                    "generation": 2,
+                    "accessToken": TOKEN + "-2",
+                }
+                self.send_response(401)
+                self.end_headers()
+                return
+            expected_count = 3 if mode == "recover" else 2
+            if requests[-1]["path"] != "/v1/messages" or len(requests) > expected_count:
                 self.send_error(403)
                 return
             self.send_response(200)
@@ -136,7 +146,7 @@ def test_prepared_access_only_launch_reaches_native_inference(
     port = server.server_address[1]
     proxy = None
     advance = None
-    if mode in {"proxy", "pool"}:
+    if mode in {"proxy", "pool", "recover"}:
         credentials = CentralCredential(registry, record)
         if mode == "pool":
             credentials, advance = _native_pool(manager, registry, record, monkeypatch)
@@ -199,7 +209,7 @@ def test_prepared_access_only_launch_reaches_native_inference(
         "claude-sonnet-4-6",
     ]
     try:
-        if mode in {"proxy", "pool"}:
+        if mode in {"proxy", "pool", "recover"}:
             result, session_id = _two_proxy_turns(
                 command, env, registry, temp_home, advance=advance
             )
@@ -265,25 +275,23 @@ def test_prepared_access_only_launch_reaches_native_inference(
         server.shutdown()
         server.server_close()
     assert result.returncode == 0, "Pinned native synthetic inference failed"
-    assert (
-        requests
-        == [
-            {
-                "path": "/v1/messages",
-                "correct_bearer": True,
-                "api_key": False,
-                "stream": True,
-            }
-        ]
-        * 2
-    )
+    assert requests == [
+        {
+            "path": "/v1/messages",
+            "correct_bearer": True,
+            "api_key": False,
+            "stream": True,
+        }
+    ] * (3 if mode == "recover" else 2)
     events = [
         json.loads(line) for line in result.stdout.splitlines() if line.startswith(b"{")
     ]
     assert any(
         event.get("type") == "result" and not event.get("is_error") for event in events
     )
-    assert message_counts[1] > message_counts[0]
+    assert message_counts[-1] > message_counts[0]
+    if mode == "recover":
+        assert message_counts[0] == message_counts[1]
     assert any(
         event.get("type") == "result" and event.get("session_id") == session_id
         for event in events

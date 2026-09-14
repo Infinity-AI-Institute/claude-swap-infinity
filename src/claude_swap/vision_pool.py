@@ -17,6 +17,7 @@ from claude_swap.settings import (
 from claude_swap.vision import VisionError
 from claude_swap.vision_proxy import CentralCredential
 from claude_swap.vision_registry import RegistryPool
+from claude_swap.vision_session import recover_rejected_credential
 from claude_swap.vision_usage import read_usage
 
 
@@ -45,7 +46,8 @@ class CentralPoolCredential:
         self.pool = RegistryPool(switcher, client, now=clock)
         self.current = record["visionLoginId"]
         self.last_switch = None
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
+        self.rejected = {}
 
     def _records(self):
         self.pool.sync()
@@ -66,8 +68,18 @@ class CentralPoolCredential:
                 raise ConfigError("The account roster needs repair.")
             if row.get("source") != "vision" or row.get("visionUrl") != self.client.url:
                 continue
+            login = row["visionLoginId"]
+            rejected = self.rejected.get(login)
+            if rejected is not None:
+                generation, retry_at = rejected
+                if (
+                    row.get("visionGeneration", 0) <= generation
+                    and self.clock() < retry_at
+                ):
+                    continue
+                del self.rejected[login]
             if not row.get("disabled", False):
-                records[row["visionLoginId"]] = row
+                records[login] = row
         return records
 
     def get(self, *, model=None):
@@ -161,3 +173,17 @@ class CentralPoolCredential:
                 self.current = selected
                 self.last_switch = now
             return credential
+
+    def recover(self, rejected, *, model=None):
+        with self.lock:
+            # Use the identity actually rejected by the provider, not whichever
+            # login another concurrent native request most recently selected.
+            candidate = recover_rejected_credential(self.client, rejected)
+            if candidate is not None:
+                return candidate
+            self.rejected[rejected["login_id"]] = (
+                rejected["generation"],
+                self.clock() + 60,
+            )
+            self.pool.sync(force=True)
+            return self.get(model=model)

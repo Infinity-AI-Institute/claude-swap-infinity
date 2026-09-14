@@ -19,7 +19,7 @@ import urllib.request
 
 from claude_swap.exceptions import ClaudeSwitchError, SessionError
 from claude_swap.vision import VisionError
-from claude_swap.vision_session import acquire_credential
+from claude_swap.vision_session import acquire_credential, recover_rejected_credential
 
 MAX_REQUEST_BYTES = 64 * 1024 * 1024
 UPSTREAM = "https://api.anthropic.com"
@@ -63,6 +63,10 @@ class CentralCredential:
                 )
             self.record["visionGeneration"] = credential["generation"]
             return credential
+
+    def recover(self, rejected, *, model=None):
+        with self.lock:
+            return recover_rejected_credential(self.client, rejected)
 
 
 class InferenceProxy:
@@ -189,19 +193,22 @@ class InferenceProxy:
                     if key.lower() in FORWARDED_HEADERS
                     or key.lower().startswith("x-stainless-")
                 }
-                headers["Authorization"] = "Bearer " + credential["accessToken"]
-                request = urllib.request.Request(
-                    proxy.upstream + self.path,
-                    data=body,
-                    headers=headers,
-                    method="POST",
-                )
                 response_started = False
                 try:
-                    try:
-                        response = proxy.opener.open(request, timeout=120)
-                    except urllib.error.HTTPError as error:
-                        response = error
+                    response = proxy.open_message(self.path, body, headers, credential)
+                    if response.status == 401:
+                        # An explicit authentication rejection precedes inference.
+                        # Close it before central recovery, and replay at most once.
+                        response.close()
+                        replacement = proxy.credentials.recover(credential, model=model)
+                        if replacement is None:
+                            self._error(
+                                401, "Central login reauthentication is required."
+                            )
+                            return
+                        response = proxy.open_message(
+                            self.path, body, headers, replacement
+                        )
                     with response:
                         status = response.status
                         if 300 <= status < 400:
@@ -223,6 +230,11 @@ class InferenceProxy:
                         while chunk := response.read1(65536):
                             self.wfile.write(chunk)
                             self.wfile.flush()
+                except VisionError as error:
+                    status = error.status if error.status in {401, 403, 429} else 503
+                    self._error(status, "Central credential recovery is unavailable.")
+                except ClaudeSwitchError:
+                    self._error(503, "No central login is available for recovery.")
                 except (urllib.error.URLError, TimeoutError):
                     # No retry here: only the native client decides whether to
                     # replay a request whose upstream execution is uncertain.
@@ -236,6 +248,16 @@ class InferenceProxy:
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         return self
+
+    def open_message(self, path, body, headers, credential):
+        headers = {**headers, "Authorization": "Bearer " + credential["accessToken"]}
+        request = urllib.request.Request(
+            self.upstream + path, data=body, headers=headers, method="POST"
+        )
+        try:
+            return self.opener.open(request, timeout=120)
+        except urllib.error.HTTPError as error:
+            return error
 
     def __exit__(self, *_args):
         if self.server is not None:

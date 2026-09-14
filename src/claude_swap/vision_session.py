@@ -65,6 +65,54 @@ def acquire_credential(client: VisionClient, record: dict, *, wait_seconds=90):
         time.sleep(min(1, max(0, deadline - time.monotonic())))
 
 
+def recover_rejected_credential(client, rejected, *, wait_seconds=90):
+    """Recover an explicit provider 401 using only the central refresh owner.
+
+    A successful credential endpoint response alone is insufficient: the server
+    can still be serving the rejected generation while its refresh job runs.
+    Only a later generation with a different access token permits a replay.
+    """
+    account = rejected["account_id"]
+    login = rejected["login_id"]
+    generation = rejected["generation"]
+
+    def successor():
+        try:
+            candidate = client.credential(account, login)
+        except VisionError as error:
+            if error.code == "credential_unavailable":
+                return None
+            raise
+        if (
+            candidate["email"] != rejected["email"]
+            or candidate["organization_id"] != rejected["organization_id"]
+        ):
+            raise VisionError("service_unavailable")
+        if (
+            candidate["generation"] > generation
+            and candidate["accessToken"] != rejected["accessToken"]
+        ):
+            return candidate
+        return None
+
+    candidate = successor()
+    if candidate is not None:
+        return candidate
+    if rejected.get("kind") != "login_oauth":
+        return None
+    receipt = client.refresh(account, login, generation)
+    if receipt["state"] in {"current", "reauth_required", "obsolete"}:
+        return None
+    deadline = time.monotonic() + wait_seconds
+    while True:
+        candidate = successor()
+        if candidate is not None:
+            return candidate
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(min(1, max(0, deadline - time.monotonic())))
+
+
 def session_directory(backup_dir, url, login_id):
     registry_id(login_id, "ail_")
     return (
