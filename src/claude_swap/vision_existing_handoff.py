@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import secrets
 import shutil
 import uuid
@@ -20,6 +21,7 @@ from claude_swap.claude_locks import claude_credentials_lock
 from claude_swap.credentials import SECURITY_SERVICE
 from claude_swap.exceptions import SessionError
 from claude_swap.locking import FileLock
+from claude_swap.paths import get_claude_config_home
 from claude_swap.session import scan_live_sessions
 from claude_swap.vision_handoff import _read_private, _sync_directory, _write_private
 from claude_swap.vision_inventory import CredentialSource, _decode, capture_inventory
@@ -196,6 +198,23 @@ class ExistingLoginHandoff:
             for source_id, profile in inventory.profile_sources.items()
             if source_id in source_ids
         }
+        secure_home = os.environ.get("CLAUDE_SECURESTORAGE_CONFIG_DIR")
+        if secure_home is not None:
+            secure_path = (
+                Path(secure_home).expanduser().absolute()
+                if secure_home
+                else Path.home() / ".claude"
+            )
+            if secure_path in profiles:
+                # Native credentials and process/session records can use different
+                # homes. The current environment proves this explicit association.
+                profiles.add(get_claude_config_home().expanduser().absolute())
+        isolated_root = self.switcher.backup_dir / "vision-sessions"
+        if any(profile.is_relative_to(isolated_root) for profile in profiles):
+            # Central launches preserve arbitrary caller config homes. Without
+            # a durable writer association, a secure-store source alone cannot
+            # prove which known native homes may still hold its credentials.
+            profiles.update(inventory.profiles)
         roster = self.switcher._get_sequence_data() or {}
         for number, record in roster.get("accounts", {}).items():
             if record.get("source") == "vision":

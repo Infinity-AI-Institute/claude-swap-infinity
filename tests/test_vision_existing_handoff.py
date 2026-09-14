@@ -609,3 +609,64 @@ def test_new_grant_copy_appearing_during_deletion_blocks_central_release(
     with pytest.raises(SessionError, match="Another refresh copy"):
         transaction.upload(source, confirmation)
     registry.confirm_registration.assert_not_called()
+
+
+def test_split_secure_storage_and_config_home_fences_native_writer(setup, monkeypatch):
+    transaction, registry, _, _, native, _, _ = setup
+    secure_home = native.parent.parent / "separate-secure-storage"
+    put(secure_home / ".credentials.json", material("split"))
+    monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", str(secure_home))
+    source = next(
+        item.source.id
+        for item in transaction._capture().copies
+        if item.source.location == str(secure_home / ".credentials.json")
+    )
+    preview = transaction.preview(source)
+    monkeypatch.setattr(
+        "claude_swap.vision_inventory.profile_is_quiescent",
+        lambda profile: profile != native.parent,
+    )
+    with pytest.raises(SessionError, match="selected login"):
+        transaction.upload(source, preview["confirmation"])
+    registry.prepare_registration.assert_not_called()
+
+
+def test_central_secure_store_without_writer_association_fences_all_known_homes(
+    setup, monkeypatch
+):
+    transaction, registry, _, _, native, _, _ = setup
+    secure_home = (
+        transaction.switcher.backup_dir / "vision-sessions" / "origin" / "login"
+    )
+    put(secure_home / ".credentials.json", material("isolated"))
+    source = next(
+        item.source.id
+        for item in transaction._capture().copies
+        if item.source.location == str(secure_home / ".credentials.json")
+    )
+    preview = transaction.preview(source)
+    monkeypatch.setattr(
+        "claude_swap.vision_inventory.profile_is_quiescent",
+        lambda profile: profile != native.parent,
+    )
+    with pytest.raises(SessionError, match="selected login"):
+        transaction.upload(source, preview["confirmation"])
+    registry.prepare_registration.assert_not_called()
+
+
+def test_explicit_empty_secure_home_fences_custom_native_config_writer(
+    setup, monkeypatch
+):
+    transaction, registry, source, _, native, _, _ = setup
+    config_home = native.parent.parent / "custom-native-config"
+    config_home.mkdir()
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_home))
+    monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", "")
+    preview = transaction.preview(source)
+    monkeypatch.setattr(
+        "claude_swap.vision_inventory.profile_is_quiescent",
+        lambda profile: profile != config_home,
+    )
+    with pytest.raises(SessionError, match="selected login"):
+        transaction.upload(source, preview["confirmation"])
+    registry.prepare_registration.assert_not_called()
