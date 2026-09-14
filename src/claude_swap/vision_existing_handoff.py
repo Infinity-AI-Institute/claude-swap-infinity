@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import secrets
 import shutil
 import uuid
@@ -21,7 +20,6 @@ from claude_swap.claude_locks import claude_credentials_lock
 from claude_swap.credentials import SECURITY_SERVICE
 from claude_swap.exceptions import SessionError
 from claude_swap.locking import FileLock
-from claude_swap.paths import get_claude_config_home
 from claude_swap.session import scan_live_sessions
 from claude_swap.vision_handoff import _read_private, _sync_directory, _write_private
 from claude_swap.vision_inventory import CredentialSource, _decode, capture_inventory
@@ -130,6 +128,10 @@ class ExistingLoginHandoff:
                     value["local_slots"],
                 )
                 if not required.issubset(set(map(Path, affected))):
+                    if (self.switcher._get_sequence_data() or {}) != value["roster"]:
+                        raise SessionError(
+                            "The account roster changed; reconcile the saved writer scope before recovery."
+                        )
                     raise ValueError()
             known_ids = {item.source.id for item in known.copies}
             native_files = {profile / ".credentials.json" for profile in known.profiles}
@@ -198,22 +200,12 @@ class ExistingLoginHandoff:
             for source_id, profile in inventory.profile_sources.items()
             if source_id in source_ids
         }
-        secure_home = os.environ.get("CLAUDE_SECURESTORAGE_CONFIG_DIR")
-        if secure_home is not None:
-            secure_path = (
-                Path(secure_home).expanduser().absolute()
-                if secure_home
-                else Path.home() / ".claude"
-            )
-            if secure_path in profiles:
-                # Native credentials and process/session records can use different
-                # homes. The current environment proves this explicit association.
-                profiles.add(get_claude_config_home().expanduser().absolute())
-        isolated_root = self.switcher.backup_dir / "vision-sessions"
-        if any(profile.is_relative_to(isolated_root) for profile in profiles):
-            # Central launches preserve arbitrary caller config homes. Without
-            # a durable writer association, a secure-store source alone cannot
-            # prove which known native homes may still hold its credentials.
+        if profiles:
+            # A native credential home may be an arbitrary secure-storage
+            # override for a process whose session records live elsewhere.
+            # The migration shell does not prove that process's environment.
+            # Without a durable/process-level association, fence every known
+            # native home. Only saved-backup-only grants permit narrower scope.
             profiles.update(inventory.profiles)
         roster = self.switcher._get_sequence_data() or {}
         for number, record in roster.get("accounts", {}).items():

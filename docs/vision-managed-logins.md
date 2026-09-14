@@ -75,15 +75,16 @@ to bypass handoff.
 
 ## Transfer a selected existing login
 
-Exit native sessions that can use the selected grant before transfer. This
-includes every known matching credential copy and its saved-slot session home;
-unrelated active profiles do not block the transfer. The selected writer scope
-is saved before any credential deletion and remains enforced during recovery.
-Older recovery journals lack that scope and conservatively require all known
-profiles to be idle. An explicit native config/secure-storage split fences both
-homes. A selected credential found in an earlier central secure store also
-requires all known profiles idle, because its original caller home is not
-recorded. Unreadable session records anywhere in inventory remain a blocker.
+A grant found only in saved backups fences its matching saved-slot session
+homes, including retained previous copies. Unrelated active native profiles do
+not block that case. If any matching copy is in a native credential store,
+all known native profiles must be idle: Claude can use an arbitrary separate
+secure-storage directory, and the migration shell cannot prove where a running
+process obtained its credentials.
+
+The writer scope is saved before credential deletion and remains enforced during
+recovery. Older recovery journals lack that scope and also require all known
+profiles idle. Unreadable session records anywhere in inventory remain a blocker.
 Use a `source_id` from the inventory:
 
 ```sh

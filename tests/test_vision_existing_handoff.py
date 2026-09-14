@@ -690,3 +690,29 @@ def test_previous_copy_fences_its_saved_slot_even_when_current_grant_differs(
     with pytest.raises(SessionError, match="selected login"):
         transaction.upload(source, preview["confirmation"])
     registry.prepare_registration.assert_not_called()
+
+
+def test_fresh_shell_extra_secure_profile_does_not_hide_other_native_writer(
+    setup, monkeypatch
+):
+    transaction, registry, _, _, native, _, _ = setup
+    # The live native process was started with config C and secure store S,
+    # but its parent environment is not inherited by this migration shell.
+    secure_home = native.parent.parent / "arbitrary-secure-store"
+    put(secure_home / ".credentials.json", material("separate-grant"))
+    transaction.extra_profiles = (str(secure_home),)
+    monkeypatch.delenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    source = next(
+        item.source.id
+        for item in transaction._capture().copies
+        if item.source.location == str(secure_home / ".credentials.json")
+    )
+    preview = transaction.preview(source)
+    monkeypatch.setattr(
+        "claude_swap.vision_inventory.profile_is_quiescent",
+        lambda profile: profile != native.parent,
+    )
+    with pytest.raises(SessionError, match="selected login"):
+        transaction.upload(source, preview["confirmation"])
+    registry.prepare_registration.assert_not_called()
