@@ -1,8 +1,10 @@
 # Vision account registry integration
 
-This branch can discover authorized Claude accounts and display their centrally
-observed usage. Explicit `cswap run ACCOUNT` also launches a remote account with
-an access-only credential. Managed provider login now uploads by default when
+With Vision configured, `cswap run` discovers enabled, use-authorized Claude
+accounts and launches native Claude using an existing central credential. It does
+not require an explicit account, local provider credential, or `/login`. An
+explicit `cswap run ACCOUNT` or directory mapping still selects that account.
+Without Vision configuration, the existing local default launch is unchanged. Managed provider login now uploads by default when
 Vision is configured. Existing-profile handoff is available through the migration
 commands in [vision-managed-logins.md](vision-managed-logins.md). Automatic
 recovery from provider authentication rejection now requests a successor from

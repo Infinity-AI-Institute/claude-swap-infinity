@@ -208,7 +208,9 @@ Examples:
                     "launching the default account."
                 )
             )
-        manager.exec_default(tail)
+        manager.exec_default(
+            tail, share=not args.no_share, share_history=args.share_history
+        )
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
         sys.exit(1)
