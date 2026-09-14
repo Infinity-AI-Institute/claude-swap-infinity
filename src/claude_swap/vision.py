@@ -11,6 +11,7 @@ import ipaddress
 import json
 import math
 import os
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -160,10 +161,23 @@ class VisionClient:
         """Nonsecret stable namespace; never use a local alias as provider identity."""
         return hashlib.sha256(self.url.encode()).hexdigest()
 
-    def request(self, method: str, path: str, body: Any = None) -> Any:
+    def request(
+        self,
+        method: str,
+        path: str,
+        body: Any = None,
+        *,
+        handoff_secret: str | None = None,
+    ) -> Any:
         if not path.startswith("/api/") or any(c in path for c in "#\r\n"):
             raise VisionError("invalid_request")
         headers = {"Accept": "application/json", "X-Api-Key": self.api_key}
+        if handoff_secret is not None:
+            if not isinstance(handoff_secret, str) or not re.fullmatch(
+                r"[A-Za-z0-9_-]{43}", handoff_secret
+            ):
+                raise VisionError("invalid_request")
+            headers["X-Vision-Handoff-Secret"] = handoff_secret
         payload = None
         if body is not None:
             payload = json.dumps(body, allow_nan=False).encode()
