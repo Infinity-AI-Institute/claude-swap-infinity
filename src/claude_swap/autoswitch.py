@@ -1877,226 +1877,8 @@ class AutoSwitchEngine:
             < was - RECOVERY_HYSTERESIS_S
         )
 
-    def _rank_candidates(
-        self,
-        *,
-        trigger: str,
-        consume_first: bool,
-        oauth_candidates: list[str],
-        no_return: str | None,
-        usage: dict[str, dict | str | None],
-        headroom: dict[str, float | None],
-        current: str,
-        active_headroom: float | None,
-        settings: AutoSwitchSettings,
-        now: float,
-        margins: dict[str, float | None] | None = None,
-        active_margin: float | None = None,
-    ) -> tuple[list[str], bool, float | None]:
-        """Filter and rank OAuth candidates for this tick's trigger.
-
-        Returns ``(ordered, any_known, active_reset_ts)``. Pure — no emits,
-        no state writes — so the consume-first two-phase commit can run it
-        twice per tick: on the stored snapshot to decide provisionally, then
-        on the escalated refetch to re-verify before switching.
-
-        ``margins``/``active_margin`` carry the per-window switch margins
-        (``oauth.switch_margin``) for every threshold comparison; omitted
-        (direct callers predating per-window walls), they derive from
-        ``headroom`` as the no-override identity.
-        """
-        if margins is None:
-            margins = _margins_from_headroom(headroom, settings.threshold)
-            active_margin = (
-                None
-                if active_headroom is None
-                else active_headroom - (100.0 - settings.threshold)
-            )
-        # consume-first ranks by soonest weekly reset; a proactive (below-
-        # threshold) target must reset strictly sooner than where we are.
-        active_reset_ts = (
-            _seven_day_reset_ts(usage.get(current), now) if consume_first else None
-        )
-        # When NOTHING is below the threshold — the active account and every
-        # candidate all in the 90s — "land somewhere healthy" has no answer,
-        # and holding out for one costs the user the session. Sitting still
-        # means burning the active account to 100% and taking a hard limit,
-        # with the peer that resets in 8 minutes never tried. So in that state
-        # the goal changes from "most headroom" to "soonest back": move to
-        # whichever account recovers first and keep working through its reset.
-        #
-        # Deliberately narrow. It engages only when every measured OAuth
-        # account is at/over the threshold, so a single healthy peer still
-        # wins the normal way, and RECOVERY_HYSTERESIS_S below replaces the
-        # percentage-point margin so two accounts in the 90s cannot ping-pong.
-        all_above = _every_account_above_threshold(
-            oauth_candidates, margins, active_margin
-        )
-        # "Is anything worth having?" — the most headroom any candidate with a
-        # READABLE row offers. Two exclusions and no others:
-        #
-        # Unknown headrooms are skipped rather than counted as zero. A row we
-        # cannot read is not evidence of an empty account — measured, one
-        # sentinel row (expired token, locked keychain) made `all(...)` False
-        # forever and parked the engine on the account resetting LAST.
-        #
-        # Nothing else is filtered, INCLUDING the no-return bar. An earlier
-        # version of this comment claimed it was "scoped to choosable
-        # candidates"; the code below has never done that and the two
-        # paragraphs contradicted each other. Leaving the barred account in is
-        # deliberate: this answers whether the FLEET has quota, and the bar is
-        # about which account to move to, not about what exists. A peer just
-        # above SPENT_HEADROOM_PCT can therefore turn the spent check off while
-        # being unchoosable itself — the band is (SPENT_HEADROOM_PCT, active x
-        # RATIO], up to 3 points wide at the defaults, and the one-way fallback
-        # below is what stops that band parking the engine. A ratio floor used
-        # to sit here too and inverted monotonicity; removing it is what let
-        # the fallback do the job.
-        best_candidate_headroom = max(
-            (h for h in map(headroom.get, oauth_candidates) if h is not None),
-            default=0.0,
-        )
-        active_recovery_ts = (
-            _binding_recovery_ts(usage.get(current), self._models, now)
-            if all_above
-            else 0.0  # unread unless all_above; never a live sentinel
-        )
-
-        qualifying: list[tuple[tuple, str]] = []
-        fallback: list[tuple[tuple, str]] = []
-        any_known = False
-        for num in oauth_candidates:
-            h = headroom.get(num)
-            if h is None:
-                continue
-            any_known = True          # it EXISTS and is readable either way
-            # Non-None whenever h is (same window set); the wall-relative
-            # score for every threshold comparison below.
-            m = margins.get(num)
-            if h <= 0:
-                continue  # itself at its hard limit — never a target
-            if num == no_return:
-                continue  # the account we just left; see _no_return_account
-            reset_ts = (
-                _seven_day_reset_ts(usage.get(num), now) if consume_first else None
-            )
-            recovery_ts = (
-                _binding_recovery_ts(usage.get(num), self._models, now)
-                if all_above
-                else 0.0
-            )
-            if trigger in ("proactive", "consume-first"):
-                # Landing must be healthy: an account at/past its own switch
-                # wall (margin <= 0) would re-trigger on the very next tick.
-                # At-limit and failover are escapes that skip this whole block
-                # — any account with real headroom beats a blocked or dead
-                # one.
-                if m <= 0 and not all_above:
-                    continue
-                if all_above:
-                    # Checked before the strategies, because with nothing below
-                    # the threshold the strategy question is moot: consume-first
-                    # exists to spend perishable WEEKLY quota, and every account
-                    # here is blocked on a window that returns in minutes. Both
-                    # strategies want the same thing — the account that can work
-                    # again first — so both take this gate and the matching key
-                    # below. (Ordering matters: `if consume_first` catching
-                    # first filtered on weekly ordering while the key sorted on
-                    # binding recovery, two different axes, and left
-                    # consume-first users with no anti-flap guard at all.)
-                    #
-                    # WHICH AXIS is decided per candidate, in one place — see
-                    # _recovery_is_useful for the four holes that came from
-                    # deciding it once, globally, from four scattered gates.
-                    # Set and read under the same `all_above and trigger`
-                    # condition, so it is always assigned before the key below.
-                    by_recovery = _recovery_is_useful(
-                        recovery_ts,
-                        active_recovery_ts,
-                        active_headroom or 0.0,
-                        best_candidate_headroom,
-                        now,
-                    )
-                    if by_recovery:
-                        # Hysteresis on the axis we actually rank by. It bounds
-                        # the flap RATE rather than making a reverse move
-                        # impossible: the target must come back meaningfully
-                        # sooner than where we are.
-                        if recovery_ts >= active_recovery_ts - RECOVERY_HYSTERESIS_S:
-                            continue
-                    else:
-                        # Headroom axis, with a RATIO margin. Also a rate bound,
-                        # not impossibility — headroom moves, so a target that
-                        # burns down to a quarter of what it beat can qualify
-                        # in reverse. That takes a 4x relative burn instead of
-                        # the one point a strictly-greater test would need.
-                        if h < (active_headroom or 0.0) * HORIZON_HEADROOM_RATIO:
-                            if (
-                                (active_headroom or 0.0) <= SPENT_HEADROOM_PCT
-                                and h >= (active_headroom or 0.0)
-                                and recovery_ts
-                                < active_recovery_ts - RECOVERY_HYSTERESIS_S
-                            ):
-                                fallback.append(((0, recovery_ts, -h), num))
-                            continue
-                elif consume_first:
-                    # Purely proactive on reset ordering: below the threshold,
-                    # only move to accounts whose weekly window resets sooner
-                    # than the active one (above the threshold we must move, so
-                    # any healthy account qualifies and the sort picks soonest).
-                    if trigger == "consume-first" and (
-                        reset_ts is None
-                        or active_reset_ts is None
-                        or reset_ts >= active_reset_ts
-                    ):
-                        continue
-                elif active_margin is not None:
-                    # best: the candidate must beat the active account by the
-                    # full hysteresis margin (a one-way move like 99%→89%
-                    # qualifies; near-line pairs can't flap back). Margin
-                    # difference, not headroom difference, so a candidate is
-                    # judged safely-below relative to its OWN walls — with no
-                    # overrides the two differences are identical.
-                    if m - active_margin < settings.hysteresis_pct:
-                        continue
-            if all_above and trigger in ("proactive", "consume-first"):
-                # Ranked on the axis its own gate decided, and TIERED so the two
-                # stay comparable: a candidate returning inside the horizon
-                # beats one that does not, whatever its headroom. Untiered, the
-                # two key shapes were compared elementwise — a raw headroom
-                # against an epoch timestamp — and headroom won on magnitude
-                # alone. Falling through to the weekly key instead split the
-                # filter and the sort across two axes, picking the candidate
-                # with LESS headroom whenever its weekly reset was sooner.
-                #
-                # Scoped to the SAME triggers as the gate above: at-limit and
-                # failover skip that gate deliberately, because there we are
-                # escaping a dead account rather than optimising a return time.
-                # `recovery_ts` in BOTH tiers. Tier 1 hard-coded 0.0 there,
-                # which threw away a fact already in hand: two peers with equal
-                # headroom past the horizon then tied, and the tie fell through
-                # to sequence order. Measured — active 4 pts/300h, two peers
-                # 8 pts each, one returning in 5h and one in 500h: base picks
-                # the 5h account whichever slot it occupies, this branch picked
-                # whichever came first in the list. Headroom still decides
-                # first within the tier; the reset only breaks its ties, where
-                # sooner is plainly better than lower slot number.
-                key: tuple = (
-                    (0, recovery_ts, -h) if by_recovery else (1, -h, recovery_ts)
-                )
-            elif consume_first:
-                # Soonest weekly reset first (unknown resets sort last), most
-                # headroom breaks ties, then sequence order.
-                key = (reset_ts if reset_ts is not None else float("inf"), -h)
-            else:
-                # best: widest margin to its nearest wall first — identical to
-                # most-headroom ordering when no per-window overrides exist.
-                key = (-m,)
-            qualifying.append((key, num))
-        # Ascending by the strategy's key; list order (sequence order) breaks ties.
-        qualifying = qualifying or fallback
-        qualifying.sort(key=lambda t: t[0])
-        return [num for _, num in qualifying], any_known, active_reset_ts
+    def _rank_candidates(self, **kwargs):
+        return rank_candidates(models=self._models, **kwargs)
 
     # -- adaptive usage scheduling ---------------------------------------------
 
@@ -2536,3 +2318,225 @@ class AutoSwitchEngine:
                     )
                 )
             self._wake.wait(delay)
+
+
+def rank_candidates(
+    *,
+    models,
+    trigger: str,
+    consume_first: bool,
+    oauth_candidates: list[str],
+    no_return: str | None,
+    usage: dict[str, dict | str | None],
+    headroom: dict[str, float | None],
+    current: str,
+    active_headroom: float | None,
+    settings: AutoSwitchSettings,
+    now: float,
+    margins: dict[str, float | None] | None = None,
+    active_margin: float | None = None,
+) -> tuple[list[str], bool, float | None]:
+    """Filter and rank OAuth candidates for this tick's trigger.
+
+    Returns ``(ordered, any_known, active_reset_ts)``. Pure — no emits,
+    no state writes — so the consume-first two-phase commit can run it
+    twice per tick: on the stored snapshot to decide provisionally, then
+    on the escalated refetch to re-verify before switching.
+
+    ``margins``/``active_margin`` carry the per-window switch margins
+    (``oauth.switch_margin``) for every threshold comparison; omitted
+    (direct callers predating per-window walls), they derive from
+    ``headroom`` as the no-override identity.
+    """
+    if margins is None:
+        margins = _margins_from_headroom(headroom, settings.threshold)
+        active_margin = (
+            None
+            if active_headroom is None
+            else active_headroom - (100.0 - settings.threshold)
+        )
+    # consume-first ranks by soonest weekly reset; a proactive (below-
+    # threshold) target must reset strictly sooner than where we are.
+    active_reset_ts = (
+        _seven_day_reset_ts(usage.get(current), now) if consume_first else None
+    )
+    # When NOTHING is below the threshold — the active account and every
+    # candidate all in the 90s — "land somewhere healthy" has no answer,
+    # and holding out for one costs the user the session. Sitting still
+    # means burning the active account to 100% and taking a hard limit,
+    # with the peer that resets in 8 minutes never tried. So in that state
+    # the goal changes from "most headroom" to "soonest back": move to
+    # whichever account recovers first and keep working through its reset.
+    #
+    # Deliberately narrow. It engages only when every measured OAuth
+    # account is at/over the threshold, so a single healthy peer still
+    # wins the normal way, and RECOVERY_HYSTERESIS_S below replaces the
+    # percentage-point margin so two accounts in the 90s cannot ping-pong.
+    all_above = _every_account_above_threshold(
+        oauth_candidates, margins, active_margin
+    )
+    # "Is anything worth having?" — the most headroom any candidate with a
+    # READABLE row offers. Two exclusions and no others:
+    #
+    # Unknown headrooms are skipped rather than counted as zero. A row we
+    # cannot read is not evidence of an empty account — measured, one
+    # sentinel row (expired token, locked keychain) made `all(...)` False
+    # forever and parked the engine on the account resetting LAST.
+    #
+    # Nothing else is filtered, INCLUDING the no-return bar. An earlier
+    # version of this comment claimed it was "scoped to choosable
+    # candidates"; the code below has never done that and the two
+    # paragraphs contradicted each other. Leaving the barred account in is
+    # deliberate: this answers whether the FLEET has quota, and the bar is
+    # about which account to move to, not about what exists. A peer just
+    # above SPENT_HEADROOM_PCT can therefore turn the spent check off while
+    # being unchoosable itself — the band is (SPENT_HEADROOM_PCT, active x
+    # RATIO], up to 3 points wide at the defaults, and the one-way fallback
+    # below is what stops that band parking the engine. A ratio floor used
+    # to sit here too and inverted monotonicity; removing it is what let
+    # the fallback do the job.
+    best_candidate_headroom = max(
+        (h for h in map(headroom.get, oauth_candidates) if h is not None),
+        default=0.0,
+    )
+    active_recovery_ts = (
+        _binding_recovery_ts(usage.get(current), models, now)
+        if all_above
+        else 0.0  # unread unless all_above; never a live sentinel
+    )
+
+    qualifying: list[tuple[tuple, str]] = []
+    fallback: list[tuple[tuple, str]] = []
+    any_known = False
+    for num in oauth_candidates:
+        h = headroom.get(num)
+        if h is None:
+            continue
+        any_known = True          # it EXISTS and is readable either way
+        # Non-None whenever h is (same window set); the wall-relative
+        # score for every threshold comparison below.
+        m = margins.get(num)
+        if h <= 0:
+            continue  # itself at its hard limit — never a target
+        if num == no_return:
+            continue  # the account we just left; see _no_return_account
+        reset_ts = (
+            _seven_day_reset_ts(usage.get(num), now) if consume_first else None
+        )
+        recovery_ts = (
+            _binding_recovery_ts(usage.get(num), models, now)
+            if all_above
+            else 0.0
+        )
+        if trigger in ("proactive", "consume-first"):
+            # Landing must be healthy: an account at/past its own switch
+            # wall (margin <= 0) would re-trigger on the very next tick.
+            # At-limit and failover are escapes that skip this whole block
+            # — any account with real headroom beats a blocked or dead
+            # one.
+            if m <= 0 and not all_above:
+                continue
+            if all_above:
+                # Checked before the strategies, because with nothing below
+                # the threshold the strategy question is moot: consume-first
+                # exists to spend perishable WEEKLY quota, and every account
+                # here is blocked on a window that returns in minutes. Both
+                # strategies want the same thing — the account that can work
+                # again first — so both take this gate and the matching key
+                # below. (Ordering matters: `if consume_first` catching
+                # first filtered on weekly ordering while the key sorted on
+                # binding recovery, two different axes, and left
+                # consume-first users with no anti-flap guard at all.)
+                #
+                # WHICH AXIS is decided per candidate, in one place — see
+                # _recovery_is_useful for the four holes that came from
+                # deciding it once, globally, from four scattered gates.
+                # Set and read under the same `all_above and trigger`
+                # condition, so it is always assigned before the key below.
+                by_recovery = _recovery_is_useful(
+                    recovery_ts,
+                    active_recovery_ts,
+                    active_headroom or 0.0,
+                    best_candidate_headroom,
+                    now,
+                )
+                if by_recovery:
+                    # Hysteresis on the axis we actually rank by. It bounds
+                    # the flap RATE rather than making a reverse move
+                    # impossible: the target must come back meaningfully
+                    # sooner than where we are.
+                    if recovery_ts >= active_recovery_ts - RECOVERY_HYSTERESIS_S:
+                        continue
+                else:
+                    # Headroom axis, with a RATIO margin. Also a rate bound,
+                    # not impossibility — headroom moves, so a target that
+                    # burns down to a quarter of what it beat can qualify
+                    # in reverse. That takes a 4x relative burn instead of
+                    # the one point a strictly-greater test would need.
+                    if h < (active_headroom or 0.0) * HORIZON_HEADROOM_RATIO:
+                        if (
+                            (active_headroom or 0.0) <= SPENT_HEADROOM_PCT
+                            and h >= (active_headroom or 0.0)
+                            and recovery_ts
+                            < active_recovery_ts - RECOVERY_HYSTERESIS_S
+                        ):
+                            fallback.append(((0, recovery_ts, -h), num))
+                        continue
+            elif consume_first:
+                # Purely proactive on reset ordering: below the threshold,
+                # only move to accounts whose weekly window resets sooner
+                # than the active one (above the threshold we must move, so
+                # any healthy account qualifies and the sort picks soonest).
+                if trigger == "consume-first" and (
+                    reset_ts is None
+                    or active_reset_ts is None
+                    or reset_ts >= active_reset_ts
+                ):
+                    continue
+            elif active_margin is not None:
+                # best: the candidate must beat the active account by the
+                # full hysteresis margin (a one-way move like 99%→89%
+                # qualifies; near-line pairs can't flap back). Margin
+                # difference, not headroom difference, so a candidate is
+                # judged safely-below relative to its OWN walls — with no
+                # overrides the two differences are identical.
+                if m - active_margin < settings.hysteresis_pct:
+                    continue
+        if all_above and trigger in ("proactive", "consume-first"):
+            # Ranked on the axis its own gate decided, and TIERED so the two
+            # stay comparable: a candidate returning inside the horizon
+            # beats one that does not, whatever its headroom. Untiered, the
+            # two key shapes were compared elementwise — a raw headroom
+            # against an epoch timestamp — and headroom won on magnitude
+            # alone. Falling through to the weekly key instead split the
+            # filter and the sort across two axes, picking the candidate
+            # with LESS headroom whenever its weekly reset was sooner.
+            #
+            # Scoped to the SAME triggers as the gate above: at-limit and
+            # failover skip that gate deliberately, because there we are
+            # escaping a dead account rather than optimising a return time.
+            # `recovery_ts` in BOTH tiers. Tier 1 hard-coded 0.0 there,
+            # which threw away a fact already in hand: two peers with equal
+            # headroom past the horizon then tied, and the tie fell through
+            # to sequence order. Measured — active 4 pts/300h, two peers
+            # 8 pts each, one returning in 5h and one in 500h: base picks
+            # the 5h account whichever slot it occupies, this branch picked
+            # whichever came first in the list. Headroom still decides
+            # first within the tier; the reset only breaks its ties, where
+            # sooner is plainly better than lower slot number.
+            key: tuple = (
+                (0, recovery_ts, -h) if by_recovery else (1, -h, recovery_ts)
+            )
+        elif consume_first:
+            # Soonest weekly reset first (unknown resets sort last), most
+            # headroom breaks ties, then sequence order.
+            key = (reset_ts if reset_ts is not None else float("inf"), -h)
+        else:
+            # best: widest margin to its nearest wall first — identical to
+            # most-headroom ordering when no per-window overrides exist.
+            key = (-m,)
+        qualifying.append((key, num))
+    # Ascending by the strategy's key; list order (sequence order) breaks ties.
+    qualifying = qualifying or fallback
+    qualifying.sort(key=lambda t: t[0])
+    return [num for _, num in qualifying], any_known, active_reset_ts

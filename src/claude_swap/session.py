@@ -542,7 +542,9 @@ class SessionManager:
                 f"{accent('Launching')} Account-{account_num} ({email}) "
                 f"{muted('[Vision]')}"
             )
-            run_native(claude_bin, claude_args, launch, client, remote)
+            run_native(
+                claude_bin, claude_args, launch, client, remote, switcher=self.switcher
+            )
             raise AssertionError("unreachable")
 
         # Guard before the same-account direct-launch fast path below (which

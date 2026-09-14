@@ -3,9 +3,10 @@
 This branch can discover authorized Claude accounts and display their centrally
 observed usage. Explicit `cswap run ACCOUNT` also launches a remote account with
 an access-only credential. Managed provider login now uploads by default when
-Vision is configured. Existing-profile handoff and automatic recovery during a
-running session remain in progress. Do not release this integration until the
-remaining client and deployment acceptance checks pass.
+Vision is configured. Existing-profile handoff is available through the migration
+commands in [vision-managed-logins.md](vision-managed-logins.md). Automatic
+recovery after provider authentication errors remains in progress. Do not release
+this integration until the remaining client and deployment acceptance checks pass.
 
 Sign in with `cswap vision login`, open the printed approval URL in your browser,
 and compare the displayed code before approving. The CLI saves a registry-only
@@ -40,24 +41,45 @@ stack. Run `.venv/bin/pytest -q -n 4` for the regression suite. Registry tests l
 in `tests/test_vision.py`, `tests/test_vision_registry.py`, and
 `tests/test_vision_usage.py`.
 
-Remote launch uses `CLAUDE_CODE_OAUTH_TOKEN`; it never writes a refresh token or
-copies the local account backup. An unavailable credential requests recovery from
-Vision with the observed generation and waits up to 90 seconds. Revoked access
+Remote launch runs a loopback inference adapter beside the native process. Native
+receives a random process capability through `CLAUDE_CODE_OAUTH_TOKEN` and sends
+message requests to the adapter. The adapter gets authorized access credentials
+from Vision for each request and attaches them to the fixed Anthropic endpoint.
+It rejects redirects and forwards only message and token-count routes. It never
+writes a refresh token or copies the local account backup. An unavailable
+credential requests recovery from Vision with the observed generation and waits
+up to 90 seconds. Revoked access
 fails without requesting refresh. The native profile lives under
 `vision-sessions/<registry-hash>/<login-id>` in the backup directory, preserving
 conversation history across alias changes and credential generations. Native
 arguments, including `--resume`, pass through unchanged. A local credential file
 in that profile is preserved and blocks launch until ownership handoff is resolved.
 
-The current launcher fetches credentials before starting Claude. It does not yet
-replace the token in an already-running native process. The native macOS
-qualification uses Claude 2.1.270 with SHA-256
+Request-time selection reads the complete central usage snapshot and chooses among
+enabled, authorized remote logins. It uses the existing threshold, per-window
+threshold, hysteresis, cooldown and consume-first ranking settings. The model in
+each native request adds its weekly limit to the decision; an unknown model name
+includes all reported model windows. Hard exhaustion or removed membership can
+bypass proactive cooldown. Selection stays private to this process and does not
+change the global active account or the native conversation directory.
+
+Each request reads local disable preferences and obtains a central credential,
+including when membership is still within its 30-second discovery cache. Unknown
+or stale observations never qualify a new account. If observations are unavailable,
+the existing authorized login may continue; the client does not infer spare quota
+from a failed observation. If the current account is known exhausted and no eligible
+account has known headroom, the adapter returns an error before provider inference.
+Provider 401/429 response recovery and earned-reset integration remain unfinished.
+
+The native macOS qualification uses Claude 2.1.270 with SHA-256
 `a506b6d970a4cf44f6abdb53a81ddcd5d3b0ce042a95c502fe9d1f946bdb8807`.
 `tests/test_vision_native.py` opts in via `CLAUDE_NATIVE_TEST_BINARY`: it blocks
-external network access and user-home reads, serves synthetic inference, then
-resumes the same native conversation with a second synthetic access token. It
-checks the bearer, conversation ID, retained message context, and absence of a
-local credential file. This does not establish live-provider or Linux acceptance.
+external network access and user-home reads and serves synthetic inference. The
+cases cover native resume, resume after history migration, token rotation between
+two turns of one live process, and quota-driven account switching between two turns
+of one live process. They check the bearer, conversation ID, retained message
+context, and absence of a local credential file. This does not establish
+live-provider or Linux acceptance.
 
 `ManagedLoginHandoff` implements recoverable registration for dedicated profiles
 under `vision-logins/<profile-id>`. Its caller must keep the profile lease across
@@ -150,5 +172,6 @@ and API key. Changed credentials or a changed key require a new preview. Apply
 checks each profile again under its handoff lease; one unavailable profile does
 not abandon the remaining selection. Each successful item uses the same durable
 registration recovery as a single upload. Profiles not selected are untouched.
-This command currently selects dedicated managed profiles; inventory and handoff
-of existing default/external profiles remains separate required work.
+This command selects dedicated managed profiles. For inventory and handoff of
+existing default/external profiles, use the migration commands documented in
+[vision-managed-logins.md](vision-managed-logins.md).

@@ -17,7 +17,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from claude_swap.exceptions import SessionError
+from claude_swap.exceptions import ClaudeSwitchError, SessionError
 from claude_swap.vision import VisionError
 from claude_swap.vision_session import acquire_credential
 
@@ -51,7 +51,7 @@ class CentralCredential:
         self.record = dict(record)
         self.lock = threading.Lock()
 
-    def get(self):
+    def get(self, *, model=None):
         with self.lock:
             credential = acquire_credential(self.client, self.record)
             if (
@@ -159,7 +159,17 @@ class InferenceProxy:
                     self._error(400, "The native request body is incomplete.")
                     return
                 try:
-                    credential = proxy.credentials.get()
+                    payload = json.loads(body)
+                    if not isinstance(payload, dict):
+                        raise TypeError()
+                    model = payload.get("model")
+                    if model is not None and not isinstance(model, str):
+                        raise TypeError()
+                except (ValueError, TypeError, UnicodeDecodeError):
+                    self._error(400, "A native JSON message object is required.")
+                    return
+                try:
+                    credential = proxy.credentials.get(model=model)
                 except VisionError as error:
                     status = error.status if error.status in {401, 403, 429} else 503
                     self._error(
@@ -167,10 +177,10 @@ class InferenceProxy:
                         "Central credentials are unavailable; " + error.code + ".",
                     )
                     return
-                except SessionError:
+                except ClaudeSwitchError:
                     self._error(
                         503,
-                        "The central login needs recovery before inference can continue.",
+                        "Central account configuration or recovery needs attention.",
                     )
                     return
                 headers = {
@@ -241,9 +251,15 @@ class InferenceProxy:
         return env
 
 
-def run_native(native, arguments, launch, client, record):
+def run_native(native, arguments, launch, client, record, *, switcher=None):
     """Keep the adapter alive while native owns terminal input and output."""
-    with InferenceProxy(CentralCredential(client, record)) as proxy:
+    if switcher is None:
+        credentials = CentralCredential(client, record)
+    else:
+        from claude_swap.vision_pool import CentralPoolCredential
+
+        credentials = CentralPoolCredential(switcher, client, record)
+    with InferenceProxy(credentials) as proxy:
         child = subprocess.Popen(
             [native, *arguments], env=proxy.environment(launch.env)
         )

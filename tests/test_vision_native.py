@@ -17,8 +17,10 @@ import pytest
 
 from claude_swap.session import SessionManager
 from claude_swap.switcher import ClaudeAccountSwitcher
+from claude_swap.usage_store import UsageEntry
 from claude_swap.vision import VisionClient
 from claude_swap.vision_history import copy_history, install_history
+from claude_swap.vision_pool import CentralPoolCredential
 from claude_swap.vision_proxy import CentralCredential, InferenceProxy
 from claude_swap.vision_session import prepare_launch, session_directory
 
@@ -30,7 +32,7 @@ TOKEN = "synthetic-vision-native-token"
     sys.platform != "darwin" or not os.environ.get("CLAUDE_NATIVE_TEST_BINARY"),
     reason="Requires explicit pinned native binary and macOS sandbox-exec",
 )
-@pytest.mark.parametrize("mode", ["resume", "migrate", "proxy"])
+@pytest.mark.parametrize("mode", ["resume", "migrate", "proxy", "pool"])
 def test_prepared_access_only_launch_reaches_native_inference(
     temp_home, monkeypatch, mode
 ):
@@ -133,10 +135,12 @@ def test_prepared_access_only_launch_reaches_native_inference(
     threading.Thread(target=server.serve_forever, daemon=True).start()
     port = server.server_address[1]
     proxy = None
-    if mode == "proxy":
-        proxy = InferenceProxy(
-            CentralCredential(registry, record), upstream=f"http://127.0.0.1:{port}"
-        )
+    advance = None
+    if mode in {"proxy", "pool"}:
+        credentials = CentralCredential(registry, record)
+        if mode == "pool":
+            credentials, advance = _native_pool(manager, registry, record, monkeypatch)
+        proxy = InferenceProxy(credentials, upstream=f"http://127.0.0.1:{port}")
         proxy.__enter__()
         port = proxy.server.server_port
     # Only the synthetic endpoint is reachable. Helpers, Keychain access, and
@@ -195,8 +199,10 @@ def test_prepared_access_only_launch_reaches_native_inference(
         "claude-sonnet-4-6",
     ]
     try:
-        if mode == "proxy":
-            result, session_id = _two_proxy_turns(command, env, registry, temp_home)
+        if mode in {"proxy", "pool"}:
+            result, session_id = _two_proxy_turns(
+                command, env, registry, temp_home, advance=advance
+            )
         else:
             result = subprocess.run(
                 command,
@@ -285,7 +291,7 @@ def test_prepared_access_only_launch_reaches_native_inference(
     assert not (launch.directory / ".credentials.json").exists()
 
 
-def _two_proxy_turns(command, env, registry, cwd):
+def _two_proxy_turns(command, env, registry, cwd, *, advance=None):
     """Keep one pinned native process alive while its upstream token changes."""
     argv = [arg for arg in command if arg != "Reply with OK."]
     argv += ["--input-format", "stream-json"]
@@ -315,7 +321,9 @@ def _two_proxy_turns(command, env, registry, cwd):
                 assert child.poll() is None, (
                     "Native process exited before the next turn"
                 )
-                if turn:
+                if turn and advance is not None:
+                    advance()
+                elif turn:
                     registry.credential.return_value = {
                         **registry.credential.return_value,
                         "accessToken": TOKEN + "-2",
@@ -353,3 +361,45 @@ def _two_proxy_turns(command, env, registry, cwd):
                 child.kill()
                 child.wait(timeout=5)
             reader.join(timeout=5)
+
+
+def _native_pool(manager, registry, record, monkeypatch):
+    """The second native turn must move accounts because the first is spent."""
+    first = dict(registry.credential.return_value)
+    second = {
+        **first,
+        "account_id": "aia_00000000-0000-4000-8000-000000000002",
+        "login_id": "ail_00000000-0000-4000-8000-000000000002",
+        "email": "second@example.invalid",
+        "accessToken": TOKEN + "-2",
+    }
+    tokens = {row["login_id"]: row for row in (first, second)}
+    registry.discover = Mock(
+        return_value=[
+            {
+                "account_id": row["account_id"],
+                "login_id": row["login_id"],
+                "email": row["email"],
+                "organization_id": row["organization_id"],
+                "subscription": {},
+                "login_generation": 1,
+            }
+            for row in tokens.values()
+        ]
+    )
+    registry.credential.side_effect = lambda _account, login: tokens[login]
+    observations = {
+        row["login_id"]: (
+            row["account_id"],
+            UsageEntry(last_good={"five_hour": {"pct": 10}}, age_s=0),
+        )
+        for row in tokens.values()
+    }
+    monkeypatch.setattr(
+        "claude_swap.vision_pool.read_usage", lambda *_args, **_kwargs: observations
+    )
+
+    def exhaust_first():
+        observations[first["login_id"]][1].last_good["five_hour"]["pct"] = 100
+
+    return CentralPoolCredential(manager.switcher, registry, record), exhaust_first

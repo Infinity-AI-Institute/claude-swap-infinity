@@ -168,3 +168,27 @@ def test_native_runner_preserves_arguments_exit_status_and_hides_provider_token(
     assert env["CLAUDE_CONFIG_DIR"] == "/synthetic/profile"
     assert env["ANTHROPIC_BASE_URL"].startswith("http://127.0.0.1:")
     child.terminate.assert_not_called()
+
+
+def test_native_model_is_passed_to_central_selection(upstream):
+    url, _ = upstream
+    credentials = Mock()
+    credentials.get.return_value = {"accessToken": "synthetic"}
+    with (
+        InferenceProxy(credentials, upstream=url) as proxy,
+        request(proxy, body=b'{"model":"claude-sonnet-4-6"}') as response,
+    ):
+        response.read()
+    credentials.get.assert_called_once_with(model="claude-sonnet-4-6")
+
+
+@pytest.mark.parametrize("body", [b"null", b"[]", b'{"model":42}', b"not-json"])
+def test_invalid_message_does_not_acquire_credentials(upstream, body):
+    url, seen = upstream
+    credentials = Mock()
+    with InferenceProxy(credentials, upstream=url) as proxy:
+        with pytest.raises(urllib.error.HTTPError) as error:
+            request(proxy, body=body)
+        assert error.value.code == 400
+    credentials.get.assert_not_called()
+    assert seen == []
