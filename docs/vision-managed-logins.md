@@ -1,8 +1,22 @@
-# Managed Claude logins (development branch)
+# Managed Claude logins
 
-The Vision client commands below are implemented on this branch. They are not
-released yet; unattended session recovery and full rollout acceptance
-still need implementation and testing.
+Native launch, credential recovery, and conversation resume are implemented.
+Production compatibility and rollout acceptance require their own live evidence.
+
+## Use an existing Vision account
+
+With `VISION_API_KEY` configured and an authorized, qualified Claude login in
+Vision, the wrapper discovers the pool automatically:
+
+```sh
+cswap run
+cswap run -- --resume CONVERSATION_ID
+```
+
+These clients need no provider login or copied provider home. To register a new
+provider login deliberately, use `cswap vision account-login work`, then
+`cswap run work` after registration and use authorization complete. Existing
+native credentials can instead use the selected-login transfer below.
 
 ## Keep a managed login local
 
@@ -102,6 +116,22 @@ removing them. It waits for local refresh operations, takes native refresh locks
 and refuses to confirm central ownership while a known native session is active
 or a credential source changes. It does not stop native sessions automatically.
 Unselected refresh grants remain local.
+
+For an explicitly approved import while native sessions keep running, add
+`--allow-live-handoff` to preview, apply, and every recovery/cancellation command.
+The preview binds this choice; a strict preview cannot be reused for live import.
+The live confirmation tells Vision that refreshers are **not** stopped and records
+acknowledgement of the refresh race. Strict behavior remains the default.
+
+Live import retains locks, source snapshots, per-copy change checks, duplicate
+copy checks and durable recovery. It rejects unreadable session records. It retires
+known matching stored credentials, but cannot erase credentials cached by running
+native processes or atomically fence a writer that ignores those locks. A process
+may later refresh or rewrite the grant, invalidating central authority. This mode
+does not establish exclusive refresh ownership. No sessions are stopped or copied.
+If a credential changes during transfer, reconcile/cancel the original request;
+never silently retry an old generation. A server without live acknowledgement
+support rejects the request; the client does not retry by claiming stopped writers.
 
 After commit, slots whose current backup held the selected grant become one
 central account using provider-verified identity. Their aliases continue to resolve

@@ -36,8 +36,13 @@ def _fingerprint(inventory):
 
 
 class ExistingLoginHandoff:
-    def __init__(self, switcher, registry, request_id, extra_profiles=()):
+    def __init__(
+        self, switcher, registry, request_id, extra_profiles=(), *, allow_live_handoff=False
+    ):
         registration_proof(request_id, "a" * 43)
+        if type(allow_live_handoff) is not bool:
+            raise SessionError("Live handoff acknowledgement must be explicit.")
+        self.allow_live_handoff = allow_live_handoff
         self.switcher = switcher
         self.registry = registry
         self.request_id = request_id
@@ -47,8 +52,14 @@ class ExistingLoginHandoff:
         self.history_path = self.root / (request_id + ".history")
 
     @classmethod
-    def new(cls, switcher, registry, extra_profiles=()):
-        return cls(switcher, registry, str(uuid.uuid4()), extra_profiles)
+    def new(cls, switcher, registry, extra_profiles=(), *, allow_live_handoff=False):
+        return cls(
+            switcher,
+            registry,
+            str(uuid.uuid4()),
+            extra_profiles,
+            allow_live_handoff=allow_live_handoff,
+        )
 
     def _capture(self):
         return capture_inventory(self.switcher, self.extra_profiles)
@@ -79,10 +90,18 @@ class ExistingLoginHandoff:
                 "history_sources",
                 "history_snapshotted",
             }
-            if type(value["version"]) is not int or value["version"] not in {1, 2}:
+            if type(value["version"]) is not int or value["version"] not in {1, 2, 3}:
                 raise ValueError()
-            if value["version"] == 2:
+            if value["version"] >= 2:
                 fields.add("affected_profiles")
+            if value["version"] == 3:
+                fields.add("allow_live_handoff")
+                if value["allow_live_handoff"] is not True:
+                    raise ValueError()
+            if value.get("allow_live_handoff", False) != self.allow_live_handoff:
+                raise SessionError(
+                    "Repeat the original --allow-live-handoff choice when recovering this transfer."
+                )
             if set(value) != fields:
                 raise ValueError()
             registration_proof(value["request_id"], value["proof"])
@@ -108,7 +127,7 @@ class ExistingLoginHandoff:
             if type(value["history_snapshotted"]) is not bool:
                 raise ValueError()
             known = self._capture()
-            if value["version"] == 2:
+            if value["version"] >= 2:
                 affected = value["affected_profiles"]
                 known_profiles = set(known.profiles) | {
                     self.switcher._session_dir(number, record["email"])
@@ -265,9 +284,13 @@ class ExistingLoginHandoff:
             return set(inventory.profiles)
         return set(map(Path, journal["affected_profiles"]))
 
-    @staticmethod
-    def _require_quiescent(inventory, affected_profiles):
-        if set(inventory.live_profiles) & affected_profiles:
+    def _require_writer_policy(self, inventory, affected_profiles):
+        # Explicit live import acknowledges cached native refresh authority.
+        # It bypasses session liveness only, never unreadable records or CAS.
+        if (
+            not self.allow_live_handoff
+            and set(inventory.live_profiles) & affected_profiles
+        ):
             raise SessionError(
                 "Exit native sessions using the selected login before transferring it."
             )
@@ -279,7 +302,7 @@ class ExistingLoginHandoff:
                 raise SessionError(
                     "A native session record is unreadable; repair it before transferring a login."
                 )
-            if profile in affected_profiles and sessions:
+            if not self.allow_live_handoff and profile in affected_profiles and sessions:
                 raise SessionError(
                     "Exit native sessions using the selected login before transferring it."
                 )
@@ -311,7 +334,7 @@ class ExistingLoginHandoff:
                 if profile.is_dir():
                     locks.enter_context(claude_credentials_lock(config_home=profile))
             current = self._capture()
-            self._require_quiescent(current, affected)
+            self._require_writer_policy(current, affected)
             if (
                 _fingerprint(initial) != _fingerprint(current)
                 or initial.profiles != current.profiles
@@ -476,6 +499,7 @@ class ExistingLoginHandoff:
                     hashlib.sha256(self.registry.client.api_key.encode()).hexdigest(),
                     source_id,
                     _fingerprint(inventory),
+                    self.allow_live_handoff,
                 ]
             ).encode()
         ).hexdigest()
@@ -483,6 +507,12 @@ class ExistingLoginHandoff:
         return {
             "request_id": self.request_id,
             "confirmation": binding,
+            "allow_live_handoff": self.allow_live_handoff,
+            "live_refresh_risk": (
+                "Running native sessions may retain and later refresh this grant."
+                if self.allow_live_handoff
+                else None
+            ),
             "selected": next(
                 row for row in public["candidates"] if row["source_id"] == source_id
             ),
@@ -541,7 +571,7 @@ class ExistingLoginHandoff:
                 "The account roster changed; reconcile slot ownership before restoring credentials."
             )
         current = self._capture()
-        self._require_quiescent(current, self._journal_profiles(journal, current))
+        self._require_writer_policy(current, self._journal_profiles(journal, current))
         current_copies = [
             (item, CredentialSource(**item["source"]).read())
             for item in journal["copies"]
@@ -592,7 +622,7 @@ class ExistingLoginHandoff:
                     inventory, selected.credential["refreshToken"]
                 )
                 journal = {
-                    "version": 2,
+                    "version": 3 if self.allow_live_handoff else 2,
                     "affected_profiles": sorted(map(str, affected)),
                     "request_id": self.request_id,
                     "proof": secrets.token_urlsafe(32),
@@ -612,6 +642,8 @@ class ExistingLoginHandoff:
                     "history_sources": [],
                     "history_snapshotted": False,
                 }
+                if self.allow_live_handoff:
+                    journal["allow_live_handoff"] = True
                 self._save(journal)
                 journal = self._read()
             elif journal["receipt"] is not None and journal["receipt"]["state"] in {
@@ -643,7 +675,7 @@ class ExistingLoginHandoff:
                             "The account roster changed during migration; reconcile this transfer."
                         )
                     current = self._capture()
-                    self._require_quiescent(
+                    self._require_writer_policy(
                         current, self._journal_profiles(journal, current)
                     )
                     if current.profiles != inventory.profiles:
@@ -659,7 +691,15 @@ class ExistingLoginHandoff:
                                 "A selected login changed during registration; cancel this transfer."
                             )
                     for item in journal["copies"]:
-                        self._delete(CredentialSource(**item["source"]))
+                        source = CredentialSource(**item["source"])
+                        # Recheck each backend: a native writer can change a
+                        # later copy while an earlier copy is being retired.
+                        current_raw = source.read()
+                        if current_raw is not None and current_raw != item["raw"]:
+                            raise SessionError(
+                                "A selected login changed during retirement; cancel this transfer."
+                            )
+                        self._delete(source)
                     if any(
                         CredentialSource(**item["source"]).read() is not None
                         for item in journal["copies"]
@@ -673,11 +713,16 @@ class ExistingLoginHandoff:
                             "Known native profiles changed during migration; repeat inventory."
                         )
                     self._require_known_copies(journal, after_delete)
-                    self._require_quiescent(
+                    self._require_writer_policy(
                         after_delete, self._journal_profiles(journal, after_delete)
                     )
+                confirmation_options = {
+                    "local_refreshers_stopped": not self.allow_live_handoff
+                }
+                if self.allow_live_handoff:
+                    confirmation_options["live_refresh_risk_acknowledged"] = True
                 journal["receipt"] = self.registry.confirm_registration(
-                    self.request_id, proof, local_refreshers_stopped=True
+                    self.request_id, proof, **confirmation_options
                 )
                 self._save(journal)
             self._finish(journal)
