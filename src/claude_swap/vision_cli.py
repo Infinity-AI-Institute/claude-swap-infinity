@@ -16,7 +16,7 @@ from claude_swap.exceptions import ClaudeSwitchError, SessionError
 from claude_swap.locking import FileLock
 from claude_swap.models import normalize_alias
 from claude_swap.session import AUTH_OVERRIDE_ENV_VARS, _mkdir_private
-from claude_swap.vision import VisionError, configured_client
+from claude_swap.vision import VisionError, configured_client, origin
 from claude_swap.vision_handoff import (
     ManagedLoginHandoff,
     _credential,
@@ -37,7 +37,13 @@ class ManagedProfiles:
     def read(self):
         raw = _read_private(self.path)
         if raw is None:
-            return {"version": 1, "auto_register": True, "profiles": {}, "bindings": {}}
+            return {
+                "version": 2,
+                "auto_register": True,
+                "auto_register_by_origin": {},
+                "profiles": {},
+                "bindings": {},
+            }
         try:
             value = json.loads(raw)
             if (
@@ -46,13 +52,28 @@ class ManagedProfiles:
                 not in (
                     {"version", "auto_register", "profiles"},
                     {"version", "auto_register", "profiles", "bindings"},
+                    {
+                        "version", "auto_register", "auto_register_by_origin",
+                        "profiles", "bindings",
+                    },
                 )
                 or type(value["version"]) is not int
-                or value["version"] != 1
+                or value["version"] not in (1, 2)
                 or type(value["auto_register"]) is not bool
                 or not isinstance(value["profiles"], dict)
             ):
                 raise ValueError()
+            if (value["version"] == 2) != ("auto_register_by_origin" in value):
+                raise ValueError()
+            overrides = value.setdefault("auto_register_by_origin", {})
+            if not isinstance(overrides, dict) or len(overrides) > 1000:
+                raise ValueError()
+            for destination, enabled in overrides.items():
+                if origin(destination) != destination or type(enabled) is not bool:
+                    raise ValueError()
+            # Keep the legacy global choice as the fallback. In particular,
+            # upgrading an opt-out must never enable uploads to a new origin.
+            value["version"] = 2
             value.setdefault("bindings", {})
             if not isinstance(value["bindings"], dict):
                 raise TypeError()
@@ -67,7 +88,7 @@ class ManagedProfiles:
                 if normalize_alias(name) != name or str(uuid.UUID(profile)) != profile:
                     raise ValueError()
             return value
-        except (ValueError, TypeError, AttributeError):
+        except (ValueError, TypeError, AttributeError, VisionError):
             raise SessionError(
                 "Vision profile preferences need repair; refusing to reset your upload preference."
             ) from None
@@ -89,14 +110,36 @@ class ManagedProfiles:
                 _write_private(self.path, json.dumps(state))
         return profile
 
-    def set_auto_register(self, enabled):
+    def auto_register(self, destination):
+        state = self.read()
+        return state["auto_register_by_origin"].get(
+            origin(destination), state["auto_register"]
+        )
+
+    def set_auto_register(self, enabled, destination):
+        if type(enabled) is not bool:
+            raise SessionError("The upload preference must be enabled or disabled.")
+        destination = origin(destination)
         _mkdir_private(self.root)
         with FileLock(self.root / ".vision-profiles.lock"):
             state = self.read()
-            state["auto_register"] = enabled
+            state["auto_register_by_origin"][destination] = enabled
             _write_private(self.path, json.dumps(state))
-            if self.read()["auto_register"] is not enabled:
+            if self.auto_register(destination) is not enabled:
                 raise SessionError("The upload preference was not saved.")
+
+
+def disclose_registration(profiles, destination, *, configured=True):
+    destination = origin(destination)
+    enabled = profiles.auto_register(destination)
+    status = "enabled" if enabled else "disabled"
+    context = "" if configured else "Vision is not configured; this login stays local. "
+    print(
+        context + f"Automatic credential registration is {status} for {destination}. "
+        f"To disable it: cswap vision --url {destination} auto-register off",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def name_committed_login(switcher, client, name, receipt):
@@ -203,13 +246,9 @@ def run_profile(switcher, name, native_args):
         result = subprocess.run(
             [native, *native_args], env=_profile_environment(lease.profile), check=False
         )
-        if (
-            result.returncode == 0
-            and profiles.read()["auto_register"]
-            and lease._stores() != before
-        ):
+        if result.returncode == 0 and lease._stores() != before:
             client = configured_client()
-            if client is not None:
+            if client is not None and profiles.auto_register(client.url):
                 lease.registry = RegistrationClient(client)
                 receipt = lease.upload()
                 name_committed_login(switcher, client, name, receipt)
@@ -224,6 +263,10 @@ def login_profile(switcher, name):
     native = shutil.which("claude")
     if native is None:
         raise SessionError("Install Claude Code before starting a provider login.")
+    destination = client.url if client is not None else os.environ.get(
+        "VISION_API_URL", "https://vision.infinity.inc"
+    )
+    disclose_registration(profiles, destination, configured=client is not None)
     with ManagedLoginHandoff(switcher.backup_dir, profile_id, registry) as lease:
         lease.prepare_login()
         before = lease._stores()
@@ -236,7 +279,7 @@ def login_profile(switcher, name):
             return {"state": "unchanged", "profile": name}
         # Re-read the persisted preference after login, so another terminal's
         # explicit opt-out applies before any provider credential is uploaded.
-        if not profiles.read()["auto_register"] or registry is None:
+        if registry is None or not profiles.auto_register(client.url):
             return {"state": "local", "profile": name}
         receipt = lease.upload()
         name_committed_login(switcher, client, name, receipt)
@@ -246,7 +289,7 @@ def login_profile(switcher, name):
 def run_command(argv, switcher):
     parser = argparse.ArgumentParser(prog="cswap vision")
     parser.add_argument(
-        "--url", default=os.environ.get("VISION_API_URL", "https://vision.infinity.inc")
+        "--url", default=None
     )
     commands = parser.add_subparsers(dest="command", required=True)
     browser = commands.add_parser("login")
@@ -287,8 +330,10 @@ def run_command(argv, switcher):
     if args.command in {"login", "status", "cancel"}:
         if args.command == "login" and os.environ.get("VISION_API_KEY"):
             client = configured_client()
+            disclose_registration(profiles, client.url)
             return {"state": "configured", "source": "environment", "url": client.url}
-        flow = VisionSignIn(switcher.backup_dir, args.url)
+        destination = args.url or os.environ.get("VISION_API_URL", "https://vision.infinity.inc")
+        flow = VisionSignIn(switcher.backup_dir, destination)
         if args.command == "cancel":
             return flow.cancel()
         if args.command == "status":
@@ -298,6 +343,7 @@ def run_command(argv, switcher):
             if client is None:
                 return {"state": "signed_out"}
             return {"state": "signed_in", "url": client.url}
+        disclose_registration(profiles, flow.url)
         public = flow.begin(args.host_label)
         if args.no_wait:
             return public
@@ -349,8 +395,17 @@ def run_command(argv, switcher):
     if args.command == "profiles":
         return profiles.read()
     if args.command == "auto-register":
-        profiles.set_auto_register(args.value == "on")
-        return {"auto_register": profiles.read()["auto_register"]}
+        client = None if args.url else configured_client()
+        if args.url:
+            destination = origin(args.url)
+        elif client is not None:
+            destination = client.url
+        else:
+            destination = origin(
+                os.environ.get("VISION_API_URL", "https://vision.infinity.inc")
+            )
+        profiles.set_auto_register(args.value == "on", destination)
+        return {"auto_register": profiles.auto_register(destination), "url": destination}
     if args.command == "account-run":
         native_args = args.native_args
         if native_args[:1] == ["--"]:

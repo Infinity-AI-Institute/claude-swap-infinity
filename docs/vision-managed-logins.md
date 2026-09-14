@@ -27,7 +27,14 @@ cswap vision account-run personal
 cswap vision account-run personal -- --resume CONVERSATION_ID
 ```
 
-The upload preference persists across invocations. `account-run` uses the same
+The upload preference persists across invocations for the selected Vision
+deployment. `cswap vision --url https://other-vision.example.com auto-register off`
+changes only that deployment. Fresh installations enable automatic registration;
+an existing global opt-out remains the fallback for deployments without an
+explicit choice, so upgrading never silently enables uploads. Vision setup and
+managed provider login display the effective setting, destination and opt-out
+command before proceeding. Automatic authorized-pool discovery is independent
+of the upload preference. `account-run` uses the same
 native profile as `account-login`, forwards the native arguments and terminal
 streams, and returns Claude's exit status. A local run with uploads disabled does
 not require Vision configuration. It does not copy the default Claude profile.
