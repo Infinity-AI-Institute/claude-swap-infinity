@@ -2,37 +2,78 @@
 
 Multi-account switcher for Claude Code. Easily switch between multiple Claude accounts without logging out, or let it switch for you before you hit a rate limit. Track usage for every account in a live dashboard, and run accounts in parallel. Works with both the Claude Code CLI and the VS Code extension.
 
-## Installation
+## Get started with Infinity Vision
 
-### Using uv (recommended)
-
-```bash
-uv tool install claude-swap
-```
-
-### Using pipx
+This is Infinity's fork. Install it from this repository to get Vision support.
+You need Python 3.12+, `uv`, GitHub access to Infinity's repositories, and the native
+Claude Code CLI installed.
 
 ```bash
-pipx install claude-swap
+gh repo clone Infinity-AI-Institute/claude-swap-infinity
+uv tool install ./claude-swap-infinity
+cswap --set-vision-token
+cswap run
 ```
 
-### From source
+Get your own Vision API key from [Vision Settings → API keys](https://vision.infinity.inc).
+The setup command prompts without displaying the key. It saves the key once for
+both `cswap` and the Infinity version of `codex-swap` on this machine. Future
+terminals need no environment variable or repeated setup. `claude-swap` is an alias
+for `cswap`.
+
+To pass the key directly, use `cswap --set-vision-token TOKEN`. The interactive
+form keeps the key out of shell history. A Vision key is different from a Claude
+provider token.
+
+Resume a native conversation:
 
 ```bash
-git clone https://github.com/realiti4/claude-swap.git
-cd claude-swap
-uv sync
-uv run cswap help
+cswap run -- --resume
 ```
 
-### Updating
+Add a new Claude account through the native login flow:
 
 ```bash
-cswap upgrade          # uv/pipx installs on macOS/Linux: auto-detects and upgrades
-# or run your installer directly:
-uv tool upgrade claude-swap
-pipx upgrade claude-swap
+cswap vision account-login work
+cswap run work
 ```
+
+With Vision configured, new managed logins register automatically unless you
+previously disabled auto-registration. Complete any displayed handoff confirmation.
+Successful registration grants you use of that account. Existing Vision accounts
+need no provider login on this machine. Conversation resume uses the native Claude
+home; no session transfer is required.
+
+### Saved key and troubleshooting
+
+The private key file is `${XDG_CONFIG_HOME:-~/.config}/vision/credentials.json`.
+Setup stores the Vision URL with the key. Run setup again to replace it.
+`VISION_API_KEY`, when set, takes precedence; otherwise the shared key takes
+precedence over an older `cswap vision login` browser sign-in. To return to browser
+sign-in, remove the shared key file and unset `VISION_API_KEY`; this removes the
+saved configuration for both wrappers, without revoking the server key.
+
+Run `cswap vision status` to check whether configuration is present. Saving a key
+and status do not test server access; `cswap run` verifies access when it loads
+accounts. If access is refused, check that the key is valid and your Vision user
+can use a Claude account. `VISION_API_URL` must match the saved URL. For a separate
+Vision deployment, set that variable before saving its key.
+
+For browser sign-in, local-only accounts, and recovery, see the
+[Vision guide](docs/VISION.md) and [managed login guide](docs/vision-managed-logins.md).
+The local-account commands below are optional for Vision users.
+
+### Update this Infinity installation
+
+From the cloned repository:
+
+```bash
+git pull --ff-only
+uv tool install --force .
+```
+
+Use this repository when updating; the public `claude-swap` package and upstream
+update commands do not supply Infinity's Vision integration.
 
 ## Usage
 

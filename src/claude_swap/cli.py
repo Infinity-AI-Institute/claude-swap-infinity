@@ -910,6 +910,15 @@ def main() -> None:
     force_utf8_output()
     _use_native_tls()
     argv = sys.argv[1:]
+    if argv and (argv[0] == "--set-vision-token" or argv[0].startswith("--set-vision-token=")):
+        from claude_swap.vision_token import setup_command
+
+        setup_args = argv[1:]
+        if "=" in argv[0]:
+            setup_args = [argv[0].split("=", 1)[1], *setup_args]
+        setup_command(setup_args)
+        return
+
     try:
         from claude_swap.appearance import cli_should_probe, cli_theme
         # `run` execs a child that takes over the terminal, and `--json`
@@ -973,6 +982,7 @@ def main() -> None:
         description="""Multi-Account Switcher for Claude Code
 
 Commands:
+  %(prog)s --set-vision-token [TOKEN] save a Vision API key for both swap tools
   %(prog)s help                       show this help
   %(prog)s list                       list managed accounts
   %(prog)s status                     show current account

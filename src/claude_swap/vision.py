@@ -418,7 +418,7 @@ class VisionClient(VisionTransport):
 
 
 def configured_client(state_root: Path | None = None) -> VisionClient | None:
-    """Use an explicit environment key before this installation's saved sign-in."""
+    """Resolve environment, shared manual token, then this installation's sign-in."""
     from claude_swap.paths import get_backup_root
     from claude_swap.vision_state import VisionState
 
@@ -427,6 +427,11 @@ def configured_client(state_root: Path | None = None) -> VisionClient | None:
         return VisionClient(
             os.environ.get("VISION_API_URL", "https://vision.infinity.inc"), key
         )
+    from claude_swap.vision_token import saved_token_client
+
+    shared = saved_token_client()
+    if shared is not None:
+        return shared
     saved = VisionState(
         state_root if state_root is not None else get_backup_root()
     ).read("key")

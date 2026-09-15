@@ -5,7 +5,7 @@ Production compatibility and rollout acceptance require their own live evidence.
 
 ## Use an existing Vision account
 
-With `VISION_API_KEY` configured and an authorized, provider-verified Claude login in
+After [one-time Vision setup](../README.md#get-started-with-infinity-vision), with an authorized Claude login in
 Vision, the wrapper discovers the pool automatically:
 
 ```sh
