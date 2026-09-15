@@ -328,10 +328,18 @@ def run_command(argv, switcher):
     args = parser.parse_args(argv)
     profiles = ManagedProfiles(switcher.backup_dir)
     if args.command in {"login", "status", "cancel"}:
-        if args.command == "login" and os.environ.get("VISION_API_KEY"):
-            client = configured_client()
-            disclose_registration(profiles, client.url)
-            return {"state": "configured", "source": "environment", "url": client.url}
+        if args.command in {"login", "status"}:
+            from claude_swap.vision_token import saved_token_client
+
+            environment_key = os.environ.get("VISION_API_KEY")
+            client = configured_client() if environment_key else saved_token_client()
+            if client is not None:
+                if args.url and origin(args.url) != client.url:
+                    raise SessionError("Configured Vision key belongs to another origin.")
+                if args.command == "login":
+                    disclose_registration(profiles, client.url)
+                source = "environment" if environment_key else "shared_config"
+                return {"state": "configured", "source": source, "url": client.url}
         destination = args.url or os.environ.get("VISION_API_URL", "https://vision.infinity.inc")
         flow = VisionSignIn(switcher.backup_dir, destination)
         if args.command == "cancel":

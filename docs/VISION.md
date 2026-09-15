@@ -11,10 +11,19 @@ recovery from provider authentication rejection now requests a successor from
 Vision or selects another eligible account. Do not release this integration until
 the remaining client and deployment acceptance checks pass.
 
-Sign in with `cswap vision login`, open the printed approval URL in your browser,
-and compare the displayed code before approving. The CLI saves a registry-only
-key privately; it does not print it. Alternatively, set `VISION_API_KEY` to your
-own Vision API key, which takes precedence over the saved sign-in.
+For installation and the shortest setup, start with the [README](../README.md#get-started-with-infinity-vision).
+Run `cswap --set-vision-token` to enter your Vision API key privately and save it
+for both Infinity swap tools. The shared file is
+`${XDG_CONFIG_HOME:-~/.config}/vision/credentials.json` (private directory and file).
+The key is bound to the URL saved with it. Configuration precedence is
+`VISION_API_KEY`, shared saved key, then this wrapper's browser sign-in.
+
+Alternatively, with neither an environment nor shared key configured, run
+`cswap vision login`, open the printed approval URL, and compare its code before
+approving. Browser sign-in saves a wrapper-specific key privately. If an environment
+or shared key already exists, `vision login` reports that configuration instead.
+To return to browser sign-in, remove the shared file and unset `VISION_API_KEY`.
+Removing the file affects both wrappers and does not revoke the server key.
 `VISION_API_URL` defaults to
 `https://vision.infinity.inc`; an override must be an HTTPS origin, except for
 loopback HTTP during local integration testing. The client does not follow HTTP
