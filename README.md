@@ -2,6 +2,9 @@
 
 Multi-account switcher for Claude Code. Easily switch between multiple Claude accounts without logging out, or let it switch for you before you hit a rate limit. Track usage for every account in a live dashboard, and run accounts in parallel. Works with both the Claude Code CLI and the VS Code extension.
 
+For credential storage, retrieval, refresh ownership, and native-client behavior,
+see [How tokens work](docs/token-lifecycle.md).
+
 ## Get started with Infinity Vision
 
 This is Infinity's fork. Install it from this repository to get Vision support.
