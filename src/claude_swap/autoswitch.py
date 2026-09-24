@@ -20,7 +20,9 @@ activation the target's token is *freshened* (refreshed if it expires within
 under-lock re-read sees a fresh token and aborts its own refresh); a target
 whose refresh token is dead gets quarantined instead of activated. When the
 active account's own usage becomes unreadable for ``unhealthy_ticks``
-consecutive ticks, the engine fails over to any healthy candidate.
+consecutive ticks, the engine fails over to any healthy candidate. A usage
+endpoint 429 is not unreadable in that sense: it throttles polling, not the
+account, so the engine holds until a fetch succeeds.
 
 Cooldown and quarantine persist in ``<backup_root>/autoswitch_state.json``
 (so cron-driven ``cswap auto --once`` ticks behave across processes), mutated
@@ -58,7 +60,11 @@ from claude_swap.settings import (
     parse_window_thresholds,
 )
 from claude_swap.switcher import ClaudeAccountSwitcher
-from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
+from claude_swap.usage_store import (
+    UsageEntry,
+    due_candidate,
+    plan_oversleeps_interval,
+)
 
 STATE_FILENAME = "autoswitch_state.json"
 STATE_SCHEMA_VERSION = 1
@@ -267,6 +273,14 @@ def _now_iso() -> str:
     )
 
 
+def _epoch_iso(epoch: float) -> str:
+    return (
+        datetime.fromtimestamp(epoch, timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
+    )
+
+
 def pct_label(value: float) -> str:
     """A percentage for display, as configured: 85.555555 stays itself
     (never a rounded "85.5556") and 99.9 never becomes a lying "100" the
@@ -372,15 +386,21 @@ class SwitchEvent(AutoSwitchEvent):
     to_ref: dict | None
     warnings: list[str] = field(default_factory=list)
     dry_run: bool = False
+    # Failover only: why the active account's usage was unusable (its last
+    # fetch error, e.g. "timeout", or a sentinel). Additive field.
+    cause: str | None = None
 
     def _fields(self) -> dict:
-        return {
+        fields = {
             "trigger": self.trigger,
             "from": self.from_ref,
             "to": self.to_ref,
             "warnings": self.warnings,
             "dryRun": self.dry_run,
         }
+        if self.cause:
+            fields["cause"] = self.cause
+        return fields
 
     def human(self) -> str:
         src = (
@@ -392,7 +412,8 @@ class SwitchEvent(AutoSwitchEvent):
             else "?"
         )
         prefix = "[dry-run] would switch" if self.dry_run else "Switched"
-        return f"{prefix} {src} -> {dst} ({self.trigger})"
+        reason = f"{self.trigger}: {self.cause}" if self.cause else self.trigger
+        return f"{prefix} {src} -> {dst} ({reason})"
 
 
 @dataclass(frozen=True)
@@ -618,6 +639,28 @@ def _every_account_above_threshold(
     if not measured:
         return False
     return all(m <= 0 for m in measured)
+
+
+def _usage_rate_limited(entry: UsageEntry | None) -> bool:
+    """Whether the usage endpoint's own rate limit is why a reading is missing.
+
+    A 429 from the usage endpoint throttles polling; it is no evidence about
+    the account's quota or credential. So it must not count toward failover,
+    and it must not trigger an all-candidate escalation fetch that spends more
+    of the same budget. A success clears ``last_error``, so this holds only
+    while the latest attempt was a 429; the store's Retry-After backoff decides
+    when the next attempt runs.
+    """
+    return entry is not None and entry.last_error == "http-429"
+
+
+def _failover_cause(value: dict | str | None, entry: UsageEntry | None) -> str:
+    """What made the active account's usage unusable, for the switch record."""
+    if isinstance(value, str):
+        return value  # a sentinel such as an expired or foreign credential
+    if entry is not None and entry.last_error:
+        return entry.last_error
+    return "usage-unknown"
 
 
 def _ref(number: str, email: str) -> dict:
@@ -1125,6 +1168,29 @@ class AutoSwitchEngine:
                     "resuming unhealthy counting (dead refresh token?)",
                     IDLE_HOLD_MAX_S / 60,
                 )
+            elif _usage_rate_limited(entries.get(current)):
+                # The usage endpoint is throttling this token, typically after
+                # its last-good reading aged past the 429 trust ceiling. That
+                # says nothing about the account, and candidates are often
+                # throttled too (2026-09-24: two accounts drew 429s in one
+                # batch), so a failover would move every Claude Code on this
+                # profile for no gain. Hold until a fetch succeeds; the store's
+                # Retry-After backoff paces the retries.
+                self._idle_hold_since = None
+                self._unhealthy_ticks = 0
+                active_entry = entries[current]
+                retry = (
+                    f"; next fetch after {_epoch_iso(active_entry.backoff_until)}"
+                    if active_entry.backoff_until
+                    else ""
+                )
+                self._emit(
+                    NoSwitchEvent(
+                        reason="active-usage-rate-limited",
+                        detail=f"usage endpoint answered http-429{retry}",
+                    )
+                )
+                return TickOutcome.NO_ACTION
             else:
                 self._idle_hold_since = None
             self._unhealthy_ticks += 1
@@ -1140,6 +1206,11 @@ class AutoSwitchEngine:
                 )
                 return TickOutcome.NO_ACTION
             trigger = "failover"
+        failover_cause = (
+            _failover_cause(usage.get(current), entries.get(current))
+            if trigger == "failover"
+            else None
+        )
 
         if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
             self._emit(NoSwitchEvent(reason="cooldown"))
@@ -1439,7 +1510,9 @@ class AutoSwitchEngine:
             if self.dry_run:
                 # Dry-run stops at the decision: no token refresh, no
                 # quarantine writes — freshening is a mutation.
-                return self._perform(num, email, trigger, left_snapshot)
+                return self._perform(
+                    num, email, trigger, left_snapshot, cause=failover_cause
+                )
             status = self._freshen_target(num, email)
             if status == "identity-conflict":
                 # The slot's credential is alive but belongs to a different
@@ -1470,7 +1543,9 @@ class AutoSwitchEngine:
                 continue
             if status == "skip-live-session":
                 continue
-            return self._perform(num, email, trigger, left_snapshot)
+            return self._perform(
+                num, email, trigger, left_snapshot, cause=failover_cause
+            )
 
         if systemic or transient_failure:
             self._emit(
@@ -1995,7 +2070,14 @@ class AutoSwitchEngine:
             self._window_thresholds,
         )
         escalate = bool(candidates) and (
-            (active_margin is None and active_value != USAGE_TOKEN_EXPIRED)
+            (
+                active_margin is None
+                and active_value != USAGE_TOKEN_EXPIRED
+                # A rate-limited active holds instead of failing over, so
+                # fresh candidate data would buy nothing (see
+                # _usage_rate_limited).
+                and not _usage_rate_limited(entries.get(current))
+            )
             or (
                 active_margin is not None
                 and active_margin <= ESCALATION_MARGIN_PCT
@@ -2037,6 +2119,8 @@ class AutoSwitchEngine:
         email: str,
         trigger: str,
         left: tuple[float | None, float],
+        *,
+        cause: str | None = None,
     ) -> TickOutcome:
         if self.dry_run:
             current = self.switcher.current_account_number()
@@ -2047,6 +2131,7 @@ class AutoSwitchEngine:
                     from_ref=_ref(current, current_email) if current else None,
                     to_ref=_ref(number, email),
                     dry_run=True,
+                    cause=cause,
                 )
             )
             return TickOutcome.SWITCHED
@@ -2102,6 +2187,7 @@ class AutoSwitchEngine:
                 from_ref=result.get("from"),
                 to_ref=result.get("to"),
                 warnings=result.get("warnings", []),
+                cause=cause,
             )
         )
         return TickOutcome.SWITCHED
