@@ -4739,7 +4739,13 @@ class ClaudeAccountSwitcher:
             entry = entries[num]
             _i = info_by_num[num]
             if self._entry_token_dead(entry, num, _i[1], _i[5], _i[4]):
-                sentinels[num] = USAGE_RELOGIN_REQUIRED
+                if self._heal_active_quarantine_from_live(entry, num, _i):
+                    self._usage_store.clear_dead_token(
+                        [num], {num: identities[num]}
+                    )
+                    entries = store.entries(identities, models)
+                else:
+                    sentinels[num] = USAGE_RELOGIN_REQUIRED
             elif entry.auth_dead_strikes and entry.token_dead():
                 # Struck, but no stored source still matches the condemned
                 # generation — the fingerprint healed the verdict.
@@ -4877,6 +4883,55 @@ class ClaudeAccountSwitcher:
         else:
             stored = backup
         return self._entry_token_dead(entry, num, email, stored, is_active)
+
+    def _heal_active_quarantine_from_live(
+        self,
+        entry: UsageEntry,
+        num: str,
+        account_info: tuple[int, str, str, str, bool, str, str],
+    ) -> bool:
+        """Lift a quarantine that the ACTIVE slot's healthy live login disproves.
+
+        Claude Code rotates the live refresh token during normal use. When no
+        collect pass resynced the backup in time, the backup keeps the consumed
+        predecessor, a later POST of it returns invalid_grant, and the slot is
+        quarantined. The repair (``_resync_rotated_backup``) only runs on the
+        fetch path, and the quarantine skips that path, so the active slot
+        stayed "re-login needed" indefinitely although its live login worked.
+
+        Resync the backup from the live credential here. The resync attributes
+        the live bytes to this slot with the profile oracle (which also proves
+        the live access token is accepted) and writes only under the slot and
+        credential locks. The quarantine lifts only if the backup now holds the
+        live lineage. If the live lineage is itself dead, the next refresh
+        earns a fingerprint-bound strike on it and the check below then refuses
+        to heal, so a dead login cannot loop.
+
+        Returns True when the caller should clear the strike.
+        """
+        _num, email, _org_name, org_uuid, is_active, live, _alias = account_info
+        if not is_active or not live:
+            return False
+        live_oauth = oauth.extract_oauth_data(live)
+        if not (
+            live_oauth
+            and live_oauth.get("accessToken")
+            and live_oauth.get("refreshToken")
+        ):
+            return False
+        if oauth.is_oauth_token_expired(live_oauth.get("expiresAt")):
+            # The ownership probe needs an access token the server accepts.
+            return False
+        live_fp = oauth.credential_fingerprint(live)
+        if entry.struck_fingerprint is not None and live_fp == entry.struck_fingerprint:
+            return False  # the live credential is the condemned generation
+        self._resync_rotated_backup(num, email, org_uuid or "", live)
+        backup, unreadable = self._read_account_credentials_ex(num, email)
+        return (
+            not unreadable
+            and bool(backup)
+            and oauth.credential_fingerprint(backup) == live_fp
+        )
 
     def _entry_token_dead(
         self,
