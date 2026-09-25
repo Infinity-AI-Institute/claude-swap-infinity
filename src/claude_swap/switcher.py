@@ -73,6 +73,7 @@ from claude_swap.printer import (
     ide_short_name,
     muted,
     warning,
+    yellowed,
 )
 from claude_swap.paths import (
     get_backup_root,
@@ -84,7 +85,7 @@ from claude_swap.paths import (
 )
 from claude_swap.process_detection import get_running_instances
 from claude_swap.vision import VisionError, configured_client as configured_vision_client
-from claude_swap.vision_registry import RegistryPool
+from claude_swap.vision_registry import RegistryPool, RosterSync
 from claude_swap import poll_policy
 from claude_swap.settings import (
     load_settings,
@@ -394,22 +395,53 @@ class ClaudeAccountSwitcher:
 
         run_migrations(self)
 
-    def sync_vision_accounts(self, *, force: bool = False) -> bool:
+    def sync_vision_accounts(self, *, force: bool = False) -> RosterSync:
         """Refresh optional registry membership outside credential/native locks."""
+        url = None
         try:
             client = configured_vision_client()
             if client is None:
-                return False
-            changed = RegistryPool(self, client).sync(force=force)
+                return RosterSync(url=None)
+            url = client.url
+            RegistryPool(self, client).sync(force=force)
         except VisionError as error:
             # Keep independent local profiles available during a registry outage.
             # Remote launch must still obtain an authorized credential from Vision.
             if getattr(self, "_vision_sync_error", None) != error.code:
                 self._logger.warning("Vision account synchronization failed: %s", error.code)
             self._vision_sync_error = error.code
-            return False
+            return RosterSync(url=url, failure=error)
         self._vision_sync_error = None
-        return changed
+        return RosterSync(url=url)
+
+    def _has_accounts(self) -> bool:
+        return bool((self._get_sequence_data() or {}).get("accounts"))
+
+    def warn_about_vision_roster(self, sync: RosterSync) -> None:
+        """Explain a stale or empty Vision roster to a key-only user.
+
+        Without this, an empty roster reads as "log in to Claude first", which is
+        the wrong fix for someone whose only credential is a Vision key. Prints
+        to stderr so ``--json`` stdout stays parseable.
+        """
+        if sync.failure is not None:
+            print(
+                yellowed(f"Vision accounts were not refreshed. {sync.failure}"),
+                file=sys.stderr,
+            )
+            return
+        if sync.url is None or self._has_accounts():
+            # Explain an empty Vision grant only when the roster is empty: the
+            # shared key may exist just for codex-swap, and a user with other
+            # accounts has something to use.
+            return
+        print(
+            yellowed(
+                f"Vision at {sync.url} authorizes no Claude accounts for this "
+                "API key. Ask a Vision admin to grant you use of an account."
+            ),
+            file=sys.stderr,
+        )
 
     def _is_running_in_container(self) -> bool:
         """Check if running inside a container."""
@@ -5274,7 +5306,12 @@ class ClaudeAccountSwitcher:
         watch view's adaptive set); ``None`` — the CLI default — leaves every
         stale account eligible.
         """
-        self.sync_vision_accounts()
+        sync = self.sync_vision_accounts()
+        if sync.failure is not None and not self._has_accounts():
+            # Nothing to list, and the first-run prompt below would tell a
+            # key-only user to log in to Claude. Vision's refusal is the fix.
+            raise sync.failure
+        self.warn_about_vision_roster(sync)
         if not self.sequence_file.exists():
             # JSON mode must never prompt — emit an empty list instead of the
             # interactive first-run setup.

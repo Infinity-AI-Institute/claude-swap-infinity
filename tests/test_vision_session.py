@@ -11,6 +11,7 @@ from claude_swap.session import SessionManager
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.vision import VisionClient, VisionError
 from claude_swap.vision_session import acquire_credential, prepare_launch
+from claude_swap.vision_registry import RosterSync
 
 
 @pytest.fixture
@@ -171,7 +172,9 @@ def test_remote_run_bypasses_local_bootstrap_and_preserves_resume_arguments(
             "activeAccountNumber": None,
         },
     )
-    manager.switcher.sync_vision_accounts = Mock()
+    manager.switcher.sync_vision_accounts = Mock(
+        return_value=RosterSync(url=registry.url)
+    )
     monkeypatch.setattr("claude_swap.vision.configured_client", lambda: registry)
     monkeypatch.setattr(
         "claude_swap.session.shutil.which", lambda _: "/synthetic/claude"
