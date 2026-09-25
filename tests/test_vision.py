@@ -169,7 +169,7 @@ def test_transport_rejects_oversized_delivery(monkeypatch):
 
 @pytest.mark.parametrize(
     ("status", "code", "advice"),
-    [(401, "unauthorized", "API key"), (403, "not_permitted", "Vision admin")],
+    [(401, "unauthorized", "VISION_API_KEY"), (403, "not_permitted", "Vision admin")],
 )
 def test_refused_key_error_names_the_vision_url_and_the_fix(
     monkeypatch, status, code, advice

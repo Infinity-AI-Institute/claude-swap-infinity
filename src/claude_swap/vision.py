@@ -62,9 +62,10 @@ ERROR_CODES = {
 # grants its owner, never a provider login. Other codes are service states.
 ACCESS_REFUSAL_ADVICE = {
     "unauthorized": (
-        "The Vision API key was not accepted. Set VISION_API_KEY, or run "
-        "cswap --set-vision-token, with a current key from Vision Settings "
-        "→ API keys."
+        "The Vision API key was not accepted. Create a new key in Vision "
+        "Settings (gear) → API keys. If VISION_API_KEY is set, put the new key "
+        "there, because it overrides a saved key. Otherwise run "
+        "cswap --set-vision-token."
     ),
     "not_permitted": (
         "Your Vision user is not an invited member, or this API key lacks "

@@ -515,8 +515,7 @@ class SessionManager:
                 "'claude' was not found on PATH. Install Claude Code first."
             )
 
-        self.switcher.sync_vision_accounts()
-        self.switcher.warn_about_vision_roster()
+        self.switcher.warn_about_vision_roster(self.switcher.sync_vision_accounts())
         account_num, email, org_uuid = self.switcher.resolve_account(identifier)
         remote = self.switcher._vision_account_record(account_num)
         if remote is not None:

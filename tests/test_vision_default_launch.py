@@ -97,6 +97,6 @@ def test_explicit_launch_explains_a_refused_key_before_the_lookup_fails(
     monkeypatch.setattr("claude_swap.session.shutil.which", lambda _: "/synthetic/claude")
     manager = SessionManager(switcher)
     manager._exec = Mock(side_effect=AssertionError("uncredentialed native launch"))
-    with pytest.raises(ClaudeSwitchError):
+    with pytest.raises(ClaudeSwitchError, match="does not exist"):
         manager.run("1", [])
     assert "Vision admin" in capsys.readouterr().err

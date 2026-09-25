@@ -1,10 +1,12 @@
 """Registry membership is metadata, never a local refresh-token backup."""
 
 import json
+import sys
 from unittest.mock import Mock
 
 import pytest
 
+from claude_swap import cli
 from claude_swap.exceptions import ConfigError
 from claude_swap.locking import FileLock
 from claude_swap.switcher import ClaudeAccountSwitcher
@@ -197,6 +199,37 @@ def test_no_grants_note_stays_quiet_when_local_accounts_exist(
     use_vision(monkeypatch, client([]))
     switcher.list_accounts()
     assert "no Claude accounts" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("has_local_account", [True, False])
+def test_json_list_stdout_stays_parseable_when_vision_refuses_the_key(
+    switcher, monkeypatch, capsys, has_local_account
+):
+    if has_local_account:
+        local = {"email": "local@example.invalid", "organizationUuid": ""}
+        switcher._write_json(
+            switcher.sequence_file,
+            {"accounts": {"1": local}, "sequence": [1], "activeAccountNumber": None},
+        )
+    registry = client()
+    registry.discover.side_effect = VisionError("not_permitted", 403)
+    use_vision(monkeypatch, registry)
+    monkeypatch.setattr(sys, "argv", ["cswap", "list", "--json"])
+    exit_code = 0
+    try:
+        cli.main()
+    except SystemExit as exited:
+        exit_code = exited.code
+    output = capsys.readouterr()
+    payload = json.loads(output.out)
+    if has_local_account:
+        assert exit_code == 0
+        assert [row["email"] for row in payload["accounts"]] == ["local@example.invalid"]
+        assert "not_permitted" in output.err
+    else:
+        assert exit_code == 1
+        assert payload["error"]["type"] == "VisionError"
+        assert "Vision admin" in payload["error"]["message"]
 
 
 def test_remote_rows_never_read_or_write_local_credential_backups(switcher):
