@@ -12254,13 +12254,13 @@ class TestActiveQuarantineHealsFromLiveLogin:
         "uuid": "uuid-1", "email": "test@example.com", "organizationUuid": None
     }
 
-    def _switcher(self, sample_sequence_data, struck_fp):
+    def _switcher(self, sample_sequence_data, struck_fp, backup=_DEAD_BACKUP):
         from claude_swap.usage_store import FetchRecord
         sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
         s = ClaudeAccountSwitcher()
         s._setup_directories()
         s._write_json(s.sequence_file, sample_sequence_data)
-        s._write_account_credentials("1", "test@example.com", self._DEAD_BACKUP)
+        s._write_account_credentials("1", "test@example.com", backup)
         identities = {"1": ("test@example.com", "")}
         s._usage_store.record(
             {"1": FetchRecord(error="invalid_grant", struck_fp=struck_fp)},
@@ -12328,3 +12328,42 @@ class TestActiveQuarantineHealsFromLiveLogin:
             s._read_account_credentials("1", "test@example.com")
             == self._DEAD_BACKUP
         )
+
+    def test_degraded_live_read_stays_quarantined_without_probe(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict
+    ):
+        # A Keychain failure covered by the plaintext fallback may serve a
+        # consumed predecessor whose access token is still accepted: the
+        # oracle would attribute it, and the heal would write a dead refresh
+        # token into the backup. The fetch path never resyncs from a degraded
+        # read; the heal must not either.
+        s = self._switcher(sample_sequence_data, None)
+        s._record_active_verdict(ActiveCredentials(self._LIVE, False, True))
+
+        entry, probe = self._collect(s, self._PROFILE_SELF)
+
+        probe.assert_not_called()
+        assert entry.sentinel == USAGE_RELOGIN_REQUIRED
+        assert (
+            s._read_account_credentials("1", "test@example.com")
+            == self._DEAD_BACKUP
+        )
+
+    def test_legacy_strike_on_live_lineage_needs_an_oracle_verdict(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict
+    ):
+        # A legacy (fingerprint-less) strike binds to whatever is stored. When
+        # the backup already holds the live lineage, the resync has nothing
+        # to write and never probes, so "backup == live" alone is no evidence
+        # that the struck generation is gone. Without an oracle verdict the
+        # quarantine must hold.
+        s = self._switcher(sample_sequence_data, None, backup=self._LIVE)
+
+        entry, _probe = self._collect(s, self._PROFILE_SELF)
+
+        assert entry.sentinel == USAGE_RELOGIN_REQUIRED
+        assert s._usage_store.entries(
+            {"1": ("test@example.com", "")}, []
+        )["1"].token_dead()

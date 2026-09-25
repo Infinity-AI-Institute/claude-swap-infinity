@@ -4934,15 +4934,22 @@ class ClaudeAccountSwitcher:
         Resync the backup from the live credential here. The resync attributes
         the live bytes to this slot with the profile oracle (which also proves
         the live access token is accepted) and writes only under the slot and
-        credential locks. The quarantine lifts only if the backup now holds the
-        live lineage. If the live lineage is itself dead, the next refresh
-        earns a fingerprint-bound strike on it and the check below then refuses
-        to heal, so a dead login cannot loop.
+        credential locks. The quarantine lifts only if the oracle attributed
+        the live lineage and the backup now holds it; a degraded (Keychain
+        fallback) read never heals. If the live lineage is itself dead, the
+        next refresh earns a fingerprint-bound strike on it and the check
+        below then refuses to heal, so a dead login cannot loop.
 
         Returns True when the caller should clear the strike.
         """
         _num, email, _org_name, org_uuid, is_active, live, _alias = account_info
         if not is_active or not live:
+            return False
+        if self._active_read_degraded:
+            # Same rule as the fetch path's resync: a Keychain-fallback read
+            # may serve a consumed predecessor whose access token the oracle
+            # still accepts. Writing it would put a dead refresh token in the
+            # backup and lift the quarantine on it.
             return False
         live_oauth = oauth.extract_oauth_data(live)
         if not (
@@ -4958,6 +4965,16 @@ class ClaudeAccountSwitcher:
         if entry.struck_fingerprint is not None and live_fp == entry.struck_fingerprint:
             return False  # the live credential is the condemned generation
         self._resync_rotated_backup(num, email, org_uuid or "", live)
+        # The oracle must have attributed the live lineage. The resync
+        # returns before probing when the backup already holds that lineage,
+        # and with a legacy (fingerprint-less) strike that lineage may be the
+        # struck one, so "backup == live" alone proves nothing. Such a slot
+        # stays quarantined until Claude Code next rotates the live token;
+        # the resync then probes the new lineage.
+        if not self._probe_verdicts.get(
+            self._lineage_key(num, email, live_fp or "")
+        ):
+            return False
         backup, unreadable = self._read_account_credentials_ex(num, email)
         return (
             not unreadable
