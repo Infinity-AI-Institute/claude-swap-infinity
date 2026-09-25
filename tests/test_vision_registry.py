@@ -133,6 +133,72 @@ def test_fresh_registry_user_is_discovered_before_first_run_prompt(
     registry.discover.assert_called_once()
 
 
+def use_vision(monkeypatch, registry):
+    monkeypatch.setattr(
+        "claude_swap.switcher.configured_vision_client", lambda: registry
+    )
+
+
+@pytest.mark.parametrize(
+    ("code", "status", "advice"),
+    [("unauthorized", 401, "API key"), ("not_permitted", 403, "Vision admin")],
+)
+@pytest.mark.parametrize("json_output", [False, True])
+def test_refused_key_explains_vision_access_instead_of_asking_for_a_claude_login(
+    switcher, monkeypatch, code, status, advice, json_output
+):
+    registry = client()
+    registry.discover.side_effect = VisionError(code, status)
+    use_vision(monkeypatch, registry)
+    switcher._first_run_setup = Mock(
+        side_effect=AssertionError("a key-only user must not be sent to /login")
+    )
+    with pytest.raises(VisionError, match=advice):
+        switcher.list_accounts(json_output=json_output)
+
+
+def test_registry_failure_keeps_local_accounts_listed_and_says_why(
+    switcher, monkeypatch, capsys
+):
+    local = {"email": "local@example.invalid", "organizationUuid": ""}
+    switcher._write_json(
+        switcher.sequence_file,
+        {"accounts": {"1": local}, "sequence": [1], "activeAccountNumber": None},
+    )
+    registry = client()
+    registry.discover.side_effect = VisionError("service_unavailable", 503)
+    use_vision(monkeypatch, registry)
+    switcher.list_accounts()
+    output = capsys.readouterr()
+    assert "local@example.invalid" in output.out
+    assert "service_unavailable" in output.err
+
+
+def test_key_without_granted_accounts_is_told_why_the_list_is_empty(
+    switcher, monkeypatch, capsys
+):
+    use_vision(monkeypatch, client([]))
+    switcher.list_accounts()
+    note = capsys.readouterr().err
+    assert "https://vision.example.invalid" in note
+    assert "no Claude accounts" in note
+    assert "Vision admin" in note
+
+
+def test_no_grants_note_stays_quiet_when_local_accounts_exist(
+    switcher, monkeypatch, capsys
+):
+    """The shared key also serves codex-swap; Claude-local users get no nag."""
+    local = {"email": "local@example.invalid", "organizationUuid": ""}
+    switcher._write_json(
+        switcher.sequence_file,
+        {"accounts": {"1": local}, "sequence": [1], "activeAccountNumber": None},
+    )
+    use_vision(monkeypatch, client([]))
+    switcher.list_accounts()
+    assert "no Claude accounts" not in capsys.readouterr().err
+
+
 def test_remote_rows_never_read_or_write_local_credential_backups(switcher):
     RegistryPool(switcher, client()).sync()
     switcher._store._read_account_credentials = Mock(

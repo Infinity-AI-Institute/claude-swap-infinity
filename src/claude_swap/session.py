@@ -516,6 +516,7 @@ class SessionManager:
             )
 
         self.switcher.sync_vision_accounts()
+        self.switcher.warn_about_vision_roster()
         account_num, email, org_uuid = self.switcher.resolve_account(identifier)
         remote = self.switcher._vision_account_record(account_num)
         if remote is not None:
@@ -624,7 +625,11 @@ class SessionManager:
                         str(number), claude_args, share=share, share_history=share_history
                     )
                     return  # Only reachable when the native handoff is mocked.
-            raise SessionError("No enabled Claude account is authorized through Vision.")
+            raise SessionError(
+                "No enabled Claude account is authorized through Vision. Ask a "
+                "Vision admin to grant you use of an account, or run "
+                "cswap enable for one you disabled."
+            )
 
         claude_bin = shutil.which("claude")
         if not claude_bin:
