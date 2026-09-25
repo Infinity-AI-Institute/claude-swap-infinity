@@ -658,6 +658,17 @@ class TestRunCommand:
         )
         assert "alias <num|email>" in result.stdout
 
+    def test_main_help_points_to_the_vision_commands(self):
+        result = subprocess.run(
+            [sys.executable, "-m", "claude_swap", "--help"],
+            capture_output=True,
+            text=True,
+            env=_subprocess_env(),
+        )
+        assert "vision status" in result.stdout
+        assert "vision account-login <name>" in result.stdout
+        assert "vision --help" in result.stdout
+
     def test_session_error_exits_cleanly(self, capsys):
         class FailingSessionManager:
             def __init__(self, switcher):

@@ -5,12 +5,25 @@ from __future__ import annotations
 import copy
 import hashlib
 import time
+from dataclasses import dataclass
 from typing import Any
 
 from claude_swap.exceptions import ConfigError
 from claude_swap.locking import FileLock
 from claude_swap.models import get_timestamp
-from claude_swap.vision import VisionClient
+from claude_swap.vision import VisionClient, VisionError
+
+
+@dataclass(frozen=True)
+class RosterSync:
+    """Outcome of one roster sync, returned to its caller.
+
+    Returned rather than stored on the shared switcher: the TUI syncs from
+    several threads, and one caller must not report another's outcome.
+    """
+
+    url: str | None  # None when no Vision key is configured
+    failure: VisionError | None = None
 
 
 def _valid_preferences(value):

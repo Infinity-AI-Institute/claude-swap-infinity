@@ -4,7 +4,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from claude_swap.exceptions import SessionError
+from claude_swap.exceptions import ClaudeSwitchError, SessionError
 from claude_swap.session import SessionManager
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.vision import VisionClient, VisionError
@@ -75,3 +75,28 @@ def test_automatic_selection_preserves_sharing_options(setup):
     manager.run.assert_called_once_with(
         "1", ["--continue"], share=False, share_history=True
     )
+
+
+def test_empty_authorized_pool_names_who_can_grant_access(setup):
+    manager, client = setup
+    client.discover.return_value = []
+    with pytest.raises(SessionError, match="Vision admin"):
+        manager.exec_default([])
+
+
+def test_explicit_launch_explains_a_refused_key_before_the_lookup_fails(
+    temp_home, monkeypatch, capsys
+):
+    monkeypatch.delenv("VISION_API_KEY", raising=False)
+    switcher = ClaudeAccountSwitcher()
+    client = VisionClient("https://vision.example.invalid", "synthetic-key")
+    client.discover = Mock(side_effect=VisionError("not_permitted", status=403))
+    monkeypatch.setattr(
+        "claude_swap.switcher.configured_vision_client", lambda: client
+    )
+    monkeypatch.setattr("claude_swap.session.shutil.which", lambda _: "/synthetic/claude")
+    manager = SessionManager(switcher)
+    manager._exec = Mock(side_effect=AssertionError("uncredentialed native launch"))
+    with pytest.raises(ClaudeSwitchError, match="does not exist"):
+        manager.run("1", [])
+    assert "Vision admin" in capsys.readouterr().err

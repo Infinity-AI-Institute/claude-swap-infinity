@@ -287,25 +287,45 @@ def login_profile(switcher, name):
 
 
 def run_command(argv, switcher):
-    parser = argparse.ArgumentParser(prog="cswap vision")
+    parser = argparse.ArgumentParser(
+        prog="cswap vision",
+        description=(
+            "Vision account commands. With a Vision API key configured, "
+            "`cswap list` and `cswap run` need none of these."
+        ),
+    )
     parser.add_argument(
         "--url", default=None
     )
-    commands = parser.add_subparsers(dest="command", required=True)
-    browser = commands.add_parser("login")
+    commands = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
+    browser = commands.add_parser(
+        "login", help="sign in through the browser when no API key is configured"
+    )
     browser.add_argument("--host-label", default=socket.gethostname())
     browser.add_argument("--no-wait", action="store_true")
-    commands.add_parser("status")
-    commands.add_parser("cancel")
-    for command in ("account-login", "upload", "cancel-upload"):
-        commands.add_parser(command).add_argument("name")
-    local_run = commands.add_parser("account-run")
+    commands.add_parser(
+        "status", help="show the configured key source and Vision URL (no key check)"
+    )
+    commands.add_parser("cancel", help="cancel a pending browser sign-in")
+    for command, summary in (
+        ("account-login", "log in to a Claude account and register it with Vision"),
+        ("upload", "register a managed login with Vision, or retry its upload"),
+        ("cancel-upload", "cancel a managed login's pending upload"),
+    ):
+        commands.add_parser(command, help=summary).add_argument("name")
+    local_run = commands.add_parser(
+        "account-run", help="run Claude on a managed login that stays local"
+    )
     local_run.add_argument("name")
     local_run.add_argument("native_args", nargs=argparse.REMAINDER)
-    batch = commands.add_parser("batch-upload")
+    batch = commands.add_parser(
+        "batch-upload", help="preview, then register, several managed logins"
+    )
     batch.add_argument("names", nargs="+")
     batch.add_argument("--confirm")
-    migration = commands.add_parser("migrate-login")
+    migration = commands.add_parser(
+        "migrate-login", help="preview, then transfer, an existing login to Vision"
+    )
     migration.add_argument("source_id")
     migration.add_argument("--request-id")
     migration.add_argument("--confirm")
@@ -315,16 +335,21 @@ def run_command(argv, switcher):
         action="store_true",
         help="Import while sessions run; acknowledge their cached credentials may refresh later.",
     )
-    for command in ("recover-migration", "cancel-migration"):
-        recovery = commands.add_parser(command)
+    for command, summary in (
+        ("recover-migration", "retry an interrupted migrate-login"),
+        ("cancel-migration", "cancel an interrupted migrate-login"),
+    ):
+        recovery = commands.add_parser(command, help=summary)
         recovery.add_argument("request_id")
         recovery.add_argument("--profile", action="append", default=[])
         recovery.add_argument("--allow-live-handoff", action="store_true")
-    commands.add_parser("existing-logins").add_argument(
-        "--profile", action="append", default=[]
-    )
-    commands.add_parser("profiles")
-    commands.add_parser("auto-register").add_argument("value", choices=("on", "off"))
+    commands.add_parser(
+        "existing-logins", help="list existing local Claude logins (read-only)"
+    ).add_argument("--profile", action="append", default=[])
+    commands.add_parser("profiles", help="list managed login profiles")
+    commands.add_parser(
+        "auto-register", help="turn automatic registration of new logins on or off"
+    ).add_argument("value", choices=("on", "off"))
     args = parser.parse_args(argv)
     profiles = ManagedProfiles(switcher.backup_dir)
     if args.command in {"login", "status", "cancel"}:

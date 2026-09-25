@@ -1011,6 +1011,9 @@ Commands:
   %(prog)s tui                        interactive dashboard (also: bare %(prog)s)
   %(prog)s watch                      dashboard, opened on the live watch page
   %(prog)s menubar                    macOS menu bar app
+  %(prog)s vision status              show the configured Vision key and URL
+  %(prog)s vision account-login <name>  add a Claude account to Vision
+  %(prog)s vision --help              all Vision account commands
   %(prog)s upgrade                    self-upgrade to latest
   %(prog)s purge                      remove all claude-swap data
 

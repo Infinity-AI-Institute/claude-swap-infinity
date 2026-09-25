@@ -675,6 +675,93 @@ class TestIdleHold:
         assert harness.engine._idle_hold_since is None
 
 
+class TestRateLimitedHold:
+    """Active usage unknown only because the usage endpoint answered 429 →
+    hold. The 2026-09-24 incident: luke@'s last good reading aged past the
+    2 h rate-limit trust ceiling while the endpoint was still in a Retry-After
+    backoff; three unknown ticks later every agent was failed over to another
+    account whose reading was just as rate-limited."""
+
+    def _active(self, now: float, last_error: str) -> UsageEntry:
+        # Last good reading older than every trust ceiling, and the latest
+        # fetch attempt failed.
+        return UsageEntry(
+            last_good=_usage(65),
+            fetched_at=now - 7300,
+            age_s=7300.0,
+            last_attempt_at=now - 2400,
+            consecutive_failures=3,
+            last_error=last_error,
+            backoff_until=now + 2000,
+            last_429_at=(now - 2400) if last_error == "http-429" else None,
+        )
+
+    def _entries(self, harness, last_error: str) -> dict[str, UsageEntry]:
+        now = harness.clock.now
+        return {
+            "1": self._active(now, last_error),
+            "2": UsageEntry(last_good=_usage(10), fetched_at=now, age_s=0.0),
+            "3": UsageEntry(last_good=_usage(20), fetched_at=now, age_s=0.0),
+        }
+
+    def test_usage_endpoint_429_holds_instead_of_failing_over(self, harness):
+        for _ in range(6):  # twice unhealthy_ticks (3)
+            outcome = harness.tick_with_entries(self._entries(harness, "http-429"))
+            assert outcome is TickOutcome.NO_ACTION
+            harness.clock.advance(60)
+        assert harness.active_number() == 1
+        assert not any(isinstance(e, SwitchEvent) for e in harness.events)
+        holds = [e for e in harness.events if isinstance(e, NoSwitchEvent)]
+        assert {e.reason for e in holds} == {"active-usage-rate-limited"}
+        assert "http-429" in holds[0].detail
+        # The backoff deadline of the first tick's entry, in UTC.
+        assert holds[0].detail.endswith(
+            "next fetch after 1970-01-12T14:20:00Z"
+        ), holds[0].detail
+        assert harness.engine._unhealthy_ticks == 0
+
+    def test_a_429_hold_does_not_fetch_every_candidate(self, harness):
+        entries = self._entries(harness, "http-429")
+        with patch.object(
+            harness.switcher, "usage_entries_by_account", return_value=entries
+        ) as collect:
+            assert harness.engine.tick() is TickOutcome.NO_ACTION
+        fetched = [call.kwargs.get("fetch") or set() for call in collect.call_args_list]
+        assert not any({"2", "3"} <= fetch for fetch in fetched)
+
+    def test_a_429_clearing_resumes_normal_decisions(self, harness):
+        harness.tick_with_entries(self._entries(harness, "http-429"))
+        now = harness.clock.now
+        healthy = self._entries(harness, "http-429")
+        healthy["1"] = UsageEntry(last_good=_usage(95), fetched_at=now, age_s=0.0)
+        assert harness.tick_with_entries(healthy) is TickOutcome.SWITCHED
+        switch = next(e for e in harness.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "proactive"
+        assert switch.cause is None
+        assert "cause" not in switch.to_json()
+
+    def test_other_fetch_failures_still_fail_over_and_record_the_cause(self, harness):
+        for _ in range(2):
+            outcome = harness.tick_with_entries(self._entries(harness, "timeout"))
+            assert outcome is TickOutcome.NO_ACTION
+        assert harness.tick_with_entries(self._entries(harness, "timeout")) is (
+            TickOutcome.SWITCHED
+        )
+        switch = next(e for e in harness.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "failover"
+        assert switch.cause == "timeout"
+        assert switch.to_json()["cause"] == "timeout"
+        assert switch.human().endswith("(failover: timeout)")
+
+    def test_a_sentinel_failover_records_the_sentinel(self, harness):
+        foreign = {"1": USAGE_FOREIGN_CREDENTIAL, "2": _usage(10), "3": _usage(20)}
+        for _ in range(3):
+            harness.tick_with_usage(foreign)
+        switch = next(e for e in harness.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "failover"
+        assert switch.cause == USAGE_FOREIGN_CREDENTIAL
+
+
 class TestAdaptiveScheduler:
     """End-to-end through the real store: O(1) baseline, escalations,
     skip-to-reset, movement-based cadence."""
