@@ -1,7 +1,8 @@
 # Managed Claude logins
 
 Native launch, credential recovery, and conversation resume are implemented.
-Production compatibility and rollout acceptance require their own live evidence.
+Vision's [qualification evidence](https://github.com/Infinity-AI-Institute/vision/blob/main/docs/agent-accounts/qualification.md#live-launch-and-resume-evidence) records a live key-only launch and
+resume on a fresh Linux client.
 
 ## Use an existing Vision account
 
@@ -180,8 +181,9 @@ merge conversations from other native homes.
 
 Pinned Claude 2.1.270 has passed synthetic access-only inference, cold resume after
 an account change, and resume of a conversation created in the default native
-home. The live multiuser pilot and clean EC2 rollout acceptance remain separate
-required checks.
+home. On September 14, 2026, a live launch and resume on a clean Linux EC2 client
+passed with only a Vision API key. Luke removed the 24-hour multiuser pilot
+requirement the same day. Both are recorded in Vision's qualification docs.
 
 ## Central credentials during a native session
 

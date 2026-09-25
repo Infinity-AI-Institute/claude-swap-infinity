@@ -6,7 +6,7 @@ Multi-account switcher for Claude Code. Easily switch between multiple Claude ac
 
 This is Infinity's fork. Your Vision API key is the only credential or
 configuration it needs to use the Claude accounts that Vision grants you. You do
-not log in to Claude on this machine, register the machine, or edit a
+not log in to Claude on this machine, register the machine, or write a cswap
 configuration file.
 
 You need [`uv`](https://docs.astral.sh/uv/) and the native Claude Code CLI
@@ -19,7 +19,7 @@ repository is public, so the install needs no GitHub login.
    uv tool install --python 3.12 git+https://github.com/Infinity-AI-Institute/claude-swap-infinity
    ```
 
-2. Create your own API key in Vision at **Settings → API keys**
+2. Create your own API key in Vision at **Settings (gear) → API keys**
    ([vision.infinity.inc](https://vision.infinity.inc)). Add this line to your
    shell profile (for example `~/.zshrc`), then open a new terminal:
 
@@ -65,8 +65,8 @@ grants. For `cswap list` to show an account:
 - Your Vision user must be an invited member.
 - Your API key needs agent-account access. New keys have it by default.
 - An administrator or account manager must grant you **Can use** on the account,
-  under **Settings → Agent accounts**. When you register an account yourself, you
-  get use of it automatically.
+  under **Settings (gear) → Agent accounts**. When you register an account
+  yourself, you get use of it automatically.
 
 For the full permission rules, see Vision's
 [agent account settings](https://github.com/Infinity-AI-Institute/vision/blob/main/docs/AGENT_ACCOUNTS.md#permission-rules).
@@ -93,7 +93,8 @@ uv tool install --force --python 3.12 git+https://github.com/Infinity-AI-Institu
 
 If you installed the upstream tool with `pipx`, run `pipx uninstall claude-swap`
 first. Account data is stored outside the tool's install directory, so a reinstall
-keeps it. The fork is based on upstream 0.25.0. Features added in upstream 0.26.0,
+keeps it. The fork contains upstream changes up to August 20, 2026, and reports
+version `0.26.0b1`. Features from upstream 0.26.0 (released September 2, 2026),
 such as `cswap run --require-session`, are not in the fork yet.
 
 ### Update this Infinity installation

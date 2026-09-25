@@ -4,8 +4,8 @@ A Vision API key is the only credential or configuration a new user needs. With
 `VISION_API_KEY` set, or a key saved with `cswap --set-vision-token`, `cswap list`
 pulls the Claude accounts that Vision grants the key's owner. `cswap run` then
 launches native Claude with an access credential from Vision. No provider
-credential, `/login`, host registration, or configuration file is needed. For the
-install and first-run commands, see the
+credential, `/login`, host registration, or hand-written configuration file is
+needed. For the install and first-run commands, see the
 [README](../README.md#get-started-with-infinity-vision).
 
 Without an account argument, `cswap run` uses the enabled, use-authorized Claude
@@ -15,8 +15,9 @@ unchanged. Managed provider login uploads by default when Vision is configured.
 Existing-profile handoff is available through the migration commands in
 [vision-managed-logins.md](vision-managed-logins.md). Automatic recovery from
 provider authentication rejection requests a successor from Vision or selects
-another eligible account. Do not release this integration until the remaining
-client and deployment acceptance checks pass.
+another eligible account. On September 14, 2026, this wrapper launched and resumed
+native Claude on a fresh Linux EC2 client with only a Vision API key. Vision's
+[qualification evidence](https://github.com/Infinity-AI-Institute/vision/blob/main/docs/agent-accounts/qualification.md#live-launch-and-resume-evidence) records that run.
 
 The saved key is shared by both Infinity swap tools. Its file is
 `${XDG_CONFIG_HOME:-~/.config}/vision/credentials.json` (private directory and file).
@@ -138,7 +139,8 @@ of one live process. Another case rejects the first access token and verifies
 recovery without replacing the native process. A provider-429 case verifies
 account fallback within the same conversation. They check the bearer, conversation
 ID, retained message context, and absence of a local credential file. This does
-not establish live-provider or Linux acceptance.
+not establish live-provider or Linux acceptance. The live Linux run is recorded
+separately in Vision's [qualification evidence](https://github.com/Infinity-AI-Institute/vision/blob/main/docs/agent-accounts/qualification.md#live-launch-and-resume-evidence).
 
 `ManagedLoginHandoff` implements recoverable registration for dedicated profiles
 under `vision-logins/<profile-id>`. Its caller must keep the profile lease across
