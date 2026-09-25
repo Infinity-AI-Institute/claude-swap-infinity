@@ -1,0 +1,5 @@
+# Every PR into main needs an approving review from Luke (@Marviel).
+# The "main approval" repository ruleset enforces this by requiring
+# code-owner review. Only members of the swap-tools-approvers team (Luke)
+# may bypass the rule, on their own PRs, and never by direct push.
+*   @Marviel
