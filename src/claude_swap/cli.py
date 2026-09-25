@@ -880,6 +880,275 @@ Examples:
         sys.exit(130)
 
 
+def _codex_usage_lines(store) -> dict[int, list[str]]:
+    """Fetch usage for every codex slot, in parallel. Best-effort by design:
+    any failure becomes a dimmed "usage unavailable" line for that slot,
+    never a crash (the endpoint is undocumented and rate-limited)."""
+    import time as _time
+    from concurrent.futures import ThreadPoolExecutor
+
+    from claude_swap.codex_usage import CodexUsageError, fetch_usage_from_text
+
+    def _resets_in(resets_at: float | None) -> str:
+        if resets_at is None:
+            return ""
+        remaining = int(resets_at - _time.time())
+        if remaining <= 0:
+            return "  reset now"
+        days, rem = divmod(remaining, 86400)
+        hours, rem = divmod(rem, 3600)
+        minutes = rem // 60
+        if days:
+            return f"  resets in {days}d {hours}h"
+        if hours:
+            return f"  resets in {hours}h {minutes}m"
+        return f"  resets in {max(1, minutes)}m"
+
+    _, accounts = store.list_accounts()
+    slots = {a.number: store._slot_path(a.number) for a in accounts}
+
+    def _one(slot: int) -> list[str]:
+        try:
+            content = slots[slot].read_text(encoding="utf-8")
+            usage = fetch_usage_from_text(content)
+        except (CodexUsageError, OSError) as e:
+            reason = str(e) if isinstance(e, CodexUsageError) else "unreadable"
+            return [dimmed(f"usage unavailable ({reason})")]
+        lines = [
+            f"{w.label}: {w.pct:>3.0f}%{_resets_in(w.resets_at)}"
+            for w in usage.windows
+        ]
+        if usage.plan:
+            lines.insert(0, f"plan: {usage.plan}")
+        return lines or [dimmed("usage unavailable (no quota windows reported)")]
+
+    if not slots:
+        return {}
+    results: dict[int, list[str]] = {}
+    with ThreadPoolExecutor(max_workers=min(4, len(slots))) as pool:
+        for slot, lines in zip(slots, pool.map(_one, slots)):
+            results[slot] = lines
+    return results
+
+
+def _codex_command(argv: list[str]) -> None:
+    """Handle `cswap codex add|switch|list|status|remove|handoff|watch`.
+
+    Pre-dispatched before the main parser is built, like `run`/`auto` — the
+    codex namespace is self-contained and must not disturb the established
+    Claude flag interface. Account data lives in <backup-root>/codex/,
+    separate from the Claude accounts.
+    """
+    import time as _time
+
+    from claude_swap.codex_accounts import CodexAccountStore, resolve_codex_home
+    from claude_swap.codex_handoff import (
+        CodexHandoff,
+        HandoffBlocked,
+        build_handoff_config,
+        run_watch,
+    )
+    from claude_swap.settings import load_codex_settings
+
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} codex",
+        description=(
+            "Manage Codex CLI accounts (credentials: $CODEX_HOME/auth.json) "
+            "and hand a LIVE codex tmux session off to a fresh account. "
+            "Codex caches auth in memory at startup, so a live TUI never "
+            "picks up an on-disk swap — 'switch' takes effect on the next "
+            "codex start; 'handoff' warns the agent, stops the TUI, swaps, "
+            "and relaunches with 'codex resume' (full context preserved)."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Commands:
+  add [--slot N] [--label NAME]   snapshot the current login into a slot
+  switch [NUM|LABEL]              restore a slot as the live login (bare: rotate)
+  list                            show all slots with usage
+  status                          show which account is logged in
+  remove NUM|LABEL                remove a slot (live login untouched)
+  handoff [--if-needed]           rotate the live tmux session (codex.tmux_target)
+  watch                           poll usage and hand off when a wall is reached
+
+Exit codes for handoff:
+  0  handed off, or --if-needed found no handoff needed
+  1  error (config, tmux, usage fetch, TUI would not stop/boot)
+  3  blocked: no other slot with positive margin
+
+Examples:
+  cswap codex add
+  cswap codex switch 2
+  cswap config set codex.tmux_target 'agent:0.0'
+  cswap codex handoff --if-needed        # cron-friendly, idempotent
+  cswap codex handoff --dry-run
+  cswap codex watch
+        """,
+    )
+    parser.add_argument(
+        "command",
+        choices=("add", "switch", "list", "status", "remove", "handoff", "watch"),
+        help="Action to perform",
+    )
+    parser.add_argument(
+        "target",
+        nargs="?",
+        metavar="NUM|LABEL",
+        help="Account slot number or label (switch/remove)",
+    )
+    parser.add_argument("--slot", type=int, metavar="N", help="Slot number for 'add'")
+    parser.add_argument("--label", metavar="NAME", help="Display label for 'add'")
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON to stdout (with 'list' or 'status')",
+    )
+    parser.add_argument(
+        "--if-needed",
+        action="store_true",
+        help="Hand off only when the active account has reached a switch "
+        "wall; otherwise exit 0 (with 'handoff')",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the handoff plan (target slot, session id, pane) "
+        "without acting (with 'handoff')",
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+
+    if args.json and args.command not in ("list", "status"):
+        parser.error("--json can only be used with 'list' or 'status'")
+    if (args.if_needed or args.dry_run) and args.command != "handoff":
+        parser.error("--if-needed/--dry-run can only be used with 'handoff'")
+    if args.command == "remove" and not args.target:
+        parser.error("'remove' requires NUM|LABEL")
+    if args.command in ("handoff", "watch") and args.target:
+        parser.error(f"'{args.command}' takes no NUM|LABEL")
+
+    json_mode = args.json
+
+    def stamped(message: str) -> None:
+        print(f"{_time.strftime('%H:%M:%S')}  {message}", flush=True)
+
+    try:
+        backup_root = paths.get_backup_root()
+        codex_settings = load_codex_settings(backup_root)
+        store = CodexAccountStore(
+            backup_root, home=resolve_codex_home(codex_settings.home)
+        )
+
+        if args.command == "add":
+            slot, label = store.add(slot=args.slot, label=args.label)
+            print(f"{accent('Added')} Codex CLI account {slot} ({label})")
+        elif args.command == "switch":
+            slot, label = store.switch(args.target)
+            print(f"{accent('Switched to')} Codex CLI account {slot} ({label})")
+            print(
+                dimmed(
+                    "codex caches auth in memory: a running TUI keeps the old "
+                    "login until restarted (use 'cswap codex handoff' to "
+                    "rotate a live session)."
+                )
+            )
+        elif args.command == "remove":
+            slot, label = store.remove(args.target)
+            print(f"{accent('Removed')} Codex CLI account {slot} ({label})")
+        elif args.command == "status":
+            slot, label = store.status()
+            if json_mode:
+                print(
+                    json.dumps(
+                        {
+                            "schemaVersion": 1,
+                            "tool": "codex",
+                            "activeAccountNumber": slot,
+                            "label": label,
+                        },
+                        indent=2,
+                    )
+                )
+            elif slot is None:
+                print(f"Codex CLI: {label}")
+            else:
+                print(f"Codex CLI: account {slot} ({label}) {accent('[active]')}")
+        elif args.command == "list":
+            live_slot, accounts = store.list_accounts()
+            if json_mode:
+                usage_by_slot = _codex_usage_lines(store)
+                print(
+                    json.dumps(
+                        {
+                            "schemaVersion": 1,
+                            "tool": "codex",
+                            "activeAccountNumber": live_slot,
+                            "accounts": [
+                                {
+                                    "number": a.number,
+                                    "label": a.label,
+                                    "active": a.active,
+                                    "usage": usage_by_slot.get(a.number, []),
+                                }
+                                for a in accounts
+                            ],
+                        },
+                        indent=2,
+                    )
+                )
+            else:
+                if not accounts:
+                    print(
+                        dimmed(
+                            "No Codex CLI accounts stored. Log in with "
+                            "'codex', then run 'cswap codex add'."
+                        )
+                    )
+                    return
+                print(bolded("Codex CLI accounts:"))
+                usage_by_slot = _codex_usage_lines(store)
+                for a in accounts:
+                    marker = f" {accent('[active]')}" if a.active else ""
+                    print(f"  {a.number}: {a.label}{marker}")
+                    lines = usage_by_slot.get(a.number, [])
+                    for j, line in enumerate(lines):
+                        branch = "└" if j == len(lines) - 1 else "├"
+                        print(f"    {dimmed(branch)} {line}")
+        elif args.command in ("handoff", "watch"):
+            config = build_handoff_config(backup_root)
+            handoff = CodexHandoff(store, config, emit=stamped)
+            if args.command == "handoff":
+                try:
+                    sys.exit(
+                        handoff.execute(
+                            if_needed=args.if_needed, dry_run=args.dry_run
+                        )
+                    )
+                except HandoffBlocked as e:
+                    error(f"Error: {e}")
+                    sys.exit(3)
+            else:
+                stamped(
+                    f"codex watch running: every {config.poll_interval_s}s, "
+                    f"handoff at threshold {config.threshold:.0f}%"
+                    f"{f' with walls {config.window_thresholds}' if config.window_thresholds else ''}"
+                    " — Ctrl-C to stop"
+                )
+                sys.exit(run_watch(handoff))
+    except ClaudeSwitchError as e:
+        if json_mode:
+            print(json.dumps(error_envelope(e), indent=2))
+        else:
+            error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(
+            f"\n{dimmed('Operation cancelled')}",
+            file=sys.stderr if json_mode else sys.stdout,
+        )
+        sys.exit(130)
+
+
 def _use_native_tls() -> None:
     """Route TLS trust decisions through the OS-native verifier.
 
@@ -943,6 +1212,10 @@ def main() -> None:
     if argv and argv[0] == "auto":
         _auto_command(argv[1:])
         return  # only reachable in tests where sys.exit is mocked
+    # Codex CLI accounts + live-session handoff (separate account store).
+    if argv and argv[0] == "codex":
+        _codex_command(argv[1:])
+        return
     if len(sys.argv) > 1 and sys.argv[1] == "config":
         _config_command(sys.argv[2:])
         return
@@ -1016,6 +1289,10 @@ Commands:
   %(prog)s vision --help              all Vision account commands
   %(prog)s upgrade                    self-upgrade to latest
   %(prog)s purge                      remove all claude-swap data
+
+Codex CLI (separate account store):
+  %(prog)s codex add|switch|list|status|remove   manage Codex CLI accounts
+  %(prog)s codex handoff|watch                   rotate a LIVE codex tmux session
 
 Aliases: ls=list  rm=remove  update=upgrade""",
         formatter_class=argparse.RawDescriptionHelpFormatter,
