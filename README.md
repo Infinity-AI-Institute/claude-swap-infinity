@@ -81,6 +81,40 @@ cswap vision account-login work
 cswap run work
 ```
 
+### When no Vision account can serve
+
+`cswap run` checks your Vision accounts before it starts Claude. If every account
+is at a usage limit, disabled, or not granted, it uses a Claude login that this
+machine already has, and prints a warning on stderr that names it. It tries these
+logins in order:
+
+1. The login that plain `claude` uses on this machine.
+2. The first enabled local (non-Vision) cswap account, in `cswap list` order.
+
+cswap never falls back to an API key, including `ANTHROPIC_API_KEY`, because API
+usage is billed per token. The fallback removes `ANTHROPIC_API_KEY` and Claude's
+other credential variables from Claude's environment.
+
+If this machine has no login to fall back to, `cswap run` exits with code **75**
+before Claude starts. The message names each Vision account, why it cannot serve,
+and when its usage window resets (in UTC, with the time remaining). Scripts can
+test for the code:
+
+```bash
+cswap run -- -p "$PROMPT"
+if [ $? -eq 75 ]; then
+  echo "No Claude login can serve now; wait for the reset or use another provider." >&2
+fi
+```
+
+Code 75 comes only from this check. After Claude starts, `cswap run` exits with
+Claude's own exit code. A launch without `--model` checks the 5-hour and 7-day
+windows. With `--model`, it also checks that model's weekly window.
+
+If the accounts run out while Claude is running, Claude's next request fails at
+once with the same explanation instead of retrying. To keep working, exit and run
+`cswap run` again so it can fall back to a local login.
+
 ### Replace an upstream install
 
 The `claude-swap` package on PyPI and the `realiti4/claude-swap` repository are the
