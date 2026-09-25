@@ -128,6 +128,8 @@ deployment, set `VISION_API_URL` before you save its key.
 
 For browser sign-in, local-only accounts, and recovery, see the
 [Vision guide](docs/VISION.md) and [managed login guide](docs/vision-managed-logins.md).
+For where the key and provider tokens are stored, how Claude receives access
+tokens, and who refreshes them, see [How tokens work](docs/token-lifecycle.md).
 The local-account commands below are optional for Vision users.
 
 ## Usage
