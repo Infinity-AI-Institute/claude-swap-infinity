@@ -1,6 +1,7 @@
 """Managed login commands exercise the real local handoff with synthetic stores."""
 
 import json
+import re
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -340,3 +341,22 @@ def test_unconfigured_provider_login_discloses_local_only(setup, monkeypatch, ca
     assert "Vision is not configured; this login stays local" in disclosure
     assert "auto-register off" in disclosure
     client.request.assert_not_called()
+
+
+def test_vision_help_describes_each_command(capsys):
+    """`cswap vision --help` must say what each command does, not only list names."""
+    with pytest.raises(SystemExit) as exited:
+        run_command(["--help"], None)
+    assert exited.value.code == 0
+    out = capsys.readouterr().out
+    for command in (
+        "login",
+        "status",
+        "account-login",
+        "account-run",
+        "upload",
+        "auto-register",
+        "existing-logins",
+        "migrate-login",
+    ):
+        assert re.search(rf"^ +{command} +\S", out, re.M), command
