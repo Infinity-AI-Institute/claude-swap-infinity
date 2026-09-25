@@ -253,7 +253,13 @@ class TestRunSelfUpgrade:
         err = capsys.readouterr().err
         assert "uv tool upgrade claude-swap" in err
         assert "pipx upgrade claude-swap" in err
-        assert "pip install --upgrade claude-swap" in err
+        # The PyPI package is upstream and has no Vision support; a manual
+        # upgrade must stay on this fork.
+        assert (
+            "claude-swap @ git+https://github.com/Infinity-AI-Institute/claude-swap-infinity"
+            in err
+        )
+        assert "pip install --upgrade claude-swap\n" not in err
 
     @patch(
         "claude_swap.update_check.subprocess.run", side_effect=FileNotFoundError
@@ -294,4 +300,10 @@ class TestRunSelfUpgradeWindows:
         err = capsys.readouterr().err
         assert "uv tool upgrade claude-swap" in err
         assert "pipx upgrade claude-swap" in err
-        assert "pip install --upgrade claude-swap" in err
+        # The PyPI package is upstream and has no Vision support; a manual
+        # upgrade must stay on this fork.
+        assert (
+            "claude-swap @ git+https://github.com/Infinity-AI-Institute/claude-swap-infinity"
+            in err
+        )
+        assert "pip install --upgrade claude-swap\n" not in err
