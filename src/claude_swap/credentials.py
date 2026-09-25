@@ -108,16 +108,27 @@ def _active_oauth_keychain_services() -> list[str]:
 
 
 def _active_managed_keychain_services() -> list[str]:
-    """Claude uses the same profile hash for OAuth and legacy API-key entries.
+    """Keychain services holding the managed API key for the active environment.
 
-    Source contract: getMacOsKeychainStorageServiceName(serviceSuffix) in
-    claude-code/src/utils/secureStorage/macOsKeychainHelpers.ts. The OAuth
-    suffix is '-credentials'; the managed-key suffix is empty.
+    Claude derives both of its items from one function,
+    ``getMacOsKeychainStorageServiceName(serviceSuffix)`` in
+    ``src/utils/secureStorage/macOsKeychainHelpers.ts``: ``"Claude Code"`` +
+    ``serviceSuffix`` + the profile hash (empty for the default store). The
+    OAuth item passes ``"-credentials"``; the managed ("/login" API key) item
+    passes nothing — its save, read and delete all call it bare (checked
+    against the Claude Code 2.1.283 bundle).
+
+    So each managed name is the matching OAuth name with that suffix removed,
+    and it inherits :func:`_active_oauth_keychain_services`'s profile
+    selection and try-order: a custom profile never resolves to the default
+    profile's unsuffixed ``"Claude Code"`` item.
     """
-    return [
-        service.replace("Claude Code-credentials", "Claude Code", 1)
-        for service in _active_oauth_keychain_services()
-    ]
+    services = []
+    for oauth_service in _active_oauth_keychain_services():
+        assert oauth_service.startswith(CLAUDE_CODE_KEYCHAIN_SERVICE), oauth_service
+        profile_hash_suffix = oauth_service[len(CLAUDE_CODE_KEYCHAIN_SERVICE):]
+        services.append(CLAUDE_CODE_MANAGED_KEYCHAIN_SERVICE + profile_hash_suffix)
+    return services
 
 
 # Service name for per-account backup credentials now managed via the ``security``
@@ -653,7 +664,8 @@ class CredentialStore:
             if text.strip():
                 return ActiveCredentials(text, False, keychain_failed)
 
-        # 3. Managed API key (Keychain "Claude Code" on macOS, then primaryApiKey).
+        # 3. Managed API key (this profile's Keychain item on macOS, then
+        #    primaryApiKey).
         key = self._read_managed_key()
         if key:
             return ActiveCredentials(key, False, keychain_failed)
@@ -664,13 +676,14 @@ class CredentialStore:
     def _read_managed_key(self) -> str:
         """Read the active managed API key, or "" when absent. Non-mutating.
 
-        macOS Keychain "Claude Code" (when usable) first, then ``~/.claude.json``
-        ``primaryApiKey`` — mirroring Claude Code's
-        ``getApiKeyFromConfigOrMacOSKeychain``.
+        The active profile's macOS Keychain managed-key item (when usable)
+        first, then ``~/.claude.json`` ``primaryApiKey`` — mirroring Claude
+        Code's ``getApiKeyFromConfigOrMacOSKeychain``.
 
-        OAuth and managed API keys share Claude's profile hash. Probe only
-        entries belonging to the selected secure-storage profile, then that
-        profile's configuration fallback.
+        The Keychain item carries the same profile hash as the OAuth item
+        (:func:`_active_managed_keychain_services`), so only the selected
+        secure-storage profile's own item is probed: the unsuffixed
+        "Claude Code" item answers only for the default store.
         """
         if self._use_keychain():
             for service in _active_managed_keychain_services():
@@ -802,10 +815,11 @@ class CredentialStore:
         clears the other so a stale credential can't shadow the switch.
 
         - **OAuth** → write the OAuth credential (see ``_write_oauth_credentials``),
-          then clear any managed key (Keychain "Claude Code" + ``primaryApiKey``;
-          ``approved`` left intact, as ``removeApiKey`` does).
+          then clear any managed key (the profile's managed-key Keychain item +
+          ``primaryApiKey``; ``approved`` left intact, as ``removeApiKey`` does).
         - **API key** → record ``key[-20:]`` in ``approved`` and store the key (macOS
-          Keychain "Claude Code" when usable, else ``~/.claude.json`` ``primaryApiKey``),
+          Keychain managed-key item of the active profile when usable, else
+          ``~/.claude.json`` ``primaryApiKey``),
           then clear the OAuth credential (Keychain item + ``.credentials.json``).
 
         Raises:
@@ -894,7 +908,8 @@ class CredentialStore:
     def _clear_managed_key(self) -> None:
         """Clear any active managed API key (Claude Code ``removeApiKey`` semantics).
 
-        Deletes the macOS Keychain "Claude Code" item (best-effort) and drops
+        Deletes the active profile's macOS Keychain managed-key item(s)
+        (best-effort; never another profile's) and drops
         ``primaryApiKey`` from ``~/.claude.json``. Leaves
         ``customApiKeyResponses.approved`` untouched — ``removeApiKey`` doesn't clear
         it either, and removing it would force recovering ``key[-20:]`` from the
