@@ -8,7 +8,11 @@ import os
 import sys
 
 from claude_swap import __version__, paths, printer
-from claude_swap.exceptions import ClaudeSwitchError
+from claude_swap.exceptions import (
+    EXIT_NO_USABLE_LOGIN,
+    ClaudeSwitchError,
+    NoUsableLogin,
+)
 from claude_swap.json_output import error_envelope
 from claude_swap.printer import (
     accent,
@@ -108,7 +112,8 @@ def _run_command(argv: list[str]) -> None:
 
     On POSIX this execs claude and never returns; on Windows it exits with
     claude's return code. Either way the post-dispatch update check in
-    main() is unreachable, which is intended.
+    main() is unreachable, which is intended. When no Claude login can serve
+    the launch, it exits EXIT_NO_USABLE_LOGIN (75) before claude starts.
     """
     # Everything after the first `--` is forwarded to claude verbatim.
     if "--" in argv:
@@ -211,6 +216,9 @@ Examples:
         manager.exec_default(
             tail, share=not args.no_share, share_history=args.share_history
         )
+    except NoUsableLogin as e:
+        error(f"Error: {e}")
+        sys.exit(EXIT_NO_USABLE_LOGIN)
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
         sys.exit(1)

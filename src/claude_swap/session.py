@@ -45,26 +45,30 @@ import sys
 import tempfile
 import time
 import unicodedata
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
 from claude_swap import macos_keychain
 from claude_swap.claude_locks import proper_lockfile
+from claude_swap.credentials import looks_like_api_key
 from claude_swap.exceptions import (
     ClaudeCodeLockTimeout,
     CredentialReadError,
+    NoUsableLogin,
     SessionError,
 )
 from claude_swap.fsutil import replace_with_retry
 from claude_swap.locking import FileLock
 from claude_swap.models import Platform
 from claude_swap.paths import get_default_global_config_path
-from claude_swap.printer import accent, dimmed, muted, warning
+from claude_swap.printer import accent, dimmed, muted, warning, yellowed
 from claude_swap.process_detection import ClaudeSession, scan_sessions
 from claude_swap.settings import atomic_write_json
 
 if TYPE_CHECKING:
     from claude_swap.switcher import ClaudeAccountSwitcher
+    from claude_swap.vision import VisionClient
 
 # Items mirrored from ~/.claude into session profiles when sharing is on.
 # Deliberately excludes anything account- or instance-scoped: plugins/,
@@ -491,6 +495,25 @@ def _probe_env(session_dir: Path) -> dict[str, str]:
     return env
 
 
+def requested_model(claude_args: list[str]) -> str | None:
+    """The model a launch asks native for with ``--model``, or None for its default."""
+    model = None
+    for index, argument in enumerate(claude_args):
+        if argument == "--model" and index + 1 < len(claude_args):
+            model = claude_args[index + 1]
+        elif argument.startswith("--model="):
+            model = argument.removeprefix("--model=")
+    return model
+
+
+@dataclass(frozen=True)
+class LocalFallback:
+    """A login on this machine that can stand in when Vision cannot serve."""
+
+    label: str
+    account_num: str | None = None  # None: native's own default login
+
+
 class SessionManager:
     """Bootstraps per-account session profiles and launches Claude into them."""
 
@@ -509,11 +532,7 @@ class SessionManager:
         share_history: bool = False,
     ) -> NoReturn:
         """Launch Claude Code as the given account in the current terminal."""
-        claude_bin = shutil.which("claude")
-        if not claude_bin:
-            raise SessionError(
-                "'claude' was not found on PATH. Install Claude Code first."
-            )
+        claude_bin = self._require_claude_bin()
 
         self.switcher.warn_about_vision_roster(self.switcher.sync_vision_accounts())
         account_num, email, org_uuid = self.switcher.resolve_account(identifier)
@@ -531,6 +550,9 @@ class SessionManager:
                 client,
                 share=share,
                 share_history=share_history,
+            )
+            self._ensure_vision_can_serve(
+                client, remote, claude_args, share=share, share_history=share_history
             )
             print(
                 f"{accent('Launching')} Account-{account_num} ({email}) "
@@ -624,18 +646,135 @@ class SessionManager:
                         str(number), claude_args, share=share, share_history=share_history
                     )
                     return  # Only reachable when the native handoff is mocked.
-            raise SessionError(
-                "No enabled Claude account is authorized through Vision. Ask a "
-                "Vision admin to grant you use of an account, or run "
-                "cswap enable for one you disabled."
+            self._fall_back_from_vision(
+                NoUsableLogin(
+                    "No enabled Claude account is authorized through Vision. Ask "
+                    "a Vision admin to grant you use of an account, or run "
+                    "cswap enable for one you disabled."
+                ),
+                claude_args,
+                share=share,
+                share_history=share_history,
             )
 
+        self._exec(self._require_claude_bin(), claude_args, env=dict(os.environ))
+
+    def _ensure_vision_can_serve(
+        self,
+        client: VisionClient,
+        record: dict,
+        claude_args: list[str],
+        *,
+        share: bool,
+        share_history: bool,
+    ) -> None:
+        """Return when the Vision pool can serve this launch; else fall back or fail.
+
+        Without this check a spent pool still starts native, and the adapter's
+        per-request refusals are all native gets to see.
+        """
+        from claude_swap.vision import VisionError
+        from claude_swap.vision_pool import CentralPoolCredential, NoCentralQuota
+
+        pool = CentralPoolCredential(self.switcher, client, record)
+        try:
+            pool.check_launch(model=requested_model(claude_args))
+        except NoCentralQuota as unavailable:
+            self._fall_back_from_vision(
+                unavailable, claude_args, share=share, share_history=share_history
+            )
+        except VisionError as error:
+            # A registry outage is not evidence that the pool is spent. Launch
+            # as before this check existed; the adapter still refuses requests
+            # it cannot serve, and the roster warning already named the outage.
+            self._logger.debug("Vision launch check unavailable: %s", error.code)
+
+    def _fall_back_from_vision(
+        self,
+        unavailable: NoUsableLogin,
+        claude_args: list[str],
+        *,
+        share: bool,
+        share_history: bool,
+    ) -> NoReturn:
+        """Launch this machine's own login in Vision's place, or fail saying why.
+
+        Only logins stored on this machine qualify, and never an API key: API
+        usage is billed per token. Credentials exported in the environment are
+        neither a fallback nor passed to the fallback launch.
+        """
+        auth_env = [name for name in AUTH_OVERRIDE_ENV_VARS if os.environ.get(name)]
+        fallback = self._find_local_fallback()
+        if fallback is None:
+            advice = (
+                "No local Claude login was found to fall back to. Wait for the "
+                "reset, ask a Vision admin for another account, or log in with "
+                "native Claude (`claude`, then /login) so `cswap run` can fall "
+                "back to it."
+            )
+            if auth_env:
+                advice += (
+                    f" cswap does not fall back to credentials from the "
+                    f"environment ({', '.join(auth_env)}); run `claude` directly "
+                    "to use them."
+                )
+            raise NoUsableLogin(
+                f"{unavailable}\n{advice}",
+                retry_after_seconds=unavailable.retry_after_seconds,
+            )
+        notice = f"{unavailable}\nFalling back to {fallback.label}."
+        if auth_env and fallback.account_num is None:
+            notice += f" Ignoring {', '.join(auth_env)} for this launch."
+        # stderr: with `claude -p`, stdout belongs to native's answer.
+        print(yellowed(notice), file=sys.stderr)
+        if fallback.account_num is not None:
+            self.run(
+                fallback.account_num,
+                claude_args,
+                share=share,
+                share_history=share_history,
+            )
+            raise AssertionError("unreachable")
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if key not in AUTH_OVERRIDE_ENV_VARS
+        }
+        self._exec(self._require_claude_bin(), claude_args, env=env)
+
+    def _find_local_fallback(self) -> LocalFallback | None:
+        """This machine's own subscription login, if it has one.
+
+        Native's default login comes first: it is what plain `claude` would
+        use. Then the first enabled, non-Vision cswap account in roster order.
+        Quota is not checked here; native reports a spent local account itself.
+        """
+        native = self.switcher._read_credentials()
+        if native and not looks_like_api_key(native):
+            identity = self.switcher._get_current_account()
+            name = f" ({identity[0]})" if identity else ""
+            return LocalFallback(f"this machine's native Claude login{name}")
+        with FileLock(self.switcher.lock_file):
+            roster = self.switcher._get_sequence_data() or {}
+        accounts = roster.get("accounts", {})
+        for number in roster.get("sequence", []):
+            row = accounts.get(str(number), {})
+            if row.get("source") == "vision" or row.get("disabled", False):
+                continue
+            if self.switcher._account_kind(str(number)) == "api_key":
+                continue
+            return LocalFallback(
+                f"local cswap account {number} ({row.get('email', '')})", str(number)
+            )
+        return None
+
+    def _require_claude_bin(self) -> str:
         claude_bin = shutil.which("claude")
         if not claude_bin:
             raise SessionError(
                 "'claude' was not found on PATH. Install Claude Code first."
             )
-        self._exec(claude_bin, claude_args, env=dict(os.environ))
+        return claude_bin
 
     def _exec(self, claude_bin: str, claude_args: list[str], env: dict[str, str]) -> NoReturn:
         """Hand the terminal over to claude. Never returns.

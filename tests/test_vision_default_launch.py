@@ -4,7 +4,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from claude_swap.exceptions import ClaudeSwitchError, SessionError
+from claude_swap.exceptions import ClaudeSwitchError, NoUsableLogin, SessionError
 from claude_swap.session import SessionManager
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.vision import VisionClient, VisionError
@@ -50,10 +50,12 @@ def test_disabled_account_is_skipped(setup):
     manager.run.assert_called_once_with("2", [], share=True, share_history=False)
 
 
-def test_empty_authorized_pool_does_not_fall_back_to_provider_login(setup):
+def test_empty_authorized_pool_without_a_local_login_launches_nothing(setup):
+    # With a local login, an empty pool falls back to it instead; see
+    # test_vision_pool_exhaustion.py.
     manager, client = setup
     client.discover.return_value = []
-    with pytest.raises(SessionError, match="authorized through Vision"):
+    with pytest.raises(NoUsableLogin, match="authorized through Vision"):
         manager.exec_default([])
     manager.run.assert_not_called()
     manager._exec.assert_not_called()

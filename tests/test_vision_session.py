@@ -175,6 +175,20 @@ def test_remote_run_bypasses_local_bootstrap_and_preserves_resume_arguments(
     manager.switcher.sync_vision_accounts = Mock(
         return_value=RosterSync(url=registry.url)
     )
+    # The launch check reads membership and usage; no readings keeps the login.
+    registry.discover = Mock(
+        return_value=[
+            {
+                "account_id": record["visionAccountId"],
+                "login_id": record["visionLoginId"],
+                "email": record["email"],
+                "organization_id": record["organizationUuid"],
+                "subscription": {},
+                "login_generation": 4,
+            }
+        ]
+    )
+    monkeypatch.setattr("claude_swap.vision_pool.read_usage", lambda *_a, **_k: {})
     monkeypatch.setattr("claude_swap.vision.configured_client", lambda: registry)
     monkeypatch.setattr(
         "claude_swap.session.shutil.which", lambda _: "/synthetic/claude"
