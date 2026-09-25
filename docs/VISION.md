@@ -116,6 +116,20 @@ reset, and a message naming each login and why it cannot serve. Native Claude
 it retried the 503 ten times, for about three minutes, before failing with a
 generic message.
 
+The same selection runs once before native starts. A launch refuses to start
+native on a pool that cannot serve it. Without `--model`, that check counts only
+the 5-hour and 7-day windows and any `autoswitch.model` names, because native
+chooses its own default model. It issues no credential and does not change the
+selected login. When the pool cannot serve, or Vision grants no enabled account,
+`cswap run` falls back to this machine's own subscription login with a stderr
+warning. It tries native's default login first, then the first enabled local
+OAuth account in roster order. Credentials from the environment
+(`ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN` and the like) are removed from the
+fallback launch and are never a fallback themselves. With nothing to fall back to,
+`cswap run` exits 75 (`EX_TEMPFAIL`) before native starts. If the check cannot
+reach Vision, native starts as it did before the check existed. Registry and
+credential errors never trigger a fallback.
+
 An explicit provider 401 can trigger one replay before any response is sent to
 native. Recovery accepts only a newer central generation with a different token.
 It respects the server's refresh scheduling and does not refresh subscription-only
