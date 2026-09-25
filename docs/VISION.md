@@ -109,7 +109,13 @@ including when membership is still within its 30-second discovery cache. Unknown
 or stale observations never qualify a new account. If observations are unavailable,
 the existing authorized login may continue; the client does not infer spare quota
 from a failed observation. If the current account is known exhausted and no eligible
-account has known headroom, the adapter returns an error before provider inference.
+account has known headroom, the adapter answers before provider inference with a
+503 that carries `x-should-retry: false`, a `Retry-After` for the earliest known
+reset, and a message naming each login and why it cannot serve. Native Claude
+(2.1.283) then fails the turn at once and shows that message. Without the header
+it retried the 503 ten times, for about three minutes, before failing with a
+generic message.
+
 An explicit provider 401 can trigger one replay before any response is sent to
 native. Recovery accepts only a newer central generation with a different token.
 It respects the server's refresh scheduling and does not refresh subscription-only

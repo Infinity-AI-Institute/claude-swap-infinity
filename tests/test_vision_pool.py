@@ -10,7 +10,12 @@ from claude_swap.settings import AutoSwitchSettings
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.usage_store import UsageEntry
 from claude_swap.vision import VisionClient, VisionError
-from claude_swap.vision_pool import CentralPoolCredential, request_models, retry_delay
+from claude_swap.vision_pool import (
+    CentralPoolCredential,
+    NoCentralQuota,
+    request_models,
+    retry_delay,
+)
 
 NOW = 1_800_000_000.0
 
@@ -155,6 +160,38 @@ def test_no_known_quota_fails_without_provider_request(setup):
         observations[item(index)["login_id"]] = observation(index, 100)
     with pytest.raises(SessionError, match="known quota"):
         pool.get()
+    client.credential.assert_not_called()
+
+
+def test_spent_pool_explains_each_login_and_when_one_returns(setup):
+    pool, switcher, _, observations, _, _ = setup
+    pool.pool.sync()
+    data = switcher._get_sequence_data()
+    data["accounts"]["2"]["disabled"] = True
+    switcher._write_json(switcher.sequence_file, data)
+    observations[item(1)["login_id"]] = observation(1, 100, reset=900)
+    del observations[item(3)["login_id"]]
+    with pytest.raises(NoCentralQuota) as refused:
+        pool.get()
+    reasons = {login.email: login.reason for login in refused.value.logins}
+    assert reasons == {
+        "user1@example.invalid": (
+            "5h window at 100% and 7d window at 100%, "
+            "resets 2027-01-15 08:15 UTC, in 15m"
+        ),
+        "user2@example.invalid": "disabled here; `cswap enable 2` re-enables it",
+        "user3@example.invalid": "no current usage reading to select it on",
+    }
+    assert refused.value.available_at == NOW + 900
+    assert refused.value.retry_after_seconds == 900
+    assert "user2@example.invalid" in str(refused.value)
+
+
+def test_launch_check_neither_issues_a_credential_nor_switches(setup):
+    pool, _, client, _, _, _ = setup
+    pool.check_launch()
+    assert pool.current == item(1)["login_id"]
+    assert pool.last_switch is None
     client.credential.assert_not_called()
 
 
