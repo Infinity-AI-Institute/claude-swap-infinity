@@ -17,7 +17,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from claude_swap.exceptions import ClaudeSwitchError, SessionError
+from claude_swap.exceptions import ClaudeSwitchError, NoUsableLogin, SessionError
 from claude_swap.vision import VisionError
 from claude_swap.vision_session import acquire_credential, recover_rejected_credential
 
@@ -38,6 +38,12 @@ RESPONSE_HEADERS = {
     "request-id",
     "retry-after",
 }
+# Appended to the pool's explanation when no Vision login can serve a request.
+# The launch check falls back to a local login, so relaunching is the way out.
+NO_USABLE_LOGIN_ADVICE = (
+    "Exit and rerun `cswap run` to use this machine's own Claude login if it "
+    "has one, or wait for the reset."
+)
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -117,7 +123,7 @@ class InferenceProxy:
             def log_message(self, *_args):
                 pass
 
-            def _error(self, status, message, retry_after=None):
+            def _error(self, status, message, retry_after=None, *, retryable=True):
                 body = json.dumps(
                     {
                         "type": "error",
@@ -130,10 +136,24 @@ class InferenceProxy:
                 self.send_header("Cache-Control", "no-store")
                 if retry_after is not None:
                     self.send_header("Retry-After", str(retry_after))
+                if not retryable:
+                    # The Anthropic SDK and native Claude honor this header.
+                    # Without it, native retries a 503 ten times (about three
+                    # minutes in Claude 2.1.283) before showing the message.
+                    self.send_header("x-should-retry", "false")
                 self.send_header("Connection", "close")
                 self.end_headers()
                 self.close_connection = True
                 self.wfile.write(body)
+
+            def _no_usable_login(self, error):
+                """Fail native's turn at once with why no login can serve."""
+                self._error(
+                    503,
+                    f"cswap: {error} {NO_USABLE_LOGIN_ADVICE}",
+                    error.retry_after_seconds,
+                    retryable=False,
+                )
 
             def do_POST(self):
                 self.connection.settimeout(30)
@@ -182,6 +202,9 @@ class InferenceProxy:
                     return
                 try:
                     credential = proxy.credentials.get(model=model)
+                except NoUsableLogin as error:
+                    self._no_usable_login(error)
+                    return
                 except VisionError as error:
                     status = error.status if error.status in {401, 403, 429} else 503
                     self._error(
@@ -267,6 +290,8 @@ class InferenceProxy:
                         "Central credential recovery is unavailable.",
                         error.retry_after_seconds,
                     )
+                except NoUsableLogin as error:
+                    self._no_usable_login(error)
                 except ClaudeSwitchError:
                     self._error(503, "No central login is available for recovery.")
                 except (urllib.error.URLError, TimeoutError):

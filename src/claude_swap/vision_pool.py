@@ -5,12 +5,20 @@ from __future__ import annotations
 import math
 import threading
 import time
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 
 from claude_swap.autoswitch import rank_candidates
-from claude_swap.exceptions import ConfigError, SessionError
+from claude_swap.exceptions import ConfigError, NoUsableLogin
 from claude_swap.locking import FileLock
-from claude_swap.oauth import account_headroom, switch_margin
+from claude_swap.oauth import (
+    account_headroom,
+    format_countdown,
+    relevant_windows,
+    switch_margin,
+)
+from claude_swap.poll_policy import limiting_reset_ts
 from claude_swap.settings import (
     load_settings,
     parse_model_names,
@@ -23,8 +31,72 @@ from claude_swap.vision_session import recover_rejected_credential
 from claude_swap.vision_usage import read_usage
 
 
-class NoCentralQuota(SessionError):
-    """No enabled account can be selected using current quota evidence."""
+@dataclass(frozen=True)
+class IneligibleLogin:
+    """One Vision login that cannot serve now, why, and when it may again."""
+
+    email: str
+    reason: str
+    available_at: float | None = None  # UTC epoch seconds; None when unknown
+
+
+class NoCentralQuota(NoUsableLogin):
+    """No enabled account can be selected using current quota evidence.
+
+    The message names every Vision login and why it cannot serve, so both the
+    launcher and native (through the adapter's error body) can say what to do.
+    """
+
+    def __init__(self, logins: list[IneligibleLogin], *, now: float):
+        self.logins = tuple(logins)
+        known = [
+            login.available_at
+            for login in self.logins
+            if login.available_at is not None
+        ]
+        self.available_at = min(known, default=None)
+        retry_after = None
+        if self.available_at is not None:
+            retry_after = max(1, math.ceil(self.available_at - now))
+        super().__init__(
+            describe_ineligible(self.logins, self.available_at, now),
+            retry_after_seconds=retry_after,
+        )
+
+
+def describe_moment(timestamp: float, now: float) -> str:
+    """An absolute UTC time plus the wait, e.g. "2026-09-26 01:29 UTC, in 1h 52m"."""
+    clock = datetime.fromtimestamp(timestamp, UTC).strftime("%Y-%m-%d %H:%M")
+    return f"{clock} UTC, in {format_countdown(timestamp - now)}"
+
+
+def describe_ineligible(
+    logins: tuple[IneligibleLogin, ...], available_at: float | None, now: float
+) -> str:
+    if not logins:
+        return "Vision authorizes no Claude account for this key."
+    details = "; ".join(f"{login.email} ({login.reason})" for login in logins)
+    message = f"No Vision Claude account has known quota available: {details}."
+    if len(logins) > 1 and available_at is not None:
+        message += f" Earliest reset: {describe_moment(available_at, now)}."
+    return message
+
+
+def spent_login(row: dict, usage: dict | None, models, now: float) -> IneligibleLogin:
+    """Why a roster login with no known headroom cannot be selected."""
+    email = row.get("email", "")
+    if account_headroom(usage, models) is None:
+        return IneligibleLogin(email, "no current usage reading to select it on")
+    full = [
+        f"{label} window at {pct:.0f}%"
+        for label, pct, _ in relevant_windows(usage, models)
+        if pct >= 100
+    ]
+    reason = " and ".join(full)
+    available_at = limiting_reset_ts(usage, models)
+    if available_at is not None:
+        reason += f", resets {describe_moment(available_at, now)}"
+    return IneligibleLogin(email, reason, available_at)
 
 
 def retry_delay(value, now):
@@ -59,6 +131,19 @@ def request_models(model, configured):
     return tuple(sorted(names))
 
 
+def launch_models(model, configured):
+    """Windows a launch must clear before native starts.
+
+    With ``--model``, the same windows its requests will use. Without it,
+    native picks its own default model, so only the account-wide windows and
+    any configured models count: one model's weekly limit must not refuse a
+    launch that other models could still serve.
+    """
+    if model:
+        return request_models(model, configured)
+    return tuple(sorted(parse_model_names(configured)))
+
+
 class CentralPoolCredential:
     def __init__(self, switcher, client, record, *, clock=time.time):
         self.switcher = switcher
@@ -72,6 +157,7 @@ class CentralPoolCredential:
         self.rate_limits = {}
 
     def _records(self):
+        """Selectable Vision rows by login, and why every other one is not."""
         self.pool.sync()
         with FileLock(self.switcher.lock_file):
             data = self.switcher._get_sequence_data() or {}
@@ -80,6 +166,8 @@ class CentralPoolCredential:
         if not isinstance(accounts, dict) or not isinstance(sequence, list):
             raise ConfigError("The account roster needs repair.")
         records = {}
+        excluded = []
+        now = self.clock()
         # Preserve the user's sequence as the ranking tie-breaker. The complete
         # central discovery owns membership; local rows never enter this pool.
         for number in sequence:
@@ -90,30 +178,70 @@ class CentralPoolCredential:
                 raise ConfigError("The account roster needs repair.")
             if row.get("source") != "vision" or row.get("visionUrl") != self.client.url:
                 continue
-            if self.rate_limits.get(row["visionAccountId"], 0) > self.clock():
+            email = row.get("email", "")
+            limited_until = self.rate_limits.get(row["visionAccountId"], 0)
+            if limited_until > now:
+                excluded.append(
+                    IneligibleLogin(
+                        email,
+                        "rate-limited by the provider until "
+                        + describe_moment(limited_until, now),
+                        limited_until,
+                    )
+                )
                 continue
             login = row["visionLoginId"]
             rejected = self.rejected.get(login)
             if rejected is not None:
                 generation, retry_at = rejected
-                if (
-                    row.get("visionGeneration", 0) <= generation
-                    and self.clock() < retry_at
-                ):
+                if row.get("visionGeneration", 0) <= generation and now < retry_at:
+                    excluded.append(
+                        IneligibleLogin(
+                            email,
+                            "credential rejected by the provider; retrying "
+                            + describe_moment(retry_at, now),
+                            retry_at,
+                        )
+                    )
                     continue
                 del self.rejected[login]
-            if not row.get("disabled", False):
-                records[login] = row
-        return records
+            if row.get("disabled", False):
+                excluded.append(
+                    IneligibleLogin(
+                        email, f"disabled here; `cswap enable {number}` re-enables it"
+                    )
+                )
+                continue
+            records[login] = row
+        return records, excluded
 
     def get(self, *, model=None):
         with self.lock:
-            records = self._records()
-            if not records:
-                self._unavailable("No enabled central Claude login is available.")
+            record, now = self._select(model, request_models)
+            credential = CentralCredential(self.client, record).get(model=model)
+            selected = record["visionLoginId"]
+            if selected != self.current:
+                self.current = selected
+                self.last_switch = now
+            return credential
+
+    def check_launch(self, *, model=None):
+        """Raise NoCentralQuota when no login could serve native's first request.
+
+        Selection only: no credential is issued and the current login is kept,
+        so a launch that passes behaves exactly as it did without the check.
+        """
+        self._select(model, launch_models)
+
+    def _select(self, model, window_models):
+        """The row to serve ``model`` with, or NoCentralQuota saying why none can."""
+        with self.lock:
+            records, excluded = self._records()
             now = self.clock()
+            if not records:
+                self._unavailable(excluded, now)
             settings = load_settings(self.switcher.backup_dir)
-            models = request_models(model, settings.model)
+            models = window_models(model, settings.model)
             try:
                 walls = parse_window_thresholds(settings.thresholds)
             except ValueError:
@@ -187,16 +315,14 @@ class CentralPoolCredential:
                 )
             selected = ordered[0] if ordered else self.current
             if selected not in records or (forced and not ordered):
-                self._unavailable(
-                    "No enabled central Claude login has known quota available."
-                )
-            credential = CentralCredential(self.client, records[selected]).get(
-                model=model
-            )
-            if selected != self.current:
-                self.current = selected
-                self.last_switch = now
-            return credential
+                # Reached only when the current login is spent or gone and no other
+                # has known headroom, so every remaining row is spent or unread.
+                spent = [
+                    spent_login(row, usage[login], models, now)
+                    for login, row in records.items()
+                ]
+                self._unavailable(excluded + spent, now)
+            return records[selected], now
 
     def recover(self, rejected, *, model=None):
         with self.lock:
@@ -212,8 +338,8 @@ class CentralPoolCredential:
             self.pool.sync(force=True)
             return self.get(model=model)
 
-    def _unavailable(self, message):
-        remaining = [deadline - self.clock() for deadline in self.rate_limits.values()]
+    def _unavailable(self, logins, now):
+        remaining = [deadline - now for deadline in self.rate_limits.values()]
         remaining = [delay for delay in remaining if delay > 0]
         if remaining:
             raise VisionError(
@@ -221,7 +347,7 @@ class CentralPoolCredential:
                 status=429,
                 retry_after_seconds=max(1, math.ceil(min(remaining))),
             )
-        raise NoCentralQuota(message)
+        raise NoCentralQuota(logins, now=now)
 
     def record_rate_limit(self, credential, retry_after):
         with self.lock:
