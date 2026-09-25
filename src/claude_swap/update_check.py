@@ -14,6 +14,9 @@ from claude_swap.cache import CACHE_DIR, MISSING, read_cache, write_cache
 CACHE_PATH = CACHE_DIR / "update_check.json"
 CACHE_TTL = 24 * 3600  # 24 hours
 PYPI_URL = "https://pypi.org/pypi/claude-swap/json"
+# This fork is not on PyPI; the `claude-swap` package there is upstream and has
+# no Vision support. Manual upgrade instructions must point here instead.
+FORK_SOURCE = "git+https://github.com/Infinity-AI-Institute/claude-swap-infinity"
 
 
 def _parse_version(v: str) -> tuple[int, ...]:
@@ -111,7 +114,7 @@ def run_self_upgrade() -> int:
             "To upgrade manually, run one of:\n"
             "  uv tool upgrade claude-swap\n"
             "  pipx upgrade claude-swap\n"
-            f"  {sys.executable} -m pip install --upgrade claude-swap\n"
+            f'  {sys.executable} -m pip install --upgrade "claude-swap @ {FORK_SOURCE}"\n'
             "If you installed with `pip install -e .`, use `git pull` instead."
         )
         return 1
