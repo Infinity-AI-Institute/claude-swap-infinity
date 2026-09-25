@@ -5,10 +5,12 @@ Production compatibility and rollout acceptance require their own live evidence.
 
 ## Use an existing Vision account
 
-After [one-time Vision setup](../README.md#get-started-with-infinity-vision), with an authorized Claude login in
-Vision, the wrapper discovers the pool automatically:
+A Vision API key is the only setup these clients need. After you
+[install the fork and set the key](../README.md#get-started-with-infinity-vision),
+pull and use the Claude accounts that Vision grants you:
 
 ```sh
+cswap list
 cswap run
 cswap run -- --resume CONVERSATION_ID
 ```
@@ -51,8 +53,9 @@ first.
 
 ## Transfer the login to Vision
 
+With a Vision API key configured:
+
 ```sh
-cswap vision login
 cswap vision upload personal
 cswap run personal
 ```
@@ -203,5 +206,6 @@ when its child exits. It does not replay an upstream request after an uncertain
 connection failure or replace credentials inside native storage.
 
 Pinned Claude 2.1.270 has completed two synthetic turns in one process with a
-central access-token change between turns and the same conversation ID. Automatic
-quota-driven account switching and in-session relogin recovery remain unfinished.
+central access-token change between turns and the same conversation ID. The same
+synthetic qualification covers quota-driven account switching and recovery from a
+rejected access token within one process. See [VISION.md](VISION.md).

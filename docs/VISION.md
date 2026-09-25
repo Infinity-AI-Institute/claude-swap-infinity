@@ -1,19 +1,24 @@
 # Vision account registry integration
 
-With Vision configured, `cswap run` discovers enabled, use-authorized Claude
-accounts and launches native Claude using an existing central credential. It does
-not require an explicit account, local provider credential, or `/login`. An
-explicit `cswap run ACCOUNT` or directory mapping still selects that account.
-Without Vision configuration, the existing local default launch is unchanged. Managed provider login now uploads by default when
-Vision is configured. Existing-profile handoff is available through the migration
-commands in [vision-managed-logins.md](vision-managed-logins.md). Automatic
-recovery from provider authentication rejection now requests a successor from
-Vision or selects another eligible account. Do not release this integration until
-the remaining client and deployment acceptance checks pass.
+A Vision API key is the only credential or configuration a new user needs. With
+`VISION_API_KEY` set, or a key saved with `cswap --set-vision-token`, `cswap list`
+pulls the Claude accounts that Vision grants the key's owner. `cswap run` then
+launches native Claude with an access credential from Vision. No provider
+credential, `/login`, host registration, or configuration file is needed. For the
+install and first-run commands, see the
+[README](../README.md#get-started-with-infinity-vision).
 
-For installation and the shortest setup, start with the [README](../README.md#get-started-with-infinity-vision).
-Run `cswap --set-vision-token` to enter your Vision API key privately and save it
-for both Infinity swap tools. The shared file is
+Without an account argument, `cswap run` uses the enabled, use-authorized Claude
+accounts. An explicit `cswap run ACCOUNT` or directory mapping still selects that
+account. Without Vision configuration, the existing local default launch is
+unchanged. Managed provider login uploads by default when Vision is configured.
+Existing-profile handoff is available through the migration commands in
+[vision-managed-logins.md](vision-managed-logins.md). Automatic recovery from
+provider authentication rejection requests a successor from Vision or selects
+another eligible account. Do not release this integration until the remaining
+client and deployment acceptance checks pass.
+
+The saved key is shared by both Infinity swap tools. Its file is
 `${XDG_CONFIG_HOME:-~/.config}/vision/credentials.json` (private directory and file).
 The key is bound to the URL saved with it. Configuration precedence is
 `VISION_API_KEY`, shared saved key, then this wrapper's browser sign-in.
@@ -35,6 +40,13 @@ aliases and disable preferences, and removes revoked remote rows. It refreshes
 membership at most once per 30 seconds for the same origin and API key, unless
 forced. A failed request preserves the roster, and a late response cannot overwrite
 a newer sync. Each remote row stores identity and subscription metadata only.
+
+If the sync fails, `cswap list`, `cswap run`, and `cswap run ACCOUNT` report
+Vision's error. For `unauthorized` and `not_permitted`, the error names the fix: a
+current API key, or access from a Vision admin. If there are no accounts to show,
+`cswap list` exits 1 with that error (a JSON error envelope with `--json`). It does
+not start the local first-run prompt. If Vision grants the key no Claude accounts
+and no other accounts exist, `cswap list` says so on stderr.
 
 Remote usage comes from Vision's usage worker. The client reads all pages before
 returning observations and matches each result to the registry origin, account ID
@@ -137,8 +149,9 @@ the original proof, and restores a cancelled grant without overwriting a newer
 login. An active or unreadable native session prevents handoff confirmation.
 
 The managed login CLI uses this backend. It does not inventory existing default
-profiles, portable backups or external Claude homes; those remain a
-separate required integration before this series is complete. A dedicated profile
+profiles, portable backups or external Claude homes. For those, use the
+`existing-logins` and `migrate-login` commands in
+[vision-managed-logins.md](vision-managed-logins.md). A dedicated profile
 must not be populated by copying an existing refresh-token backup into it.
 
 
