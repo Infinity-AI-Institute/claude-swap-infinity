@@ -39,10 +39,11 @@ RESPONSE_HEADERS = {
     "retry-after",
 }
 # Appended to the pool's explanation when no Vision login can serve a request.
-# The launch check falls back to a local login, so relaunching is the way out.
+# A launch that names no account falls back to a local login, so relaunching
+# that way is the way out.
 NO_USABLE_LOGIN_ADVICE = (
-    "Exit and rerun `cswap run` to use this machine's own Claude login if it "
-    "has one, or wait for the reset."
+    "Exit and rerun `cswap run` without naming an account to fall back to this "
+    "machine's own Claude login if it has one, or wait for the reset."
 )
 
 

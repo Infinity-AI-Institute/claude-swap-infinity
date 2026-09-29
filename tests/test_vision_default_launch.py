@@ -33,7 +33,10 @@ def test_empty_home_launch_discovers_account_without_login_or_explicit_selection
         manager.exec_default(arguments)
     assert exited.value.code == 0
     client.discover.assert_called_once()
-    manager.run.assert_called_once_with("1", arguments, share=True, share_history=False)
+    # cswap picked the account, so the launch may fall back if it cannot serve.
+    manager.run.assert_called_once_with(
+        "1", arguments, share=True, share_history=False, allow_fallback=True
+    )
     assert not list(manager.switcher.credentials_dir.glob("*"))
 
 
@@ -47,7 +50,9 @@ def test_disabled_account_is_skipped(setup):
     manager.switcher._write_json(manager.switcher.sequence_file, roster)
     with pytest.raises(SystemExit):
         manager.exec_default([])
-    manager.run.assert_called_once_with("2", [], share=True, share_history=False)
+    manager.run.assert_called_once_with(
+        "2", [], share=True, share_history=False, allow_fallback=True
+    )
 
 
 def test_empty_authorized_pool_without_a_local_login_launches_nothing(setup):
@@ -75,7 +80,7 @@ def test_automatic_selection_preserves_sharing_options(setup):
     with pytest.raises(SystemExit):
         manager.exec_default(["--continue"], share=False, share_history=True)
     manager.run.assert_called_once_with(
-        "1", ["--continue"], share=False, share_history=True
+        "1", ["--continue"], share=False, share_history=True, allow_fallback=True
     )
 
 

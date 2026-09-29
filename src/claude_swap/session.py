@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -54,21 +55,25 @@ from claude_swap.claude_locks import proper_lockfile
 from claude_swap.credentials import looks_like_api_key
 from claude_swap.exceptions import (
     ClaudeCodeLockTimeout,
+    ClaudeSwitchError,
     CredentialReadError,
     NoUsableLogin,
     SessionError,
 )
 from claude_swap.fsutil import replace_with_retry
+from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
 from claude_swap.locking import FileLock
 from claude_swap.models import Platform
+from claude_swap.oauth import account_headroom
 from claude_swap.paths import get_default_global_config_path
 from claude_swap.printer import accent, dimmed, muted, warning, yellowed
 from claude_swap.process_detection import ClaudeSession, scan_sessions
-from claude_swap.settings import atomic_write_json
+from claude_swap.settings import atomic_write_json, load_settings
 
 if TYPE_CHECKING:
     from claude_swap.switcher import ClaudeAccountSwitcher
     from claude_swap.vision import VisionClient
+    from claude_swap.vision_pool import IneligibleLogin, LaunchSelection
 
 # Items mirrored from ~/.claude into session profiles when sharing is on.
 # Deliberately excludes anything account- or instance-scoped: plugins/,
@@ -506,6 +511,19 @@ def requested_model(claude_args: list[str]) -> str | None:
     return model
 
 
+def _earliest_wait(
+    vision_wait: int | None, local: list[IneligibleLogin], now: float
+) -> int | None:
+    """Seconds until the earliest known reset across Vision and local logins."""
+    waits = [] if vision_wait is None else [vision_wait]
+    waits += [
+        max(1, math.ceil(login.available_at - now))
+        for login in local
+        if login.available_at is not None
+    ]
+    return min(waits, default=None)
+
+
 @dataclass(frozen=True)
 class LocalFallback:
     """A login on this machine that can stand in when Vision cannot serve."""
@@ -530,38 +548,33 @@ class SessionManager:
         claude_args: list[str],
         share: bool = True,
         share_history: bool = False,
+        *,
+        allow_fallback: bool = False,
     ) -> NoReturn:
-        """Launch Claude Code as the given account in the current terminal."""
+        """Launch Claude Code as the given account in the current terminal.
+
+        ``allow_fallback`` is for launches where cswap picked the account
+        itself (see exec_default): when that Vision account cannot serve, the
+        launch moves to another login and says so on stderr. An account the
+        user named, by argument or directory mapping, is never replaced by a
+        different login; the launch fails with the reason instead.
+        """
         claude_bin = self._require_claude_bin()
 
         self.switcher.warn_about_vision_roster(self.switcher.sync_vision_accounts())
         account_num, email, org_uuid = self.switcher.resolve_account(identifier)
         remote = self.switcher._vision_account_record(account_num)
         if remote is not None:
-            from claude_swap.vision import configured_client
-            from claude_swap.vision_proxy import run_native
-            from claude_swap.vision_session import prepare_launch
-
-            client = configured_client()
-
-            launch = prepare_launch(
-                self,
+            self._run_vision(
+                claude_bin,
+                account_num,
+                email,
                 remote,
-                client,
+                claude_args,
+                allow_fallback=allow_fallback,
                 share=share,
                 share_history=share_history,
             )
-            self._ensure_vision_can_serve(
-                client, remote, claude_args, share=share, share_history=share_history
-            )
-            print(
-                f"{accent('Launching')} Account-{account_num} ({email}) "
-                f"{muted('[Vision]')}"
-            )
-            run_native(
-                claude_bin, claude_args, launch, client, remote, switcher=self.switcher
-            )
-            raise AssertionError("unreachable")
 
         if share_history and self.switcher.platform == Platform.WINDOWS:
             raise SessionError(
@@ -626,13 +639,24 @@ class SessionManager:
 
         No explicit account or directory mapping is required on a clean machine.
         Local-only installations retain the unmodified native environment.
+        cswap picks the account here, so the launch may fall back to another
+        login when Vision cannot serve (see run's ``allow_fallback``).
         """
-        from claude_swap.vision import configured_client
+        from claude_swap.vision import VisionError, configured_client
         from claude_swap.vision_registry import RegistryPool
 
         client = configured_client()
         if client is not None:
-            RegistryPool(self.switcher, client).sync()
+            try:
+                RegistryPool(self.switcher, client).sync()
+            except VisionError as error:
+                self._fall_back_from_vision(
+                    error,
+                    claude_args,
+                    context="Vision could not list the Claude accounts it grants",
+                    share=share,
+                    share_history=share_history,
+                )
             with FileLock(self.switcher.lock_file):
                 roster = self.switcher._get_sequence_data() or {}
             for number in roster.get("sequence", []):
@@ -643,7 +667,11 @@ class SessionManager:
                     and not row.get("disabled", False)
                 ):
                     self.run(
-                        str(number), claude_args, share=share, share_history=share_history
+                        str(number),
+                        claude_args,
+                        share=share,
+                        share_history=share_history,
+                        allow_fallback=True,
                     )
                     return  # Only reachable when the native handoff is mocked.
             self._fall_back_from_vision(
@@ -659,59 +687,175 @@ class SessionManager:
 
         self._exec(self._require_claude_bin(), claude_args, env=dict(os.environ))
 
-    def _ensure_vision_can_serve(
+    def _run_vision(
         self,
-        client: VisionClient,
+        claude_bin: str,
+        account_num: str,
+        email: str,
         record: dict,
         claude_args: list[str],
         *,
+        allow_fallback: bool,
         share: bool,
         share_history: bool,
-    ) -> None:
-        """Return when the Vision pool can serve this launch; else fall back or fail.
+    ) -> NoReturn:
+        """Launch native through the Vision adapter once the pool can serve it.
 
-        Without this check a spent pool still starts native, and the adapter's
-        per-request refusals are all native gets to see.
+        Without the pool check a spent pool still starts native, and the
+        adapter's per-request refusals are all native gets to see. With
+        ``allow_fallback``, a spent account is replaced by the Vision login the
+        pool selects, and Vision failing to serve at all (no quota, or no
+        credential) moves the launch to a local login. A named account is
+        launched as named; the adapter still moves its requests between Vision
+        logins, as it always has.
         """
-        from claude_swap.vision import VisionError
-        from claude_swap.vision_pool import CentralPoolCredential, NoCentralQuota
+        from claude_swap.vision import VisionError, configured_client
+        from claude_swap.vision_pool import NoCentralQuota
+        from claude_swap.vision_proxy import run_native
+        from claude_swap.vision_session import CredentialUnavailable, prepare_launch
 
-        pool = CentralPoolCredential(self.switcher, client, record)
+        client = configured_client()
         try:
-            pool.check_launch(model=requested_model(claude_args))
+            selection = self._check_vision_pool(client, record, claude_args)
         except NoCentralQuota as unavailable:
+            if not allow_fallback:
+                raise NoUsableLogin(
+                    f"{unavailable}\n`cswap run` falls back to another login only "
+                    f"when it picks the account itself, and Account-{account_num} "
+                    "was named by the account argument or this directory's "
+                    "`cswap map`. Wait for the reset, or launch without naming an "
+                    "account.",
+                    retry_after_seconds=unavailable.retry_after_seconds,
+                ) from None
             self._fall_back_from_vision(
                 unavailable, claude_args, share=share, share_history=share_history
             )
+        if (
+            allow_fallback
+            and selection is not None
+            and selection.record["visionLoginId"] != record["visionLoginId"]
+        ):
+            chosen_num = self._vision_slot(selection.record)
+            chosen_email = selection.record.get("email", "")
+            if selection.passed_over is not None:
+                # stderr: with `claude -p`, stdout belongs to native's answer.
+                print(
+                    yellowed(
+                        f"Account-{account_num} ({email}) cannot serve this "
+                        f"launch: {selection.passed_over.reason}. Using "
+                        f"Account-{chosen_num} ({chosen_email}) from the Vision "
+                        "pool instead."
+                    ),
+                    file=sys.stderr,
+                )
+            account_num, email, record = chosen_num, chosen_email, selection.record
+
+        try:
+            launch = prepare_launch(
+                self, record, client, share=share, share_history=share_history
+            )
+        except (VisionError, CredentialUnavailable) as error:
+            if not allow_fallback:
+                raise
+            self._fall_back_from_vision(
+                error,
+                claude_args,
+                context=(
+                    "Vision could not issue a credential for "
+                    f"Account-{account_num} ({email})"
+                ),
+                share=share,
+                share_history=share_history,
+            )
+        print(
+            f"{accent('Launching')} Account-{account_num} ({email}) "
+            f"{muted('[Vision]')}"
+        )
+        run_native(claude_bin, claude_args, launch, client, record, switcher=self.switcher)
+        raise AssertionError("unreachable")
+
+    def _check_vision_pool(
+        self, client: VisionClient | None, record: dict, claude_args: list[str]
+    ) -> LaunchSelection | None:
+        """What the pool would serve this launch from, or NoCentralQuota.
+
+        ``None`` means the check could not run. prepare_launch then refuses a
+        launch without a matching Vision client, with its own message.
+        """
+        from claude_swap.vision import VisionError
+        from claude_swap.vision_pool import CentralPoolCredential
+
+        if client is None or record.get("visionUrl") != client.url:
+            return None
+        pool = CentralPoolCredential(self.switcher, client, record)
+        try:
+            return pool.check_launch(model=requested_model(claude_args))
         except VisionError as error:
             # A registry outage is not evidence that the pool is spent. Launch
             # as before this check existed; the adapter still refuses requests
             # it cannot serve, and the roster warning already named the outage.
             self._logger.debug("Vision launch check unavailable: %s", error.code)
+            return None
+
+    def _vision_slot(self, record: dict) -> str:
+        """The roster number of a Vision row the pool selected."""
+        with FileLock(self.switcher.lock_file):
+            roster = self.switcher._get_sequence_data() or {}
+        for number, row in roster.get("accounts", {}).items():
+            if (
+                row.get("source") == "vision"
+                and row.get("visionUrl") == record["visionUrl"]
+                and row.get("visionLoginId") == record["visionLoginId"]
+            ):
+                return number
+        raise SessionError("The Vision roster changed during launch; retry it.")
 
     def _fall_back_from_vision(
         self,
-        unavailable: NoUsableLogin,
+        unavailable: ClaudeSwitchError,
         claude_args: list[str],
         *,
+        context: str | None = None,
         share: bool,
         share_history: bool,
     ) -> NoReturn:
         """Launch this machine's own login in Vision's place, or fail saying why.
 
+        ``unavailable`` is why Vision cannot serve: NoUsableLogin when it has
+        no login with quota, or a Vision error when it cannot be reached or
+        cannot issue a credential. ``context`` prefixes it in the messages.
+
         Only logins stored on this machine qualify, and never an API key: API
         usage is billed per token. Credentials exported in the environment are
-        neither a fallback nor passed to the fallback launch.
+        neither a fallback nor passed to the fallback launch. With no usable
+        local login, a NoUsableLogin is raised with advice (exit 75); any other
+        error is re-raised unchanged, as it was before fallback existed.
         """
+        from claude_swap.vision_pool import launch_models
+
+        reason = f"{context}: {unavailable}" if context else str(unavailable)
+        models = launch_models(
+            requested_model(claude_args), load_settings(self.switcher.backup_dir).model
+        )
         auth_env = [name for name in AUTH_OVERRIDE_ENV_VARS if os.environ.get(name)]
-        fallback = self._find_local_fallback()
+        fallback, passed_over = self._find_local_fallback(models)
+        skipped = "; ".join(f"{login.email} ({login.reason})" for login in passed_over)
         if fallback is None:
-            advice = (
-                "No local Claude login was found to fall back to. Wait for the "
-                "reset, ask a Vision admin for another account, or log in with "
-                "native Claude (`claude`, then /login) so `cswap run` can fall "
-                "back to it."
-            )
+            if not isinstance(unavailable, NoUsableLogin):
+                raise unavailable
+            if passed_over:
+                advice = (
+                    f"No local Claude login can serve either: {skipped}. Wait "
+                    "for the earliest reset, or ask a Vision admin for another "
+                    "account."
+                )
+            else:
+                advice = (
+                    "No local Claude login was found to fall back to. Wait for "
+                    "the reset, ask a Vision admin for another account, or log "
+                    "in with native Claude (`claude`, then /login) so "
+                    "`cswap run` can fall back to it."
+                )
             if auth_env:
                 advice += (
                     f" cswap does not fall back to credentials from the "
@@ -719,10 +863,15 @@ class SessionManager:
                     "to use them."
                 )
             raise NoUsableLogin(
-                f"{unavailable}\n{advice}",
-                retry_after_seconds=unavailable.retry_after_seconds,
+                f"{reason}\n{advice}",
+                retry_after_seconds=_earliest_wait(
+                    unavailable.retry_after_seconds, passed_over, time.time()
+                ),
             )
-        notice = f"{unavailable}\nFalling back to {fallback.label}."
+        notice = reason
+        if passed_over:
+            notice += f"\nSkipping local logins that cannot serve: {skipped}."
+        notice += f"\nFalling back to {fallback.label}."
         if auth_env and fallback.account_num is None:
             notice += f" Ignoring {', '.join(auth_env)} for this launch."
         # stderr: with `claude -p`, stdout belongs to native's answer.
@@ -742,31 +891,75 @@ class SessionManager:
         }
         self._exec(self._require_claude_bin(), claude_args, env=env)
 
-    def _find_local_fallback(self) -> LocalFallback | None:
-        """This machine's own subscription login, if it has one.
+    def _find_local_fallback(
+        self, models: tuple[str, ...]
+    ) -> tuple[LocalFallback | None, list[IneligibleLogin]]:
+        """This machine's first own subscription login not known to be unusable.
 
         Native's default login comes first: it is what plain `claude` would
-        use. Then the first enabled, non-Vision cswap account in roster order.
-        Quota is not checked here; native reports a spent local account itself.
+        use. Then enabled, non-Vision, non-API-key cswap accounts in roster
+        order. A login is passed over when cswap's cached usage (from `cswap
+        list` or `cswap auto`) shows a spent window for ``models``, or its
+        refresh token is quarantined. Without a trusted reading it stays
+        eligible: this makes no network calls, and native reports a spent
+        local account itself. Returns the choice and every login passed over.
         """
-        native = self.switcher._read_credentials()
-        if native and not looks_like_api_key(native):
-            identity = self.switcher._get_current_account()
-            name = f" ({identity[0]})" if identity else ""
-            return LocalFallback(f"this machine's native Claude login{name}")
         with FileLock(self.switcher.lock_file):
             roster = self.switcher._get_sequence_data() or {}
         accounts = roster.get("accounts", {})
+        passed_over: list[IneligibleLogin] = []
+        native_slot = None
+        native = self.switcher._read_credentials()
+        if native and not looks_like_api_key(native):
+            identity = self.switcher._get_current_account()
+            native_slot = self.switcher.current_account_number()
+            problem = None
+            if native_slot is not None:
+                problem = self._local_login_problem(
+                    native_slot, accounts.get(native_slot, {}), models
+                )
+            if problem is None:
+                name = f" ({identity[0]})" if identity else ""
+                return LocalFallback(f"this machine's native Claude login{name}"), []
+            passed_over.append(problem)
         for number in roster.get("sequence", []):
-            row = accounts.get(str(number), {})
-            if row.get("source") == "vision" or row.get("disabled", False):
+            slot = str(number)
+            row = accounts.get(slot, {})
+            if (
+                slot == native_slot
+                or row.get("source") == "vision"
+                or row.get("disabled", False)
+                or self.switcher._account_kind(slot) == "api_key"
+            ):
                 continue
-            if self.switcher._account_kind(str(number)) == "api_key":
+            problem = self._local_login_problem(slot, row, models)
+            if problem is not None:
+                passed_over.append(problem)
                 continue
-            return LocalFallback(
-                f"local cswap account {number} ({row.get('email', '')})", str(number)
+            label = f"local cswap account {number} ({row.get('email', '')})"
+            return LocalFallback(label, slot), passed_over
+        return None, passed_over
+
+    def _local_login_problem(
+        self, slot: str, row: dict, models: tuple[str, ...]
+    ) -> IneligibleLogin | None:
+        """Why a local account is known unable to serve now, or None."""
+        from claude_swap.vision_pool import IneligibleLogin, spent_login
+
+        email = row.get("email", "")
+        if self.switcher._slot_token_dead(slot, email):
+            return IneligibleLogin(
+                email, f"{USAGE_RELOGIN_REQUIRED}: its refresh token was refused"
             )
-        return None
+        identity = {slot: (email, row.get("organizationUuid", "") or "")}
+        entry = self.switcher._usage_store.entries(identity, models).get(slot)
+        usage = entry.decision_value() if entry is not None else None
+        if not isinstance(usage, dict):
+            return None
+        headroom = account_headroom(usage, models)
+        if headroom is None or headroom > 0:
+            return None
+        return spent_login(row, usage, models, time.time())
 
     def _require_claude_bin(self) -> str:
         claude_bin = shutil.which("claude")

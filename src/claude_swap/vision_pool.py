@@ -40,6 +40,20 @@ class IneligibleLogin:
     available_at: float | None = None  # UTC epoch seconds; None when unknown
 
 
+@dataclass(frozen=True)
+class LaunchSelection:
+    """The Vision row a launch's first request would be served from.
+
+    ``passed_over`` says why the launch's own login was not selected when it
+    cannot serve (spent, disabled, rate-limited or rejected); it is ``None``
+    when that login was selected, or was passed over only by preference
+    (``consume-first``, or past its switch threshold but not its limit).
+    """
+
+    record: dict
+    passed_over: IneligibleLogin | None
+
+
 class NoCentralQuota(NoUsableLogin):
     """No enabled account can be selected using current quota evidence.
 
@@ -157,7 +171,7 @@ class CentralPoolCredential:
         self.rate_limits = {}
 
     def _records(self):
-        """Selectable Vision rows by login, and why every other one is not."""
+        """Selectable Vision rows by login, and why each other one is not (by login)."""
         self.pool.sync()
         with FileLock(self.switcher.lock_file):
             data = self.switcher._get_sequence_data() or {}
@@ -166,7 +180,7 @@ class CentralPoolCredential:
         if not isinstance(accounts, dict) or not isinstance(sequence, list):
             raise ConfigError("The account roster needs repair.")
         records = {}
-        excluded = []
+        excluded = {}
         now = self.clock()
         # Preserve the user's sequence as the ranking tie-breaker. The complete
         # central discovery owns membership; local rows never enter this pool.
@@ -180,36 +194,30 @@ class CentralPoolCredential:
                 continue
             email = row.get("email", "")
             limited_until = self.rate_limits.get(row["visionAccountId"], 0)
+            login = row["visionLoginId"]
             if limited_until > now:
-                excluded.append(
-                    IneligibleLogin(
-                        email,
-                        "rate-limited by the provider until "
-                        + describe_moment(limited_until, now),
-                        limited_until,
-                    )
+                excluded[login] = IneligibleLogin(
+                    email,
+                    "rate-limited by the provider until "
+                    + describe_moment(limited_until, now),
+                    limited_until,
                 )
                 continue
-            login = row["visionLoginId"]
             rejected = self.rejected.get(login)
             if rejected is not None:
                 generation, retry_at = rejected
                 if row.get("visionGeneration", 0) <= generation and now < retry_at:
-                    excluded.append(
-                        IneligibleLogin(
-                            email,
-                            "credential rejected by the provider; retrying "
-                            + describe_moment(retry_at, now),
-                            retry_at,
-                        )
+                    excluded[login] = IneligibleLogin(
+                        email,
+                        "credential rejected by the provider; retrying "
+                        + describe_moment(retry_at, now),
+                        retry_at,
                     )
                     continue
                 del self.rejected[login]
             if row.get("disabled", False):
-                excluded.append(
-                    IneligibleLogin(
-                        email, f"disabled here; `cswap enable {number}` re-enables it"
-                    )
+                excluded[login] = IneligibleLogin(
+                    email, f"disabled here; `cswap enable {number}` re-enables it"
                 )
                 continue
             records[login] = row
@@ -217,7 +225,7 @@ class CentralPoolCredential:
 
     def get(self, *, model=None):
         with self.lock:
-            record, now = self._select(model, request_models)
+            record, now, _ = self._select(model, request_models)
             credential = CentralCredential(self.client, record).get(model=model)
             selected = record["visionLoginId"]
             if selected != self.current:
@@ -226,20 +234,25 @@ class CentralPoolCredential:
             return credential
 
     def check_launch(self, *, model=None):
-        """Raise NoCentralQuota when no login could serve native's first request.
+        """The LaunchSelection for native's first request, or NoCentralQuota.
 
-        Selection only: no credential is issued and the current login is kept,
-        so a launch that passes behaves exactly as it did without the check.
+        Selection only: no credential is issued and the current login is kept.
+        The caller decides whether to launch the selected row or its own.
         """
-        self._select(model, launch_models)
+        record, _, passed_over = self._select(model, launch_models)
+        return LaunchSelection(record, passed_over)
 
     def _select(self, model, window_models):
-        """The row to serve ``model`` with, or NoCentralQuota saying why none can."""
+        """The row to serve ``model`` with, or NoCentralQuota saying why none can.
+
+        Returns ``(row, now, passed_over)``; ``passed_over`` explains why the
+        current login could not serve when selection was forced off it.
+        """
         with self.lock:
             records, excluded = self._records()
             now = self.clock()
             if not records:
-                self._unavailable(excluded, now)
+                self._unavailable(list(excluded.values()), now)
             settings = load_settings(self.switcher.backup_dir)
             models = window_models(model, settings.model)
             try:
@@ -321,8 +334,15 @@ class CentralPoolCredential:
                     spent_login(row, usage[login], models, now)
                     for login, row in records.items()
                 ]
-                self._unavailable(excluded + spent, now)
-            return records[selected], now
+                self._unavailable(list(excluded.values()) + spent, now)
+            passed_over = None
+            if exhausted:
+                passed_over = spent_login(
+                    records[self.current], usage[self.current], models, now
+                )
+            elif absent:
+                passed_over = excluded.get(self.current)
+            return records[selected], now, passed_over
 
     def recover(self, rejected, *, model=None):
         with self.lock:

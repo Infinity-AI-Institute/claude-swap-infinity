@@ -21,7 +21,7 @@ from claude_swap import cli
 from claude_swap.exceptions import EXIT_NO_USABLE_LOGIN, NoUsableLogin
 from claude_swap.session import SessionManager, requested_model
 from claude_swap.switcher import ClaudeAccountSwitcher
-from claude_swap.usage_store import UsageEntry
+from claude_swap.usage_store import FetchRecord, UsageEntry
 from claude_swap.vision import VisionClient, VisionError
 from claude_swap.vision_pool import CentralPoolCredential
 from claude_swap.vision_proxy import InferenceProxy
@@ -74,7 +74,20 @@ class VisionHost:
         )
         self.run_native = Mock(side_effect=SystemExit("native Claude started"))
         monkeypatch.setattr("claude_swap.vision_proxy.run_native", self.run_native)
-        self.manager._exec = Mock(side_effect=SystemExit("claude exec"))
+        # Patched on the class, so the SessionManager that `cli._run_command`
+        # builds for itself is covered too. Mock attributes do not bind, so
+        # calls record the same arguments as the real methods receive.
+        monkeypatch.setattr(
+            SessionManager, "_exec", Mock(side_effect=SystemExit("claude exec"))
+        )
+        self.setup_session = Mock(side_effect=self._session_for)
+        monkeypatch.setattr(SessionManager, "setup_session", self.setup_session)
+
+    def _session_for(self, identifier, _share, _share_history=False):
+        """A session-mode profile for a local account, without bootstrapping it."""
+        row = self.switcher._get_sequence_data()["accounts"][identifier]
+        directory = self.switcher.backup_dir / "sessions" / identifier
+        return directory, identifier, row["email"]
 
     def _read_usage(self, *_args, **_kwargs):
         return {
@@ -109,6 +122,12 @@ class VisionHost:
         }
         roster["sequence"].append(number)
         self.switcher._write_json(self.switcher.sequence_file, roster)
+
+    def record_local_usage(self, number, email, usage):
+        """What `cswap list` or `cswap auto` last measured for a local account."""
+        self.switcher._usage_store.record(
+            {str(number): FetchRecord(usage=usage)}, {str(number): (email, "")}
+        )
 
 
 @pytest.fixture
@@ -264,13 +283,10 @@ def test_spent_pool_falls_back_to_the_native_login_and_warns_on_stderr(
 
 def test_spent_pool_falls_back_to_a_local_cswap_account(host, capsys):
     host.add_local_account(5, "local@example.invalid")
-    host.manager.setup_session = Mock(
-        return_value=(host.switcher.backup_dir / "sessions" / "5", "5", "local@example.invalid")
-    )
     with pytest.raises(SystemExit, match="claude exec"):
         host.manager.exec_default(PROMPT_ARGS)
-    host.manager.setup_session.assert_called_once()
-    assert host.manager.setup_session.call_args.args[0] == "5"
+    host.setup_session.assert_called_once()
+    assert host.setup_session.call_args.args[0] == "5"
     assert "local@example.invalid" in capsys.readouterr().err
     host.run_native.assert_not_called()
 
@@ -299,3 +315,176 @@ def test_empty_pool_falls_back_to_the_native_login(host, native_login, capsys):
     with pytest.raises(SystemExit, match="claude exec"):
         host.manager.exec_default(PROMPT_ARGS)
     assert "authorized through Vision" in capsys.readouterr().err
+
+
+# -- issue #16: a launch without a named account falls back instead of failing
+
+
+def test_issue_16_spent_default_account_falls_back_to_a_local_account(host, capsys):
+    """#16 as reported: no account argument, the default Vision account's
+    5-hour window full, and a second, local account registered. The launch
+    uses the local account and says so on stderr; native never starts on the
+    spent account."""
+    host.add_local_account(5, "luke-3@example.invalid")
+    with pytest.raises(SystemExit, match="claude exec"):
+        cli._run_command(["--", *PROMPT_ARGS])
+    host.setup_session.assert_called_once()
+    assert host.setup_session.call_args.args[0] == "5"
+    stderr = capsys.readouterr().err
+    assert "user1@example.invalid (5h window at 100%" in stderr
+    assert "Falling back to local cswap account 5 (luke-3@example.invalid)" in stderr
+    host.run_native.assert_not_called()
+
+
+def test_spent_default_account_launches_the_vision_account_with_quota(host, capsys):
+    host.client.discover.return_value = [item(1), item(2)]
+    host.usage[2] = healthy(host.now)
+    with pytest.raises(SystemExit, match="native Claude started"):
+        cli._run_command(["--", *PROMPT_ARGS])
+    launched_record = host.run_native.call_args.args[4]
+    assert launched_record["visionLoginId"] == item(2)["login_id"]
+    output = capsys.readouterr()
+    assert "Account-2 (user2@example.invalid)" in output.out
+    # The switch is announced on stderr, which `claude -p` callers keep
+    # apart from native's answer.
+    assert "Account-1 (user1@example.invalid)" in output.err
+    assert "5h window at 100%" in output.err
+    assert "Account-2 (user2@example.invalid)" in output.err
+
+
+def test_a_named_account_is_not_replaced_by_a_local_login(host, native_login, capsys):
+    RegistryPool(host.switcher, host.client).sync()
+    with pytest.raises(SystemExit) as exited:
+        cli._run_command(["1", "--", *PROMPT_ARGS])
+    assert exited.value.code == EXIT_NO_USABLE_LOGIN
+    stderr = capsys.readouterr().err
+    assert "user1@example.invalid (5h window at 100%" in stderr
+    assert "named" in stderr
+    host.manager._exec.assert_not_called()
+    host.run_native.assert_not_called()
+
+
+def test_a_mapped_directory_is_not_replaced_by_a_local_login(
+    host, native_login, temp_home, monkeypatch, capsys
+):
+    from claude_swap.mappings import MappingStore
+
+    RegistryPool(host.switcher, host.client).sync()
+    project = temp_home / "project"
+    project.mkdir()
+    MappingStore(host.switcher.backup_dir).set(
+        project, "user1@example.invalid", "organization"
+    )
+    monkeypatch.chdir(project)
+    with pytest.raises(SystemExit) as exited:
+        cli._run_command(["--", *PROMPT_ARGS])
+    assert exited.value.code == EXIT_NO_USABLE_LOGIN
+    assert "named" in capsys.readouterr().err
+    host.manager._exec.assert_not_called()
+
+
+def test_fallback_skips_a_local_account_known_to_be_spent(host, capsys):
+    host.add_local_account(5, "spent@example.invalid")
+    host.add_local_account(6, "fresh@example.invalid")
+    host.record_local_usage(5, "spent@example.invalid", spent_five_hour_window(host.now))
+    with pytest.raises(SystemExit, match="claude exec"):
+        host.manager.exec_default(PROMPT_ARGS)
+    assert host.setup_session.call_args.args[0] == "6"
+    stderr = capsys.readouterr().err
+    assert "spent@example.invalid (5h window at 100%" in stderr
+    assert "Falling back to local cswap account 6 (fresh@example.invalid)" in stderr
+
+
+def test_fallback_skips_a_local_account_that_needs_a_relogin(host, capsys):
+    host.add_local_account(5, "dead@example.invalid")
+    host.add_local_account(6, "fresh@example.invalid")
+    host.switcher._usage_store.record(
+        {"5": FetchRecord(error="invalid_grant")},
+        {"5": ("dead@example.invalid", "")},
+    )
+    with pytest.raises(SystemExit, match="claude exec"):
+        host.manager.exec_default(PROMPT_ARGS)
+    assert host.setup_session.call_args.args[0] == "6"
+    assert "dead@example.invalid (re-login needed" in capsys.readouterr().err
+
+
+def test_fallback_skips_the_native_login_when_its_account_is_known_spent(
+    host, native_login, capsys
+):
+    # The native login is also cswap's account 5; account 6 is untouched.
+    host.add_local_account(5, "native@example.invalid")
+    host.add_local_account(6, "fresh@example.invalid")
+    host.record_local_usage(5, "native@example.invalid", spent_five_hour_window(host.now))
+    with pytest.raises(SystemExit, match="claude exec"):
+        host.manager.exec_default(PROMPT_ARGS)
+    assert host.setup_session.call_args.args[0] == "6"
+    assert "native@example.invalid (5h window at 100%" in capsys.readouterr().err
+
+
+def test_no_fallback_when_every_local_login_is_known_spent(host):
+    host.add_local_account(5, "spent@example.invalid")
+    host.record_local_usage(5, "spent@example.invalid", spent_five_hour_window(host.now))
+    with pytest.raises(NoUsableLogin) as refused:
+        host.manager.exec_default(PROMPT_ARGS)
+    message = str(refused.value)
+    assert "user1@example.invalid (5h window at 100%" in message
+    assert "spent@example.invalid (5h window at 100%" in message
+    host.manager._exec.assert_not_called()
+    host.setup_session.assert_not_called()
+
+
+def test_vision_credential_outage_falls_back_to_a_local_account(host, capsys):
+    host.usage[1] = healthy(host.now)
+    host.add_local_account(5, "local@example.invalid")
+    host.client.credential.side_effect = VisionError("service_unavailable", status=503)
+    with pytest.raises(SystemExit, match="claude exec"):
+        host.manager.exec_default(PROMPT_ARGS)
+    assert host.setup_session.call_args.args[0] == "5"
+    assert "service_unavailable" in capsys.readouterr().err
+    host.run_native.assert_not_called()
+
+
+def test_vision_credential_outage_fails_a_named_account_as_before(host):
+    host.usage[1] = healthy(host.now)
+    host.add_local_account(5, "local@example.invalid")
+    host.client.credential.side_effect = VisionError("service_unavailable", status=503)
+    with pytest.raises(VisionError, match="service_unavailable"):
+        host.manager.run("1", PROMPT_ARGS)
+    host.setup_session.assert_not_called()
+    host.run_native.assert_not_called()
+
+
+def test_vision_registry_outage_falls_back_to_a_local_account(host, capsys):
+    host.add_local_account(5, "local@example.invalid")
+    # Membership synced a minute ago, so the launch asks Vision again.
+    RegistryPool(host.switcher, host.client, now=lambda: host.now - 60).sync(
+        force=True
+    )
+    host.client.discover.side_effect = VisionError("service_unavailable", status=503)
+    with pytest.raises(SystemExit, match="claude exec"):
+        host.manager.exec_default(PROMPT_ARGS)
+    assert host.setup_session.call_args.args[0] == "5"
+    assert "service_unavailable" in capsys.readouterr().err
+
+
+def test_vision_login_needing_reauthentication_falls_back_to_a_local_account(
+    host, capsys
+):
+    host.usage[1] = healthy(host.now)
+    host.add_local_account(5, "local@example.invalid")
+    host.client.credential.side_effect = VisionError("credential_unavailable")
+    host.client.refresh = Mock(return_value={"state": "reauth_required"})
+    with pytest.raises(SystemExit, match="claude exec"):
+        host.manager.exec_default(PROMPT_ARGS)
+    assert host.setup_session.call_args.args[0] == "5"
+    assert "needs reauthentication" in capsys.readouterr().err
+    host.run_native.assert_not_called()
+
+
+def test_vision_outage_without_a_local_login_fails_as_before(host):
+    host.usage[1] = healthy(host.now)
+    host.client.credential.side_effect = VisionError("service_unavailable", status=503)
+    with pytest.raises(VisionError, match="service_unavailable"):
+        host.manager.exec_default(PROMPT_ARGS)
+    host.manager._exec.assert_not_called()
+    host.run_native.assert_not_called()

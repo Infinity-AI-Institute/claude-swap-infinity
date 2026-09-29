@@ -81,24 +81,42 @@ cswap vision account-login work
 cswap run work
 ```
 
-### When no Vision account can serve
+### When a Vision account cannot serve
 
-`cswap run` checks your Vision accounts before it starts Claude. If every account
-is at a usage limit, disabled, or not granted, it uses a Claude login that this
-machine already has, and prints a warning on stderr that names it. It tries these
-logins in order:
+`cswap run` checks your Vision accounts before it starts Claude. What it does when
+an account cannot serve depends on whether you named the account.
 
-1. The login that plain `claude` uses on this machine.
-2. The first enabled local (non-Vision) cswap account, in `cswap list` order.
+**You did not name an account** (no account argument, and no `cswap map` mapping
+for this directory). cswap picked the account, so it can pick another one:
+
+1. If the default Vision account is at a usage limit and another Vision account
+   has quota, cswap launches that account. A warning on stderr names both
+   accounts and the limit.
+2. If no Vision account can serve, cswap uses a Claude login that this machine
+   already has. A warning on stderr says why Vision cannot serve and names the
+   login. Vision cannot serve when every account is at a usage limit, disabled,
+   or not granted; when Vision cannot be reached; or when Vision cannot issue a
+   credential. cswap tries these logins in order:
+   1. The login that plain `claude` uses on this machine.
+   2. Each enabled local (non-Vision) cswap account, in `cswap list` order.
+
+cswap skips a local login when it needs a re-login, or when the last usage reading
+from `cswap list` or `cswap auto` shows a full window. A login without a recent
+reading is not skipped. For the login that plain `claude` uses, this applies only
+when it is also a cswap account. The check makes no network calls.
+
+**You named an account** (an account argument such as `cswap run 2`, or a
+`cswap map` mapping). cswap does not replace it with a different login. If no Vision
+account can serve, `cswap run` exits with code 75 and says why. While Claude runs,
+its requests can still move between Vision accounts, as before.
 
 cswap never falls back to an API key, including `ANTHROPIC_API_KEY`, because API
 usage is billed per token. The fallback removes `ANTHROPIC_API_KEY` and Claude's
 other credential variables from Claude's environment.
 
-If this machine has no login to fall back to, `cswap run` exits with code **75**
-before Claude starts. The message names each Vision account, why it cannot serve,
-and when its usage window resets (in UTC, with the time remaining). Scripts can
-test for the code:
+If no login can serve, `cswap run` exits with code **75** before Claude starts. The
+message names each account, why it cannot serve, and when its usage window resets
+(in UTC, with the time remaining). Scripts can test for the code:
 
 ```bash
 cswap run -- -p "$PROMPT"
@@ -108,12 +126,15 @@ fi
 ```
 
 Code 75 comes only from this check. After Claude starts, `cswap run` exits with
-Claude's own exit code. A launch without `--model` checks the 5-hour and 7-day
+Claude's own exit code. If Vision cannot be reached or cannot issue a credential,
+and there is no local login, `cswap run` fails with Vision's error and exit code 1,
+as before. A launch without `--model` checks the 5-hour and 7-day
 windows. With `--model`, it also checks that model's weekly window.
 
 If the accounts run out while Claude is running, Claude's next request fails at
 once with the same explanation instead of retrying. To keep working, exit and run
-`cswap run` again so it can fall back to a local login.
+`cswap run` again without naming an account, so that it can fall back to a local
+login.
 
 ### Replace an upstream install
 
