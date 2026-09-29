@@ -9,7 +9,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from claude_swap.exceptions import SessionError
+from claude_swap.exceptions import NoUsableLogin, SessionError
 from claude_swap.vision import VisionError
 from claude_swap.vision_proxy import InferenceProxy
 
@@ -226,6 +226,25 @@ def test_explicit_401_recovers_once_before_replaying_message(upstream):
         "Bearer recovered",
     ]
     assert seen[0][2] == seen[1][2]
+
+
+def test_recovery_with_no_usable_login_tells_native_not_to_retry(upstream):
+    url, seen = upstream
+    credentials = Mock()
+    credentials.get.return_value = {"accessToken": "rejected"}
+    credentials.recover.side_effect = NoUsableLogin(
+        "No Vision Claude account has known quota available.",
+        retry_after_seconds=90,
+    )
+    with InferenceProxy(credentials, upstream=url) as proxy:
+        with pytest.raises(urllib.error.HTTPError) as error:
+            request(proxy, body=b'{"reject":true}')
+        message = json.loads(error.value.read())["error"]["message"]
+    assert error.value.code == 503
+    assert error.value.headers["x-should-retry"] == "false"
+    assert error.value.headers["Retry-After"] == "90"
+    assert "known quota" in message
+    assert len(seen) == 1
 
 
 def test_second_401_is_returned_without_another_replay(upstream):

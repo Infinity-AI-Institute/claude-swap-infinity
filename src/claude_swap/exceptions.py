@@ -43,6 +43,26 @@ class SessionError(ClaudeSwitchError):
     pass
 
 
+# `cswap run` exits with this code, before native Claude starts, when no Claude
+# login can serve the launch: every Vision account is spent, rate-limited,
+# disabled or not granted, and this machine has no local login to fall back
+# to. It is sysexits' EX_TEMPFAIL, so wrappers can branch on it (wait for the
+# reset, or try another provider) instead of parsing messages.
+EXIT_NO_USABLE_LOGIN = 75
+
+
+class NoUsableLogin(SessionError):
+    """No Claude login can serve right now.
+
+    ``retry_after_seconds`` is the wait until the earliest known reset, or
+    ``None`` when no reset time is known.
+    """
+
+    def __init__(self, message: str, *, retry_after_seconds: int | None = None):
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
+
+
 class LockError(ClaudeSwitchError):
     """Error acquiring lock."""
 

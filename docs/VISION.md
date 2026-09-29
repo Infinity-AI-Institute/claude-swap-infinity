@@ -109,7 +109,45 @@ including when membership is still within its 30-second discovery cache. Unknown
 or stale observations never qualify a new account. If observations are unavailable,
 the existing authorized login may continue; the client does not infer spare quota
 from a failed observation. If the current account is known exhausted and no eligible
-account has known headroom, the adapter returns an error before provider inference.
+account has known headroom, the adapter answers before provider inference with a
+503 that carries `x-should-retry: false`, a `Retry-After` for the earliest known
+reset, and a message naming each login and why it cannot serve. Native Claude
+(2.1.283) then fails the turn at once and shows that message. Without the header
+it retried the 503 ten times, for about three minutes, before failing with a
+generic message.
+
+The same selection runs once before native starts, and a launch does not start
+native on a pool that cannot serve it. The check issues no credential. Without
+`--model`, it counts only the 5-hour and 7-day windows and any `autoswitch.model`
+names, because native chooses its own default model. If the check cannot reach
+Vision, the launch continues as it did before the check existed.
+
+What happens next depends on who chose the account. When the user names no account
+and the directory has no mapping, `cswap run` chose it (`SessionManager.exec_default`)
+and may choose again:
+
+- If the default account is known exhausted and the selection moves to another
+  account, `cswap run` launches the selected account and says so on stderr.
+- If no login can serve, Vision grants no enabled account, the registry cannot be
+  reached, or Vision cannot issue the launch credential (a Vision error,
+  reauthentication required, or recovery still pending), `cswap run` falls back to
+  this machine's own subscription login with a stderr warning. It tries native's
+  default login first, then enabled local OAuth accounts in roster order. It skips
+  a local account whose refresh token is quarantined, or whose cached usage
+  (`cache/usage.json`, trusted under the same rules as autoswitch decisions) shows
+  a spent window. An account without a trusted reading is not skipped.
+
+A named account, from an argument or a directory mapping, is never replaced by
+another login. If the pool cannot serve it, `cswap run` exits 75, and registry and
+credential errors fail the launch as before. The adapter still moves the session's
+requests between Vision logins, as it did before.
+
+Credentials from the environment (`ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`
+and the like) are removed from the fallback launch and are never a fallback
+themselves. If the pool has no quota and there is no login to fall back to,
+`cswap run` exits 75 (`EX_TEMPFAIL`) before native starts. A registry or credential
+error without a fallback is raised unchanged (exit 1).
+
 An explicit provider 401 can trigger one replay before any response is sent to
 native. Recovery accepts only a newer central generation with a different token.
 It respects the server's refresh scheduling and does not refresh subscription-only
