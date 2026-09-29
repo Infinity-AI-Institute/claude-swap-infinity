@@ -149,7 +149,8 @@ uv tool install --force --python 3.12 git+https://github.com/Infinity-AI-Institu
 If you installed the upstream tool with `pipx`, run `pipx uninstall claude-swap`
 first. Account data is stored outside the tool's install directory, so a reinstall
 keeps it. The fork contains upstream changes up to August 20, 2026, and reports
-version `0.26.0b1`. Features from upstream 0.26.0 (released September 2, 2026),
+version `0.26.0b1+infinity.N`: upstream's `0.26.0b1` plus the number of the fork's
+release. Features from upstream 0.26.0 (released September 2, 2026),
 such as `cswap run --require-session`, are not in the fork yet.
 
 ### Update this Infinity installation
