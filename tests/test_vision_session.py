@@ -1,5 +1,7 @@
 """Remote launch receives access-only auth and preserves native session identity."""
 
+import json
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import Mock
@@ -289,3 +291,63 @@ def test_no_work_refresh_receipt_still_accepts_concurrent_successor(setup, state
     registry.refresh.return_value = {"state": state}
     assert acquire_credential(registry, record) == token
     assert registry.credential.call_count == 2
+
+
+# Claude Code 2.1.281 and 2.1.286 show their first-run menus (theme, then a
+# login-method menu) until the native config has hasCompletedOnboarding: true.
+# A Vision launch supplies the credential, so that login menu must not appear.
+def _native_config() -> Path:
+    return Path.home() / ".claude.json"
+
+
+def test_vision_launch_marks_native_onboarding_complete_and_keeps_other_keys(setup):
+    manager, registry, record, _ = setup
+    home_mode = Path.home().stat().st_mode & 0o777
+    _native_config().write_text(json.dumps({"numStartups": 3, "theme": "light"}))
+    prepare_launch(manager, record, registry, share=False, share_history=False)
+    assert json.loads(_native_config().read_text()) == {
+        "numStartups": 3,
+        "theme": "light",
+        "hasCompletedOnboarding": True,
+    }
+    if os.name != "nt":
+        assert _native_config().stat().st_mode & 0o777 == 0o600
+        # The native config lives in $HOME, which cswap must not re-permission.
+        assert Path.home().stat().st_mode & 0o777 == home_mode
+
+
+def test_vision_launch_creates_native_config_with_onboarding_complete(setup):
+    manager, registry, record, _ = setup
+    prepare_launch(manager, record, registry, share=False, share_history=False)
+    assert json.loads(_native_config().read_text()) == {"hasCompletedOnboarding": True}
+
+
+def test_vision_launch_seeds_the_config_claude_config_dir_selects(setup, monkeypatch):
+    manager, registry, record, _ = setup
+    native = Path.home() / "custom-native"
+    native.mkdir()
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(native))
+    prepare_launch(manager, record, registry, share=False, share_history=False)
+    assert json.loads((native / ".claude.json").read_text()) == {"hasCompletedOnboarding": True}
+    assert not _native_config().exists()
+
+
+@pytest.mark.parametrize("content", ['{"hasCompletedOnboarding": false}', "{not json", "[]"])
+def test_vision_launch_leaves_an_explicit_or_unreadable_config_alone(setup, content):
+    manager, registry, record, _ = setup
+    _native_config().write_text(content)
+    launch = prepare_launch(manager, record, registry, share=False, share_history=False)
+    assert launch.env["CLAUDE_CODE_OAUTH_TOKEN"] == "synthetic-access-token"
+    assert _native_config().read_text() == content
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_vision_launch_writes_through_a_symlinked_native_config(setup):
+    manager, registry, record, _ = setup
+    target = Path.home() / "dotfiles" / "claude.json"
+    target.parent.mkdir()
+    target.write_text("{}")
+    _native_config().symlink_to(target)
+    prepare_launch(manager, record, registry, share=False, share_history=False)
+    assert _native_config().is_symlink()
+    assert json.loads(target.read_text()) == {"hasCompletedOnboarding": True}

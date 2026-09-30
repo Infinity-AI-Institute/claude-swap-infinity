@@ -83,6 +83,10 @@ Only secure credential storage is isolated under
 `CLAUDE_SECURESTORAGE_CONFIG_DIR`. Existing local credentials are untouched.
 A credential in that isolated store blocks launch until ownership handoff is
 resolved. Sharing flags do not alter the existing native home for Vision launches.
+The one change a Vision launch makes to the native config is to add
+`hasCompletedOnboarding: true` when that key is missing. Without it, Claude Code
+opens its first-run menus, whose login step would start an OAuth login the Vision
+account must not get. An explicit value and all other keys are left as they are.
 
 Conversations created by earlier versions under
 `<backup>/vision-sessions/<registry-hash>/<login-id>` remain untouched. To resume

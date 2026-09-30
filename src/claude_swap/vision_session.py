@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import logging
 import os
 import stat
 import time
@@ -10,9 +12,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from claude_swap import macos_keychain
-from claude_swap.exceptions import SessionError
+from claude_swap.claude_locks import claude_config_lock
+from claude_swap.exceptions import ClaudeCodeLockTimeout, SessionError
 from claude_swap.models import Platform
-from claude_swap.paths import get_claude_config_home
+from claude_swap.paths import get_claude_config_home, get_global_config_path
+from claude_swap.settings import atomic_write_json
 from claude_swap.vision import VisionClient, VisionError, registry_id
 
 # A selected Vision credential must not inherit another provider route or auth
@@ -138,6 +142,39 @@ def credential_directory(backup_dir, url, login_id):
     )
 
 
+def mark_native_onboarding_complete() -> None:
+    """Keep Claude Code's first-run menus out of a Vision launch.
+
+    Claude Code (2.1.281 and 2.1.286 checked) shows its onboarding, a theme
+    picker and then a login-method menu, until the native global config has
+    ``hasCompletedOnboarding: true``. A Vision launch supplies its own
+    credential, and choosing a login in that menu starts an OAuth login the
+    Vision account must not get. Local profiles receive the same key when they
+    are bootstrapped (session.py).
+
+    Only a missing key is added. An explicit value, every other key, and a
+    config Claude Code cannot parse are left as they are. A failure here is a
+    warning: at worst the launch shows the menu, as it did before.
+    """
+    path = get_global_config_path()
+    try:
+        # Claude Code takes this lock for its own writes to the file.
+        with claude_config_lock():
+            try:
+                config = json.loads(path.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                config = {}
+            if not isinstance(config, dict) or "hasCompletedOnboarding" in config:
+                return
+            config["hasCompletedOnboarding"] = True
+            # The file lives in $HOME or CLAUDE_CONFIG_DIR, which cswap does not own.
+            atomic_write_json(path, config, private_parent=False)
+    except (ClaudeCodeLockTimeout, OSError, ValueError) as error:
+        logging.getLogger("claude-swap").warning(
+            "Could not mark Claude Code onboarding complete in %s: %s", path, error
+        )
+
+
 def prepare_launch(
     manager,
     record: dict,
@@ -212,6 +249,7 @@ def prepare_launch(
     # config resolves differently for unset versus explicit ~/.claude.
     env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] = str(directory)
     env["CLAUDE_CODE_OAUTH_TOKEN"] = credential["accessToken"]
+    mark_native_onboarding_complete()
     return RemoteLaunch(
         get_claude_config_home(),
         credential["generation"],

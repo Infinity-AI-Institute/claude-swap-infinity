@@ -506,7 +506,7 @@ def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
     return _clamped(dataclasses.replace(settings, **overrides))
 
 
-def atomic_write_json(path: Path, data: dict) -> None:
+def atomic_write_json(path: Path, data: dict, *, private_parent: bool = True) -> None:
     """Atomically write JSON with the backup dir's 0600/0700 modes.
 
     Shared by settings.json and the autoswitch state file (and any future
@@ -530,10 +530,13 @@ def atomic_write_json(path: Path, data: dict) -> None:
       else, and raise ``PermissionError`` outright when that parent is not
       ours to chmod. The written file still gets 0600, and ``mkstemp``
       creates it 0600 to begin with, so the secret is never exposed.
+
+    ``private_parent=False`` skips the 0700 step for a file whose directory
+    cswap does not own, such as Claude Code's ``~/.claude.json`` in ``$HOME``.
     """
     target = Path(os.path.realpath(path)) if path.is_symlink() else path
     target.parent.mkdir(parents=True, exist_ok=True)
-    if sys.platform != "win32":
+    if private_parent and sys.platform != "win32":
         # `path.parent`, NOT the target's: see the docstring.
         os.chmod(path.parent, 0o700)
     fd, tmp_path = tempfile.mkstemp(dir=str(target.parent), suffix=".tmp")
