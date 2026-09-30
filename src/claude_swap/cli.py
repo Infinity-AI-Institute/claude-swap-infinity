@@ -991,6 +991,7 @@ def main() -> None:
 
 Commands:
   %(prog)s --set-vision-token [TOKEN] save a Vision API key for both swap tools
+  %(prog)s --set-vision-token -       same, reading the key from stdin
   %(prog)s help                       show this help
   %(prog)s list                       list managed accounts
   %(prog)s status                     show current account

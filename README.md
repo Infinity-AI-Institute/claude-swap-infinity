@@ -173,9 +173,17 @@ If `VISION_API_KEY` is set, it takes precedence. Otherwise the saved key takes
 precedence over an older `cswap vision login` browser sign-in. To return to browser
 sign-in, remove the saved key file and unset `VISION_API_KEY`. This removes the
 saved configuration for both wrappers. It does not revoke the key in Vision.
-For scripts, `cswap --set-vision-token TOKEN` takes the key as an argument. The
-prompt form keeps the key out of shell history. A Vision API key is not a Claude
-provider token.
+For scripts, pipe the key to `cswap --set-vision-token -`. It reads the first line
+of standard input, so the key stays out of the process list and shell history:
+
+```bash
+sed -n 's/^VISION_API_KEY=//p' .env | tr -d "'\"" | cswap --set-vision-token -
+```
+
+`-` refuses a terminal, because typed input would be shown; use the prompt there.
+`cswap --set-vision-token TOKEN` also works, but the key is then visible to other
+local users in the process list and can land in shell history. A Vision API key is
+not a Claude provider token.
 
 `cswap vision status` shows which key source and Vision URL are configured. It does
 not test the key. `cswap list` contacts Vision and reports a refused key or missing
