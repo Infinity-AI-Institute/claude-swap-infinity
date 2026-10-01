@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import sys
@@ -114,6 +115,8 @@ def _run_command(argv: list[str]) -> None:
     claude's return code. Either way the post-dispatch update check in
     main() is unreachable, which is intended. When no Claude login can serve
     the launch, it exits EXIT_NO_USABLE_LOGIN (75) before claude starts.
+
+    Only claude writes to stdout; cswap's own messages go to stderr.
     """
     # Everything after the first `--` is forwarded to claude verbatim.
     if "--" in argv:
@@ -174,6 +177,17 @@ Examples:
     )
     args = parser.parse_args(head)
 
+    # Claude owns stdout from here on. Harnesses parse the stdout of
+    # `cswap run -- -p --output-format json`, so every message cswap prints
+    # while launching (banners, notices, warnings) goes to stderr instead.
+    # This rebinds only Python's sys.stdout: claude, exec'd or spawned,
+    # inherits file descriptor 1 untouched and still answers on stdout.
+    with contextlib.redirect_stdout(sys.stderr):
+        _launch_run(args, tail)
+
+
+def _launch_run(args: argparse.Namespace, tail: list[str]) -> None:
+    """Launch claude for `cswap run` once its own arguments are parsed."""
     try:
         switcher = ClaudeAccountSwitcher(debug=args.debug)
         _guard_root(switcher)

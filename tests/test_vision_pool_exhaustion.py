@@ -344,12 +344,12 @@ def test_spent_default_account_launches_the_vision_account_with_quota(host, caps
     launched_record = host.run_native.call_args.args[4]
     assert launched_record["visionLoginId"] == item(2)["login_id"]
     output = capsys.readouterr()
-    assert "Account-2 (user2@example.invalid)" in output.out
-    # The switch is announced on stderr, which `claude -p` callers keep
-    # apart from native's answer.
+    # The switch and the launch banner are announced on stderr, which
+    # `claude -p` callers keep apart from native's answer on stdout.
+    assert output.out == ""
     assert "Account-1 (user1@example.invalid)" in output.err
     assert "5h window at 100%" in output.err
-    assert "Account-2 (user2@example.invalid)" in output.err
+    assert "Launching Account-2 (user2@example.invalid) [Vision]" in output.err
 
 
 def test_a_named_account_is_not_replaced_by_a_local_login(host, native_login, capsys):
