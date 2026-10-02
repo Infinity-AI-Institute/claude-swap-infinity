@@ -689,6 +689,42 @@ class TestRunCommand:
         assert excinfo.value.code == 1
         assert "boom" in capsys.readouterr().err
 
+    def test_launch_messages_leave_stdout_to_claude(self, capfd):
+        """Harnesses parse `cswap run -- -p --output-format json` stdout.
+
+        cswap's own launch banner and warnings must go to stderr, while claude,
+        which inherits file descriptor 1, still answers on stdout. A banner on
+        stdout made json.loads fail with "Extra data" (replication #56).
+        """
+        from claude_swap.printer import warning
+
+        answer = {"type": "result", "result": "hi"}
+
+        class LaunchingSessionManager:
+            def __init__(self, switcher):
+                pass
+
+            def run(self, identifier, claude_args, share=True, share_history=False):
+                print("Launching Account-2 (user@example.com) [Vision]")
+                warning("CLAUDE_CONFIG_DIR is already set; overriding it for this launch.")
+                # Stands in for the exec'd or spawned claude: a child process
+                # writing to the inherited stdout file descriptor.
+                subprocess.run(
+                    [sys.executable, "-c", f"print({json.dumps(answer)!r})"],
+                    check=True,
+                )
+
+        with patch("claude_swap.session.SessionManager", LaunchingSessionManager), \
+             patch("claude_swap.cli.ClaudeAccountSwitcher"), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(sys, "argv", ["claude-swap", "run", "2", "--", "-p"]):
+            cli.main()
+
+        captured = capfd.readouterr()
+        assert json.loads(captured.out) == answer
+        assert "Launching Account-2" in captured.err
+        assert "overriding it for this launch" in captured.err
+
 
 class TestSubcommandAliases:
     """Memorable subcommands (`cswap switch`, `cswap list`, ...) → classic flags."""
@@ -1457,7 +1493,7 @@ class TestRunAutoResolve:
              patch.object(sys, "argv", ["claude-swap", "run"]):
             cli.main()
         assert ("exec_default", []) in calls
-        assert "No account mapped" in capsys.readouterr().out
+        assert "No account mapped" in capsys.readouterr().err
 
     def test_removed_account_falls_back_with_warning(self, tmp_path, monkeypatch, capsys):
         from claude_swap.mappings import MappingStore
@@ -1476,7 +1512,7 @@ class TestRunAutoResolve:
              patch.object(sys, "argv", ["claude-swap", "run"]):
             cli.main()
         assert ("exec_default", []) in calls
-        assert "no longer exists" in capsys.readouterr().out
+        assert "no longer exists" in capsys.readouterr().err
 
     def test_explicit_account_still_runs(self, tmp_path, monkeypatch):
         """An explicit account argument bypasses mapping resolution."""

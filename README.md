@@ -131,6 +131,10 @@ and there is no local login, `cswap run` fails with Vision's error and exit code
 as before. A launch without `--model` checks the 5-hour and 7-day
 windows. With `--model`, it also checks that model's weekly window.
 
+Only Claude writes to standard output. cswap's own messages, such as the
+`Launching Account-N` line, fallback notices and warnings, go to standard error,
+so `cswap run -- -p --output-format json` prints exactly Claude's JSON.
+
 If the accounts run out while Claude is running, Claude's next request fails at
 once with the same explanation instead of retrying. To keep working, exit and run
 `cswap run` again without naming an account, so that it can fall back to a local
