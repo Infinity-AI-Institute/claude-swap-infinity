@@ -965,6 +965,18 @@ def main() -> None:
     if argv and argv[0] == "auto":
         _auto_command(argv[1:])
         return  # only reachable in tests where sys.exit is mocked
+    if argv and argv[0] in ("rotate-proxy", "rotate-env"):
+        from claude_swap import rotate_proxy
+
+        switcher = ClaudeAccountSwitcher()
+        port = int(os.environ.get("CSWAP_ROTATE_PORT", rotate_proxy.DEFAULT_PORT))
+        if argv[0] == "rotate-env":
+            cap = rotate_proxy.load_or_create_capability(switcher)
+            print(f"ANTHROPIC_BASE_URL=http://127.0.0.1:{port}")
+            print(f"CLAUDE_CODE_OAUTH_TOKEN={cap}")
+            return
+        rotate_proxy.serve(switcher, port=port)
+        return
     if len(sys.argv) > 1 and sys.argv[1] == "config":
         _config_command(sys.argv[2:])
         return
