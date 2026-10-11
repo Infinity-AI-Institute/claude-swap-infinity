@@ -13,12 +13,15 @@ native adapter's (``vision_proxy.InferenceProxy``).
 
 from __future__ import annotations
 
+import argparse
 import http.server
 import json
 import os
 import secrets
 import threading
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 from claude_swap.exceptions import ClaudeSwitchError
@@ -129,11 +132,26 @@ class LocalTokenPool:
             self.index = i
             return self._credential(self.accounts[i])
 
+    def reset(self, target):
+        """Clear only the selected cooldown and prefer it on the next request."""
+        with self.lock:
+            matches = [(i, a) for i, a in enumerate(self.accounts)
+                       if target in {a["num"], a["name"]}]
+            if len(matches) != 1:
+                raise ValueError("Choose one unambiguous pool account alias or slot.")
+            i, account = matches[0]
+            if account["num"] in self.dead:
+                raise ValueError("This token was rejected; replace its credentials first.")
+            self.cooling.pop(account["num"], None)
+            self.index = i
+            return account["name"]
+
     def status(self):
         with self.lock:
             now = self.clock()
             return [
                 {
+                    "slot": a["num"],
                     "name": a["name"],
                     "active": i == self.index,
                     "dead": a["num"] in self.dead,
@@ -146,8 +164,20 @@ class LocalTokenPool:
 class SharedRotateProxy(InferenceProxy):
     """The native adapter on a fixed port with a capability every agent shares."""
 
+    control_paths = ("/local/rotation/status", "/local/rotation/reset")
+
+    def control_request(self, path, payload):
+        if path.endswith("/reset"):
+            target = payload.get("account")
+            if not isinstance(target, str) or not target:
+                raise ValueError("An account alias or slot is required.")
+            name = self.credentials.reset(target)
+            return {"reset": name, "accounts": self.credentials.status()}
+        return {"accounts": self.credentials.status()}
+
     def __init__(self, credentials, *, port=DEFAULT_PORT, capability, **kw):
         super().__init__(credentials, **kw)
+        self.max_attempts = len(credentials.accounts)
         self.capability = capability
         self.port = port
 
@@ -195,3 +225,30 @@ def serve(switcher, *, port=DEFAULT_PORT, log=print) -> None:
                 time.sleep(3600)
         except KeyboardInterrupt:
             pass
+
+
+def control_command(switcher, command, arguments, *, port=DEFAULT_PORT):
+    parser = argparse.ArgumentParser(prog=f"cswap {command}")
+    if command == "rotate-reset":
+        parser.add_argument("account", help="Pool account alias or slot after a manual usage reset")
+    args = parser.parse_args(arguments)
+    path = capability_path(switcher)
+    if not path.exists():
+        raise ClaudeSwitchError("Start cswap rotate-proxy before using rotation controls.")
+    action = "reset" if command == "rotate-reset" else "status"
+    payload = {"account": args.account} if action == "reset" else {}
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}/local/rotation/{action}",
+        data=json.dumps(payload).encode(),
+        headers={"Authorization": "Bearer " + path.read_text().strip(),
+                 "Content-Type": "application/json"},
+    )
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(request, timeout=5) as response:
+            result = json.load(response)
+    except urllib.error.HTTPError as error:
+        raise ClaudeSwitchError(f"Rotation control failed (HTTP {error.code}); check the account and proxy version.") from None
+    except (OSError, ValueError):
+        raise ClaudeSwitchError("Cannot reach the local rotation proxy.") from None
+    print(json.dumps(result, indent=2))

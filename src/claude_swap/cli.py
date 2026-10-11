@@ -943,11 +943,18 @@ def main() -> None:
     if argv and argv[0] == "auto":
         _auto_command(argv[1:])
         return  # only reachable in tests where sys.exit is mocked
-    if argv and argv[0] in ("rotate-proxy", "rotate-env"):
+    if argv and argv[0] in ("rotate-proxy", "rotate-env", "rotate-status", "rotate-reset"):
         from claude_swap import rotate_proxy
 
         switcher = ClaudeAccountSwitcher()
         port = int(os.environ.get("CSWAP_ROTATE_PORT", rotate_proxy.DEFAULT_PORT))
+        if argv[0] in ("rotate-status", "rotate-reset"):
+            try:
+                rotate_proxy.control_command(switcher, argv[0], argv[1:], port=port)
+            except ClaudeSwitchError as exc:
+                print(error(str(exc)), file=sys.stderr)
+                sys.exit(1)
+            return
         if argv[0] == "rotate-env":
             cap = rotate_proxy.load_or_create_capability(switcher)
             print(f"ANTHROPIC_BASE_URL=http://127.0.0.1:{port}")
@@ -994,6 +1001,8 @@ def main() -> None:
         description="""Multi-Account Switcher for Claude Code
 
 Commands:
+  %(prog)s rotate-status              show local pool cooldowns (not provider usage)
+  %(prog)s rotate-reset <alias|slot>   clear a cooldown after resetting plan usage
   %(prog)s --set-vision-token [TOKEN] save a Vision API key for both swap tools
   %(prog)s help                       show this help
   %(prog)s list                       list managed accounts

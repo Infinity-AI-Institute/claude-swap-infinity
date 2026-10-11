@@ -76,6 +76,9 @@ class CentralCredential:
 
 
 class InferenceProxy:
+    control_paths = ()
+    max_attempts = 2
+
     def __init__(self, credentials, *, upstream=UPSTREAM):
         parsed = urllib.parse.urlsplit(upstream)
         # Loopback is supported for synthetic acceptance; callers cannot choose
@@ -149,7 +152,7 @@ class InferenceProxy:
                 if (
                     parsed.scheme
                     or parsed.netloc
-                    or parsed.path not in {"/v1/messages", "/v1/messages/count_tokens"}
+                    or parsed.path not in {"/v1/messages", "/v1/messages/count_tokens", *proxy.control_paths}
                 ):
                     self._error(404, "This native API route is not supported.")
                     return
@@ -180,6 +183,21 @@ class InferenceProxy:
                 except (ValueError, TypeError, UnicodeDecodeError):
                     self._error(400, "A native JSON message object is required.")
                     return
+                if parsed.path in proxy.control_paths:
+                    try:
+                        result = proxy.control_request(parsed.path, payload)
+                    except ValueError as error:
+                        self._error(400, str(error))
+                        return
+                    data = json.dumps(result).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
                 try:
                     credential = proxy.credentials.get(model=model)
                 except VisionError as error:
@@ -204,37 +222,28 @@ class InferenceProxy:
                 }
                 response_started = False
                 try:
-                    response = proxy.open_message(self.path, body, headers, credential)
-                    if response.status == 401:
-                        # An explicit authentication rejection precedes inference.
-                        # Close it before central recovery, and replay at most once.
-                        response.close()
-                        replacement = proxy.credentials.recover(credential, model=model)
-                        if replacement is None:
-                            self._error(
-                                401, "Central login reauthentication is required."
-                            )
-                            return
-                        credential = replacement
-                        response = proxy.open_message(
-                            self.path, body, headers, credential
-                        )
-                    elif response.status == 429:
+                    attempted = set()
+                    for attempt in range(proxy.max_attempts):
+                        attempted.add(credential["accessToken"])
+                        response = proxy.open_message(self.path, body, headers, credential)
+                        if response.status not in {401, 429} or attempt + 1 == proxy.max_attempts:
+                            break
+                        # Only explicit rejections are safe to replay. Never retry
+                        # transport errors, partial streams, or server errors.
                         try:
-                            replacement = proxy.credentials.rate_limited(
-                                credential,
-                                response.headers.get("Retry-After"),
-                                model=model,
-                            )
+                            if response.status == 401:
+                                replacement = proxy.credentials.recover(credential, model=model)
+                            else:
+                                replacement = proxy.credentials.rate_limited(
+                                    credential, response.headers.get("Retry-After"), model=model
+                                )
                         except BaseException:
                             response.close()
                             raise
-                        if replacement is not None:
-                            response.close()
-                            credential = replacement
-                            response = proxy.open_message(
-                                self.path, body, headers, credential
-                            )
+                        if replacement is None or replacement["accessToken"] in attempted:
+                            break
+                        response.close()
+                        credential = replacement
                     with response:
                         if response.status == 429:
                             proxy.credentials.record_rate_limit(
