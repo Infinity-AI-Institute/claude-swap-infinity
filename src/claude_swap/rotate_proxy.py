@@ -16,10 +16,13 @@ Setup, limits and the security trade-offs of one shared endpoint are in
 
 from __future__ import annotations
 
+import http.server
 import json
 import math
 import os
 import secrets
+import socket
+import sys
 import threading
 import time
 from pathlib import Path
@@ -210,8 +213,29 @@ class LocalTokenPool:
             ]
 
 
+class _ExclusivePortServer(http.server.ThreadingHTTPServer):
+    """A listener that never shares its port with another socket.
+
+    Agents find the proxy by a fixed port, so a second listener on that port
+    would receive some of their requests and the capability with them. POSIX
+    systems refuse a second listener. Windows accepts one from any socket that
+    sets SO_REUSEADDR, which ``HTTPServer`` does by default: there, a second
+    ``rotate-proxy`` started on a port in use without an error. On Windows the
+    port is therefore claimed exclusively instead.
+    """
+
+    allow_reuse_address = sys.platform != "win32"
+
+    def server_bind(self):
+        if sys.platform == "win32":
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
 class SharedRotateProxy(InferenceProxy):
     """The native adapter on a fixed port with a capability every agent shares."""
+
+    server_class = _ExclusivePortServer
 
     # The per-session adapter's advice is to relaunch `cswap run`, which does
     # not apply to agents that share this endpoint.
