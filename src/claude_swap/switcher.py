@@ -73,6 +73,7 @@ from claude_swap.printer import (
     ide_short_name,
     muted,
     warning,
+    yellowed,
 )
 from claude_swap.paths import (
     get_backup_root,
@@ -84,7 +85,7 @@ from claude_swap.paths import (
 )
 from claude_swap.process_detection import get_running_instances
 from claude_swap.vision import VisionError, configured_client as configured_vision_client
-from claude_swap.vision_registry import RegistryPool
+from claude_swap.vision_registry import RegistryPool, RosterSync
 from claude_swap import poll_policy
 from claude_swap.settings import (
     load_settings,
@@ -394,22 +395,53 @@ class ClaudeAccountSwitcher:
 
         run_migrations(self)
 
-    def sync_vision_accounts(self, *, force: bool = False) -> bool:
+    def sync_vision_accounts(self, *, force: bool = False) -> RosterSync:
         """Refresh optional registry membership outside credential/native locks."""
+        url = None
         try:
             client = configured_vision_client()
             if client is None:
-                return False
-            changed = RegistryPool(self, client).sync(force=force)
+                return RosterSync(url=None)
+            url = client.url
+            RegistryPool(self, client).sync(force=force)
         except VisionError as error:
             # Keep independent local profiles available during a registry outage.
             # Remote launch must still obtain an authorized credential from Vision.
             if getattr(self, "_vision_sync_error", None) != error.code:
                 self._logger.warning("Vision account synchronization failed: %s", error.code)
             self._vision_sync_error = error.code
-            return False
+            return RosterSync(url=url, failure=error)
         self._vision_sync_error = None
-        return changed
+        return RosterSync(url=url)
+
+    def _has_accounts(self) -> bool:
+        return bool((self._get_sequence_data() or {}).get("accounts"))
+
+    def warn_about_vision_roster(self, sync: RosterSync) -> None:
+        """Explain a stale or empty Vision roster to a key-only user.
+
+        Without this, an empty roster reads as "log in to Claude first", which is
+        the wrong fix for someone whose only credential is a Vision key. Prints
+        to stderr so ``--json`` stdout stays parseable.
+        """
+        if sync.failure is not None:
+            print(
+                yellowed(f"Vision accounts were not refreshed. {sync.failure}"),
+                file=sys.stderr,
+            )
+            return
+        if sync.url is None or self._has_accounts():
+            # Explain an empty Vision grant only when the roster is empty: the
+            # shared key may exist just for codex-swap, and a user with other
+            # accounts has something to use.
+            return
+        print(
+            yellowed(
+                f"Vision at {sync.url} authorizes no Claude accounts for this "
+                "API key. Ask a Vision admin to grant you use of an account."
+            ),
+            file=sys.stderr,
+        )
 
     def _is_running_in_container(self) -> bool:
         """Check if running inside a container."""
@@ -715,8 +747,10 @@ class ClaudeAccountSwitcher:
         profile's possibly-stale plaintext seed — and rather than reaching the
         fallbacks below, which belong to other stores entirely.
 
-        Read-only. cswap does not write claude's hashed keychain entry — see
-        the ``session`` module docstring for why.
+        Read-only. Session profiles are seeded through their plaintext file,
+        never a hashed keychain entry (see the ``session`` module docstring);
+        an account switch writes only the active profile's own entry
+        (``credentials._active_oauth_keychain_services``).
         """
         from claude_swap.session import read_config_dir_credentials
 
@@ -4739,7 +4773,13 @@ class ClaudeAccountSwitcher:
             entry = entries[num]
             _i = info_by_num[num]
             if self._entry_token_dead(entry, num, _i[1], _i[5], _i[4]):
-                sentinels[num] = USAGE_RELOGIN_REQUIRED
+                if self._heal_active_quarantine_from_live(entry, num, _i):
+                    self._usage_store.clear_dead_token(
+                        [num], {num: identities[num]}
+                    )
+                    entries = store.entries(identities, models)
+                else:
+                    sentinels[num] = USAGE_RELOGIN_REQUIRED
             elif entry.auth_dead_strikes and entry.token_dead():
                 # Struck, but no stored source still matches the condemned
                 # generation — the fingerprint healed the verdict.
@@ -4877,6 +4917,72 @@ class ClaudeAccountSwitcher:
         else:
             stored = backup
         return self._entry_token_dead(entry, num, email, stored, is_active)
+
+    def _heal_active_quarantine_from_live(
+        self,
+        entry: UsageEntry,
+        num: str,
+        account_info: tuple[int, str, str, str, bool, str, str],
+    ) -> bool:
+        """Lift a quarantine that the ACTIVE slot's healthy live login disproves.
+
+        Claude Code rotates the live refresh token during normal use. When no
+        collect pass resynced the backup in time, the backup keeps the consumed
+        predecessor, a later POST of it returns invalid_grant, and the slot is
+        quarantined. The repair (``_resync_rotated_backup``) only runs on the
+        fetch path, and the quarantine skips that path, so the active slot
+        stayed "re-login needed" indefinitely although its live login worked.
+
+        Resync the backup from the live credential here. The resync attributes
+        the live bytes to this slot with the profile oracle (which also proves
+        the live access token is accepted) and writes only under the slot and
+        credential locks. The quarantine lifts only if the oracle attributed
+        the live lineage and the backup now holds it; a degraded (Keychain
+        fallback) read never heals. If the live lineage is itself dead, the
+        next refresh earns a fingerprint-bound strike on it and the check
+        below then refuses to heal, so a dead login cannot loop.
+
+        Returns True when the caller should clear the strike.
+        """
+        _num, email, _org_name, org_uuid, is_active, live, _alias = account_info
+        if not is_active or not live:
+            return False
+        if self._active_read_degraded:
+            # Same rule as the fetch path's resync: a Keychain-fallback read
+            # may serve a consumed predecessor whose access token the oracle
+            # still accepts. Writing it would put a dead refresh token in the
+            # backup and lift the quarantine on it.
+            return False
+        live_oauth = oauth.extract_oauth_data(live)
+        if not (
+            live_oauth
+            and live_oauth.get("accessToken")
+            and live_oauth.get("refreshToken")
+        ):
+            return False
+        if oauth.is_oauth_token_expired(live_oauth.get("expiresAt")):
+            # The ownership probe needs an access token the server accepts.
+            return False
+        live_fp = oauth.credential_fingerprint(live)
+        if entry.struck_fingerprint is not None and live_fp == entry.struck_fingerprint:
+            return False  # the live credential is the condemned generation
+        self._resync_rotated_backup(num, email, org_uuid or "", live)
+        # The oracle must have attributed the live lineage. The resync
+        # returns before probing when the backup already holds that lineage,
+        # and with a legacy (fingerprint-less) strike that lineage may be the
+        # struck one, so "backup == live" alone proves nothing. Such a slot
+        # stays quarantined until Claude Code next rotates the live token;
+        # the resync then probes the new lineage.
+        if not self._probe_verdicts.get(
+            self._lineage_key(num, email, live_fp or "")
+        ):
+            return False
+        backup, unreadable = self._read_account_credentials_ex(num, email)
+        return (
+            not unreadable
+            and bool(backup)
+            and oauth.credential_fingerprint(backup) == live_fp
+        )
 
     def _entry_token_dead(
         self,
@@ -5274,7 +5380,12 @@ class ClaudeAccountSwitcher:
         watch view's adaptive set); ``None`` — the CLI default — leaves every
         stale account eligible.
         """
-        self.sync_vision_accounts()
+        sync = self.sync_vision_accounts()
+        if sync.failure is not None and not self._has_accounts():
+            # Nothing to list, and the first-run prompt below would tell a
+            # key-only user to log in to Claude. Vision's refusal is the fix.
+            raise sync.failure
+        self.warn_about_vision_roster(sync)
         if not self.sequence_file.exists():
             # JSON mode must never prompt — emit an empty list instead of the
             # interactive first-run setup.

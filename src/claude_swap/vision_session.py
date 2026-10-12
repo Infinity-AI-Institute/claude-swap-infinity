@@ -28,6 +28,14 @@ ROUTE_OVERRIDES = {
 }
 
 
+class CredentialUnavailable(SessionError):
+    """Vision cannot issue a usable credential for this login right now.
+
+    Distinct from the local storage errors ``prepare_launch`` raises: this one
+    is about the central login, so a launcher may try another login instead.
+    """
+
+
 @dataclass(frozen=True)
 class RemoteLaunch:
     directory: Path  # Existing native config/conversation home, not credential storage.
@@ -50,7 +58,9 @@ def acquire_credential(client: VisionClient, record: dict, *, wait_seconds=90):
         raise VisionError("credential_unavailable")
     receipt = client.refresh(account, login, generation)
     if receipt["state"] == "reauth_required":
-        raise SessionError("The Vision login needs reauthentication before launch.")
+        raise CredentialUnavailable(
+            "The Vision login needs reauthentication before launch."
+        )
     # Only queued/running receipts schedule recovery work. Re-read once in
     # case another owner already published a successor, then surface issuance
     # failure instead of polling an unrelated broker error for 90 seconds.
@@ -64,7 +74,7 @@ def acquire_credential(client: VisionClient, record: dict, *, wait_seconds=90):
             if error.code != "credential_unavailable":
                 raise
             if time.monotonic() >= deadline:
-                raise SessionError(
+                raise CredentialUnavailable(
                     "Vision credential recovery is pending; retry the launch."
                 ) from None
         time.sleep(min(1, max(0, deadline - time.monotonic())))

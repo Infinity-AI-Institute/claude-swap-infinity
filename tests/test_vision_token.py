@@ -1,5 +1,6 @@
 """Shared-key startup contract; all key material is synthetic."""
 
+import io
 import json
 import os
 from pathlib import Path
@@ -159,3 +160,82 @@ def test_status_reports_saved_key_before_pending_browser_flow(monkeypatch, tmp_p
     result = run_command(["status"], SimpleNamespace(backup_dir=tmp_path))
     assert result["state"] == "configured"
     assert result["source"] == "shared_config"
+
+
+class _TerminalInput(io.StringIO):
+    """A terminal on stdin: typed input would be echoed back to the screen."""
+
+    def isatty(self):
+        return True
+
+
+@pytest.mark.parametrize("arguments", [["--set-vision-token", "-"], ["--set-vision-token=-"]])
+@pytest.mark.parametrize("piped", [KEY + "\n", KEY + "\r\n", KEY, KEY + "\nsecond line is not read\n"])
+def test_dash_reads_the_key_from_the_first_line_of_stdin(monkeypatch, capsys, arguments, piped):
+    from claude_swap.cli import main
+    monkeypatch.setattr("sys.stdin", io.StringIO(piped))
+    monkeypatch.setattr("sys.argv", ["cswap", *arguments])
+    monkeypatch.setattr("claude_swap.switcher.ClaudeAccountSwitcher", lambda *a: pytest.fail("native switcher constructed"))
+    monkeypatch.setattr("getpass.getpass", lambda prompt: pytest.fail("prompted instead of reading stdin"))
+    main()
+    assert configured_client().api_key == KEY
+    output = capsys.readouterr()
+    assert KEY not in output.out + output.err
+
+
+def test_dash_with_empty_stdin_does_not_save(monkeypatch, capsys):
+    monkeypatch.setattr("sys.stdin", io.StringIO(""))
+    with pytest.raises(SystemExit) as exit_info:
+        setup_command(["-"])
+    assert exit_info.value.code == 1
+    assert "No Vision API key on standard input" in capsys.readouterr().err
+    assert not token_path().exists()
+
+
+def test_dash_with_invalid_line_keeps_previous_key_and_does_not_echo(monkeypatch, capsys):
+    save_token(KEY)
+    monkeypatch.setattr("sys.stdin", io.StringIO("secret-invalid\n"))
+    with pytest.raises(SystemExit):
+        setup_command(["-"])
+    assert configured_client().api_key == KEY
+    output = capsys.readouterr()
+    assert "secret-invalid" not in output.out + output.err
+    assert "Vision Settings" in output.err
+
+
+def test_dash_refuses_a_terminal_so_the_key_is_never_echoed(monkeypatch, capsys):
+    terminal = _TerminalInput(KEY + "\n")
+    monkeypatch.setattr("sys.stdin", terminal)
+    with pytest.raises(SystemExit):
+        setup_command(["-"])
+    assert terminal.tell() == 0, "a terminal line was read"
+    assert "hidden prompt" in capsys.readouterr().err
+    assert not token_path().exists()
+
+
+def test_noninteractive_prompt_points_to_the_stdin_form(monkeypatch, capsys):
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    with pytest.raises(SystemExit):
+        setup_command([])
+    assert "--set-vision-token -" in capsys.readouterr().err
+
+
+def test_dash_through_a_real_pipe_keeps_the_key_out_of_argv(tmp_path):
+    import subprocess
+    import sys
+
+    environment = {
+        **os.environ,
+        "HOME": str(tmp_path),
+        "USERPROFILE": str(tmp_path),
+        "XDG_CONFIG_HOME": str(tmp_path / "config"),
+        "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
+    }
+    environment.pop("VISION_API_KEY", None)
+    environment.pop("VISION_API_URL", None)
+    arguments = [sys.executable, "-c", "from claude_swap.cli import main; main()", "--set-vision-token", "-"]
+    completed = subprocess.run(arguments, input=KEY + "\n", env=environment, capture_output=True, text=True, timeout=60)
+    assert completed.returncode == 0, completed.stderr
+    assert KEY not in completed.stdout + completed.stderr + " ".join(arguments)
+    saved = json.loads((tmp_path / "config" / "vision" / "credentials.json").read_text())
+    assert saved["api_key"] == KEY

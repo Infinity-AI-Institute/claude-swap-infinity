@@ -57,12 +57,31 @@ ERROR_CODES = {
 }
 
 
+# The two refusals a key-only user can act on. A Vision API key is the only
+# input they configured, so the fix is in that key or in the access Vision
+# grants its owner, never a provider login. Other codes are service states.
+ACCESS_REFUSAL_ADVICE = {
+    "unauthorized": (
+        "The Vision API key was not accepted. Create a new key in Vision "
+        "Settings (gear) → API keys. If VISION_API_KEY is set, put the new key "
+        "there, because it overrides a saved key. Otherwise run "
+        "cswap --set-vision-token."
+    ),
+    "not_permitted": (
+        "Your Vision user is not an invited member, or this API key lacks "
+        "agent-account access. Ask a Vision admin."
+    ),
+}
+
+
 class VisionError(ClaudeSwitchError):
     def __init__(
         self,
         code: str,
         status: int | None = None,
         retry_after_seconds: int | None = None,
+        *,
+        url: str | None = None,
     ):
         self.code = (
             code
@@ -71,7 +90,12 @@ class VisionError(ClaudeSwitchError):
         )
         self.status = status
         self.retry_after_seconds = retry_after_seconds
-        super().__init__(f"Vision account registry: {self.code}.")
+        source = "Vision account registry" if url is None else f"Vision at {url}"
+        message = f"{source}: {self.code}."
+        advice = ACCESS_REFUSAL_ADVICE.get(self.code)
+        if advice is not None:
+            message += " " + advice
+        super().__init__(message)
 
 
 def origin(value: str) -> str:
@@ -203,7 +227,7 @@ class VisionTransport:
                 and 1 <= int(raw_retry) <= 3600
             ):
                 retry_after = int(raw_retry)
-            raise VisionError(code, error.code, retry_after) from None
+            raise VisionError(code, error.code, retry_after, url=self.url) from None
         except VisionError:
             raise
         except (OSError, urllib.error.URLError, ValueError):

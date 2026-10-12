@@ -315,20 +315,21 @@ def format_reset(resets_at: str) -> tuple[str, str]:
     """Return (countdown, clock) for a reset time in local time."""
     reset_utc = datetime.fromisoformat(resets_at)
     now = datetime.now(timezone.utc)
-    remaining = reset_utc - now
-    total_seconds = max(0, int(remaining.total_seconds()))
+    countdown = format_countdown((reset_utc - now).total_seconds())
+    return countdown, reset_clock_string(reset_utc, now)
+
+
+def format_countdown(seconds: float) -> str:
+    """A wait as "2d 3h", "1h 52m" or "7m"; a past time reads "0m"."""
+    total_seconds = max(0, int(seconds))
     days, remainder = divmod(total_seconds, 86400)
     hours, remainder = divmod(remainder, 3600)
     minutes = remainder // 60
-
     if days > 0:
-        countdown = f"{days}d {hours}h"
-    elif hours > 0:
-        countdown = f"{hours}h {minutes}m"
-    else:
-        countdown = f"{minutes}m"
-
-    return countdown, reset_clock_string(reset_utc, now)
+        return f"{days}d {hours}h"
+    if hours > 0:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
 
 
 def reset_clock_string(reset_utc: datetime, now_utc: datetime) -> str:

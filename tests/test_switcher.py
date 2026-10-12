@@ -14,7 +14,11 @@ import pytest
 
 from claude_swap import macos_keychain
 from claude_swap import oauth
-from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, USAGE_TOKEN_EXPIRED
+from claude_swap.json_output import (
+    USAGE_FOREIGN_CREDENTIAL,
+    USAGE_RELOGIN_REQUIRED,
+    USAGE_TOKEN_EXPIRED,
+)
 from claude_swap.exceptions import (
     AccountNotFoundError,
     ConfigError,
@@ -12222,3 +12226,144 @@ class TestSessionShellGuardCoversEveryMutator:
         s = self._switcher(sample_sequence_data, monkeypatch)
         with pytest.raises(SwitchError):
             s.unset_alias("2")
+
+
+class TestActiveQuarantineHealsFromLiveLogin:
+    """An active slot quarantined on its dead BACKUP must heal from a healthy
+    live login of the same account.
+
+    Claude Code rotated the live token in normal use; the backup kept the
+    consumed predecessor and struck on invalid_grant. The resync that repairs
+    the backup only ran on the fetch path, which the quarantine skips, so the
+    slot showed "re-login needed" indefinitely while its live login worked.
+    """
+
+    _DEAD_BACKUP = json.dumps({
+        "claudeAiOauth": {
+            "accessToken": "sk-dead", "refreshToken": "rt-dead",
+            "expiresAt": 1000,
+        }
+    })
+    _LIVE = json.dumps({
+        "claudeAiOauth": {
+            "accessToken": "sk-live", "refreshToken": "rt-live",
+            "expiresAt": 9999999999000,
+        }
+    })
+    _PROFILE_SELF = {
+        "uuid": "uuid-1", "email": "test@example.com", "organizationUuid": None
+    }
+
+    def _switcher(self, sample_sequence_data, struck_fp, backup=_DEAD_BACKUP):
+        from claude_swap.usage_store import FetchRecord
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", backup)
+        identities = {"1": ("test@example.com", "")}
+        s._usage_store.record(
+            {"1": FetchRecord(error="invalid_grant", struck_fp=struck_fp)},
+            identities,
+        )
+        assert s._usage_store.entries(identities, [])["1"].token_dead()
+        return s
+
+    def _collect(self, s, probe_result):
+        info = (1, "test@example.com", "", "", True, self._LIVE, "")
+        with patch.object(s, "_read_credentials", return_value=self._LIVE), \
+             patch.object(s, "_live_identity_matches", return_value=True), \
+             patch("claude_swap.oauth.fetch_oauth_profile",
+                   return_value=probe_result) as probe, \
+             patch.object(s, "_run_usage_fetches", return_value={}):
+            entries = s._collect_usage_entries([info])
+        return entries["1"], probe
+
+    @pytest.mark.parametrize("bound", [True, False], ids=["fp-bound", "legacy"])
+    def test_healthy_live_login_resyncs_backup_and_lifts_quarantine(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, bound: bool
+    ):
+        struck = oauth.credential_fingerprint(self._DEAD_BACKUP) if bound else None
+        s = self._switcher(sample_sequence_data, struck)
+
+        entry, probe = self._collect(s, self._PROFILE_SELF)
+
+        probe.assert_called_once()
+        assert s._read_account_credentials("1", "test@example.com") == self._LIVE
+        assert entry.sentinel != USAGE_RELOGIN_REQUIRED
+        assert not s._usage_store.entries(
+            {"1": ("test@example.com", "")}, []
+        )["1"].token_dead()
+
+    def test_condemned_live_generation_stays_quarantined_without_probe(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict
+    ):
+        s = self._switcher(
+            sample_sequence_data, oauth.credential_fingerprint(self._LIVE)
+        )
+        entry, probe = self._collect(s, self._PROFILE_SELF)
+
+        probe.assert_not_called()
+        assert entry.sentinel == USAGE_RELOGIN_REQUIRED
+        assert (
+            s._read_account_credentials("1", "test@example.com")
+            == self._DEAD_BACKUP
+        )
+
+    def test_foreign_live_login_leaves_backup_and_quarantine(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict
+    ):
+        s = self._switcher(sample_sequence_data, None)
+        foreign = {
+            "uuid": "someone-else", "email": "other@example.com",
+            "organizationUuid": None,
+        }
+        entry, _probe = self._collect(s, foreign)
+
+        assert entry.sentinel == USAGE_RELOGIN_REQUIRED
+        assert (
+            s._read_account_credentials("1", "test@example.com")
+            == self._DEAD_BACKUP
+        )
+
+    def test_degraded_live_read_stays_quarantined_without_probe(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict
+    ):
+        # A Keychain failure covered by the plaintext fallback may serve a
+        # consumed predecessor whose access token is still accepted: the
+        # oracle would attribute it, and the heal would write a dead refresh
+        # token into the backup. The fetch path never resyncs from a degraded
+        # read; the heal must not either.
+        s = self._switcher(sample_sequence_data, None)
+        s._record_active_verdict(ActiveCredentials(self._LIVE, False, True))
+
+        entry, probe = self._collect(s, self._PROFILE_SELF)
+
+        probe.assert_not_called()
+        assert entry.sentinel == USAGE_RELOGIN_REQUIRED
+        assert (
+            s._read_account_credentials("1", "test@example.com")
+            == self._DEAD_BACKUP
+        )
+
+    def test_legacy_strike_on_live_lineage_needs_an_oracle_verdict(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict
+    ):
+        # A legacy (fingerprint-less) strike binds to whatever is stored. When
+        # the backup already holds the live lineage, the resync has nothing
+        # to write and never probes, so "backup == live" alone is no evidence
+        # that the struck generation is gone. Without an oracle verdict the
+        # quarantine must hold.
+        s = self._switcher(sample_sequence_data, None, backup=self._LIVE)
+
+        entry, _probe = self._collect(s, self._PROFILE_SELF)
+
+        assert entry.sentinel == USAGE_RELOGIN_REQUIRED
+        assert s._usage_store.entries(
+            {"1": ("test@example.com", "")}, []
+        )["1"].token_dead()

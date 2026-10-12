@@ -3,6 +3,7 @@
 import io
 import json
 import time
+import urllib.error
 from datetime import datetime, timezone
 from unittest.mock import Mock
 
@@ -164,6 +165,36 @@ def test_transport_rejects_oversized_delivery(monkeypatch):
     monkeypatch.setattr("urllib.request.build_opener", lambda *args: Opener())
     with pytest.raises(VisionError):
         client().request("GET", "/api/ai-accounts/registry")
+
+
+@pytest.mark.parametrize(
+    ("status", "code", "advice"),
+    [(401, "unauthorized", "VISION_API_KEY"), (403, "not_permitted", "Vision admin")],
+)
+def test_refused_key_error_names_the_vision_url_and_the_fix(
+    monkeypatch, status, code, advice
+):
+    """A key-only user's next step comes from Vision's refusal, not a Claude login."""
+
+    class Opener:
+        def open(self, req, timeout):
+            body = io.BytesIO(json.dumps({"error": {"code": code}}).encode())
+            raise urllib.error.HTTPError(req.full_url, status, "refused", {}, body)
+
+    monkeypatch.setattr("urllib.request.build_opener", lambda *args: Opener())
+    with pytest.raises(VisionError) as refused:
+        client().discover()
+    message = str(refused.value)
+    assert refused.value.code == code
+    assert "https://vision.example.invalid" in message
+    assert advice in message
+    assert "synthetic-private-key" not in message
+
+
+def test_service_errors_keep_their_short_message():
+    assert str(VisionError("service_unavailable")) == (
+        "Vision account registry: service_unavailable."
+    )
 
 
 def test_refresh_request_is_generation_fenced_and_never_calls_a_provider():

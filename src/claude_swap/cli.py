@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import sys
 
 from claude_swap import __version__, paths, printer
-from claude_swap.exceptions import ClaudeSwitchError
+from claude_swap.exceptions import (
+    EXIT_NO_USABLE_LOGIN,
+    ClaudeSwitchError,
+    NoUsableLogin,
+)
 from claude_swap.json_output import error_envelope
 from claude_swap.printer import (
     accent,
@@ -108,7 +113,10 @@ def _run_command(argv: list[str]) -> None:
 
     On POSIX this execs claude and never returns; on Windows it exits with
     claude's return code. Either way the post-dispatch update check in
-    main() is unreachable, which is intended.
+    main() is unreachable, which is intended. When no Claude login can serve
+    the launch, it exits EXIT_NO_USABLE_LOGIN (75) before claude starts.
+
+    Only claude writes to stdout; cswap's own messages go to stderr.
     """
     # Everything after the first `--` is forwarded to claude verbatim.
     if "--" in argv:
@@ -169,6 +177,17 @@ Examples:
     )
     args = parser.parse_args(head)
 
+    # Claude owns stdout from here on. Harnesses parse the stdout of
+    # `cswap run -- -p --output-format json`, so every message cswap prints
+    # while launching (banners, notices, warnings) goes to stderr instead.
+    # This rebinds only Python's sys.stdout: claude, exec'd or spawned,
+    # inherits file descriptor 1 untouched and still answers on stdout.
+    with contextlib.redirect_stdout(sys.stderr):
+        _launch_run(args, tail)
+
+
+def _launch_run(args: argparse.Namespace, tail: list[str]) -> None:
+    """Launch claude for `cswap run` once its own arguments are parsed."""
     try:
         switcher = ClaudeAccountSwitcher(debug=args.debug)
         _guard_root(switcher)
@@ -211,6 +230,9 @@ Examples:
         manager.exec_default(
             tail, share=not args.no_share, share_history=args.share_history
         )
+    except NoUsableLogin as e:
+        error(f"Error: {e}")
+        sys.exit(EXIT_NO_USABLE_LOGIN)
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
         sys.exit(1)
@@ -735,6 +757,51 @@ Defaults live in settings.json in the backup root; flags override them.
         sys.exit(130)
 
 
+_ROTATE_COMMAND_DESCRIPTIONS = {
+    "rotate-proxy": (
+        "Serve one loopback endpoint that every Claude Code process on this "
+        "machine can share. Each request is forwarded with one pooled setup "
+        "token; when the provider rate-limits that account, the proxy moves "
+        "to the next. Runs in the foreground until interrupted."
+    ),
+    "rotate-env": (
+        "Print the two environment variables that point a Claude Code process "
+        "at `cswap rotate-proxy`, for example: export $(cswap rotate-env)"
+    ),
+}
+
+
+def _rotate_command(command: str, argv: list[str]) -> None:
+    """Handle `cswap rotate-proxy` and `cswap rotate-env`.
+
+    Pre-dispatched before the main parser is built, like `run` and `auto`.
+    """
+    from claude_swap import rotate_proxy
+
+    parser = argparse.ArgumentParser(
+        prog=f"cswap {command}",
+        description=_ROTATE_COMMAND_DESCRIPTIONS[command],
+        epilog=(
+            f"The proxy listens on 127.0.0.1 port {rotate_proxy.DEFAULT_PORT}. "
+            f"Set {rotate_proxy.PORT_ENVIRONMENT_VARIABLE} to use another port, "
+            "with the same value for both commands. See docs/rotate-proxy.md."
+        ),
+    )
+    parser.parse_args(argv)
+    try:
+        port = rotate_proxy.port_from_environment()
+        switcher = ClaudeAccountSwitcher()
+        if command == "rotate-env":
+            capability = rotate_proxy.load_or_create_capability(switcher)
+            print(f"ANTHROPIC_BASE_URL=http://127.0.0.1:{port}")
+            print(f"CLAUDE_CODE_OAUTH_TOKEN={capability}")
+        else:
+            rotate_proxy.serve(switcher, port=port)
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+
+
 def _config_command(argv: list[str]) -> None:
     """Handle `cswap config [list|get KEY|set KEY VALUE|unset KEY|path]`.
 
@@ -943,24 +1010,19 @@ def main() -> None:
     if argv and argv[0] == "auto":
         _auto_command(argv[1:])
         return  # only reachable in tests where sys.exit is mocked
-    if argv and argv[0] in ("rotate-proxy", "rotate-env", "rotate-status", "rotate-reset"):
+    if argv and argv[0] in ("rotate-status", "rotate-reset"):
         from claude_swap import rotate_proxy
 
         switcher = ClaudeAccountSwitcher()
         port = int(os.environ.get("CSWAP_ROTATE_PORT", rotate_proxy.DEFAULT_PORT))
-        if argv[0] in ("rotate-status", "rotate-reset"):
-            try:
-                rotate_proxy.control_command(switcher, argv[0], argv[1:], port=port)
-            except ClaudeSwitchError as exc:
-                print(error(str(exc)), file=sys.stderr)
-                sys.exit(1)
-            return
-        if argv[0] == "rotate-env":
-            cap = rotate_proxy.load_or_create_capability(switcher)
-            print(f"ANTHROPIC_BASE_URL=http://127.0.0.1:{port}")
-            print(f"CLAUDE_CODE_OAUTH_TOKEN={cap}")
-            return
-        rotate_proxy.serve(switcher, port=port)
+        try:
+            rotate_proxy.control_command(switcher, argv[0], argv[1:], port=port)
+        except ClaudeSwitchError as exc:
+            print(error(str(exc)), file=sys.stderr)
+            sys.exit(1)
+        return
+    if argv and argv[0] in _ROTATE_COMMAND_DESCRIPTIONS:
+        _rotate_command(argv[0], argv[1:])
         return
     if len(sys.argv) > 1 and sys.argv[1] == "config":
         _config_command(sys.argv[2:])
@@ -1004,6 +1066,7 @@ Commands:
   %(prog)s rotate-status              show local pool cooldowns (not provider usage)
   %(prog)s rotate-reset <alias|slot>   clear a cooldown after resetting plan usage
   %(prog)s --set-vision-token [TOKEN] save a Vision API key for both swap tools
+  %(prog)s --set-vision-token -       same, reading the key from stdin
   %(prog)s help                       show this help
   %(prog)s list                       list managed accounts
   %(prog)s status                     show current account
@@ -1025,6 +1088,8 @@ Commands:
   %(prog)s swap <a> <b>               exchange two accounts' slot numbers
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
   %(prog)s auto                       auto-switch when nearing rate limits
+  %(prog)s rotate-proxy               share one endpoint that rotates setup tokens
+  %(prog)s rotate-env                 print the environment that points Claude at it
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
   %(prog)s unclaimed [--purge ID]     list or drop stashed credential entries
   %(prog)s export <path>              export accounts
@@ -1032,6 +1097,9 @@ Commands:
   %(prog)s tui                        interactive dashboard (also: bare %(prog)s)
   %(prog)s watch                      dashboard, opened on the live watch page
   %(prog)s menubar                    macOS menu bar app
+  %(prog)s vision status              show the configured Vision key and URL
+  %(prog)s vision account-login <name>  add a Claude account to Vision
+  %(prog)s vision --help              all Vision account commands
   %(prog)s upgrade                    self-upgrade to latest
   %(prog)s purge                      remove all claude-swap data
 

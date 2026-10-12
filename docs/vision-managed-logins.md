@@ -1,14 +1,17 @@
 # Managed Claude logins
 
 Native launch, credential recovery, and conversation resume are implemented.
-Production compatibility and rollout acceptance require their own live evidence.
+Vision's [qualification evidence](https://github.com/Infinity-AI-Institute/vision/blob/main/docs/agent-accounts/qualification.md#live-launch-and-resume-evidence) records a live key-only launch and
+resume on a fresh Linux client.
 
 ## Use an existing Vision account
 
-After [one-time Vision setup](../README.md#get-started-with-infinity-vision), with an authorized Claude login in
-Vision, the wrapper discovers the pool automatically:
+A Vision API key is the only setup these clients need. After you
+[install the fork and set the key](../README.md#get-started-with-infinity-vision),
+pull and use the Claude accounts that Vision grants you:
 
 ```sh
+cswap list
 cswap run
 cswap run -- --resume CONVERSATION_ID
 ```
@@ -51,8 +54,9 @@ first.
 
 ## Transfer the login to Vision
 
+With a Vision API key configured:
+
 ```sh
-cswap vision login
 cswap vision upload personal
 cswap run personal
 ```
@@ -177,8 +181,9 @@ merge conversations from other native homes.
 
 Pinned Claude 2.1.270 has passed synthetic access-only inference, cold resume after
 an account change, and resume of a conversation created in the default native
-home. The live multiuser pilot and clean EC2 rollout acceptance remain separate
-required checks.
+home. On September 14, 2026, a live launch and resume on a clean Linux EC2 client
+passed with only a Vision API key. Luke removed the 24-hour multiuser pilot
+requirement the same day. Both are recorded in Vision's qualification docs.
 
 ## Central credentials during a native session
 
@@ -203,5 +208,6 @@ when its child exits. It does not replay an upstream request after an uncertain
 connection failure or replace credentials inside native storage.
 
 Pinned Claude 2.1.270 has completed two synthetic turns in one process with a
-central access-token change between turns and the same conversation ID. Automatic
-quota-driven account switching and in-session relogin recovery remain unfinished.
+central access-token change between turns and the same conversation ID. The same
+synthetic qualification covers quota-driven account switching and recovery from a
+rejected access token within one process. See [VISION.md](VISION.md).
