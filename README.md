@@ -516,6 +516,23 @@ setup-token. It switches like any other account; since API keys have no subscrip
 quota, they show no usage and the usage-aware `switch` strategies never skip them as
 rate-limited.
 
+### Share setup tokens across agents on one machine
+
+`cswap rotate-proxy` serves one local endpoint for every Claude Code process on the
+machine. It forwards requests with one registered setup token and moves to the next
+when the provider rate-limits that account.
+
+```bash
+cswap rotate-proxy              # leave running
+export $(cswap rotate-env)      # in each shell that starts an agent
+claude
+```
+
+Only setup tokens are pooled, never API keys or browser logins. The endpoint is
+meant for a machine you do not share with untrusted users. See the
+[rotation proxy guide](docs/rotate-proxy.md) for how rotation works, its limits,
+and the security trade-offs.
+
 ## Uninstall
 
 Remove all data:
