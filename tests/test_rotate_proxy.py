@@ -414,6 +414,19 @@ def test_occupied_port_is_a_usage_error(rotating_upstream):
             second.__enter__()
 
 
+def test_another_socket_cannot_join_the_listening_port(rotating_upstream):
+    url, _statuses, _seen = rotating_upstream
+    with SharedRotateProxy(
+        LocalTokenPool(accounts()), port=0, capability="cap", upstream=url
+    ) as proxy:
+        with socket.socket() as intruder:
+            # Windows grants a port that is in use to a socket that asks to
+            # reuse the address, unless the listener claimed it exclusively.
+            intruder.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            with pytest.raises(OSError):
+                intruder.bind(("127.0.0.1", proxy.server.server_port))
+
+
 def store_in(directory: Path) -> types.SimpleNamespace:
     """The one switcher attribute the capability file depends on."""
     return types.SimpleNamespace(backup_dir=directory)

@@ -87,6 +87,8 @@ class CentralCredential:
 
 
 class InferenceProxy:
+    # The listener. A subclass that agents find by a fixed port replaces it.
+    server_class = http.server.ThreadingHTTPServer
     # POST paths a subclass answers itself instead of forwarding upstream.
     control_paths = ()
     # Appended to the reason when no login can serve. A subclass whose callers
@@ -305,9 +307,7 @@ class InferenceProxy:
                 except (BrokenPipeError, ConnectionResetError):
                     pass
 
-        self.server = http.server.ThreadingHTTPServer(
-            ("127.0.0.1", self.port), Handler
-        )
+        self.server = self.server_class(("127.0.0.1", self.port), Handler)
         self.server.daemon_threads = True
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
