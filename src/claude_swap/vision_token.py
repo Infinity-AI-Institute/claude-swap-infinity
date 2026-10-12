@@ -81,16 +81,35 @@ def save_token(token: str) -> Path:
     return path
 
 
+def _read_token_from_stdin() -> str:
+    """Read the key from the first line of piped input, so it stays out of argv."""
+    if sys.stdin.isatty():
+        # Typed input would be echoed; the prompt form hides it.
+        raise SessionError(
+            "--set-vision-token - reads a pipe. In a terminal, omit - to get the hidden prompt."
+        )
+    line = sys.stdin.readline()
+    if not line:
+        raise SessionError("No Vision API key on standard input.")
+    # A key has no whitespace; this removes the line ending, including CRLF.
+    return line.strip()
+
+
 def setup_command(argv: list[str]) -> None:
     """Set only wrapper configuration; never construct a native account switcher."""
     try:
         if len(argv) > 1:
-            raise SessionError("Use --set-vision-token [TOKEN] by itself.")
-        if argv:
+            raise SessionError("Use --set-vision-token [TOKEN | -] by itself.")
+        if argv == ["-"]:
+            token = _read_token_from_stdin()
+        elif argv:
             token = argv[0]
         else:
             if not sys.stdin.isatty():
-                raise SessionError("Run --set-vision-token in a terminal to enter the key privately.")
+                raise SessionError(
+                    "Run --set-vision-token in a terminal to enter the key privately, "
+                    "or pipe it to --set-vision-token -."
+                )
             with warnings.catch_warnings():
                 warnings.simplefilter("error", getpass.GetPassWarning)
                 token = getpass.getpass("Vision API key: ")
@@ -100,6 +119,10 @@ def setup_command(argv: list[str]) -> None:
             print("VISION_API_KEY is set and takes precedence over the saved key.")
     except (EOFError, KeyboardInterrupt):
         raise SystemExit(130) from None
+    except SessionError as error:
+        # These messages are fixed strings in this package; none includes the key.
+        print(f"Could not save Vision API key. {error}", file=sys.stderr)
+        raise SystemExit(1) from None
     except (ClaudeSwitchError, OSError, getpass.GetPassWarning):
         # Filesystem errors can include user-controlled content; keep diagnostics secret-free.
         print("Could not save Vision API key. Use a valid key and private config directory.", file=sys.stderr)

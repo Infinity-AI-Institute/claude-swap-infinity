@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import sys
 
 from claude_swap import __version__, paths, printer
-from claude_swap.exceptions import ClaudeSwitchError
+from claude_swap.exceptions import (
+    EXIT_NO_USABLE_LOGIN,
+    ClaudeSwitchError,
+    NoUsableLogin,
+)
 from claude_swap.json_output import error_envelope
 from claude_swap.printer import (
     accent,
@@ -108,7 +113,10 @@ def _run_command(argv: list[str]) -> None:
 
     On POSIX this execs claude and never returns; on Windows it exits with
     claude's return code. Either way the post-dispatch update check in
-    main() is unreachable, which is intended.
+    main() is unreachable, which is intended. When no Claude login can serve
+    the launch, it exits EXIT_NO_USABLE_LOGIN (75) before claude starts.
+
+    Only claude writes to stdout; cswap's own messages go to stderr.
     """
     # Everything after the first `--` is forwarded to claude verbatim.
     if "--" in argv:
@@ -169,6 +177,17 @@ Examples:
     )
     args = parser.parse_args(head)
 
+    # Claude owns stdout from here on. Harnesses parse the stdout of
+    # `cswap run -- -p --output-format json`, so every message cswap prints
+    # while launching (banners, notices, warnings) goes to stderr instead.
+    # This rebinds only Python's sys.stdout: claude, exec'd or spawned,
+    # inherits file descriptor 1 untouched and still answers on stdout.
+    with contextlib.redirect_stdout(sys.stderr):
+        _launch_run(args, tail)
+
+
+def _launch_run(args: argparse.Namespace, tail: list[str]) -> None:
+    """Launch claude for `cswap run` once its own arguments are parsed."""
     try:
         switcher = ClaudeAccountSwitcher(debug=args.debug)
         _guard_root(switcher)
@@ -211,6 +230,9 @@ Examples:
         manager.exec_default(
             tail, share=not args.no_share, share_history=args.share_history
         )
+    except NoUsableLogin as e:
+        error(f"Error: {e}")
+        sys.exit(EXIT_NO_USABLE_LOGIN)
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
         sys.exit(1)
@@ -995,6 +1017,7 @@ def main() -> None:
 
 Commands:
   %(prog)s --set-vision-token [TOKEN] save a Vision API key for both swap tools
+  %(prog)s --set-vision-token -       same, reading the key from stdin
   %(prog)s help                       show this help
   %(prog)s list                       list managed accounts
   %(prog)s status                     show current account
@@ -1023,6 +1046,9 @@ Commands:
   %(prog)s tui                        interactive dashboard (also: bare %(prog)s)
   %(prog)s watch                      dashboard, opened on the live watch page
   %(prog)s menubar                    macOS menu bar app
+  %(prog)s vision status              show the configured Vision key and URL
+  %(prog)s vision account-login <name>  add a Claude account to Vision
+  %(prog)s vision --help              all Vision account commands
   %(prog)s upgrade                    self-upgrade to latest
   %(prog)s purge                      remove all claude-swap data
 

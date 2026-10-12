@@ -4,76 +4,201 @@ Multi-account switcher for Claude Code. Easily switch between multiple Claude ac
 
 ## Get started with Infinity Vision
 
-This is Infinity's fork. Install it from this repository to get Vision support.
-You need Python 3.12+, `uv`, GitHub access to Infinity's repositories, and the native
-Claude Code CLI installed.
+This is Infinity's fork. Your Vision API key is the only credential or
+configuration it needs to use the Claude accounts that Vision grants you. You do
+not log in to Claude on this machine, register the machine, or write a cswap
+configuration file.
 
-```bash
-gh repo clone Infinity-AI-Institute/claude-swap-infinity
-uv tool install ./claude-swap-infinity
-cswap --set-vision-token
-cswap run
-```
+You need [`uv`](https://docs.astral.sh/uv/) and the native Claude Code CLI
+(`claude`). `uv` installs Python 3.12 if your machine does not have it. This
+repository is public, so the install needs no GitHub login.
 
-Get your own Vision API key from [Vision Settings → API keys](https://vision.infinity.inc).
-The setup command prompts without displaying the key. It saves the key once for
-both `cswap` and the Infinity version of `codex-swap` on this machine. Future
-terminals need no environment variable or repeated setup. `claude-swap` is an alias
-for `cswap`.
+1. Install the fork:
 
-To pass the key directly, use `cswap --set-vision-token TOKEN`. The interactive
-form keeps the key out of shell history. A Vision key is different from a Claude
-provider token.
+   ```bash
+   uv tool install --python 3.12 git+https://github.com/Infinity-AI-Institute/claude-swap-infinity
+   ```
 
-Resume a native conversation:
+2. Create your own API key in Vision at **Settings (gear) → API keys**
+   ([vision.infinity.inc](https://vision.infinity.inc)). Add this line to your
+   shell profile (for example `~/.zshrc`), then open a new terminal:
 
-```bash
-cswap run -- --resume
-```
+   ```bash
+   export VISION_API_KEY=vsk_...
+   ```
 
-Add a new Claude account through the native login flow:
+   Or save it once for both `cswap` and Infinity's `codex-swap`. The prompt does not
+   show the key:
+
+   ```bash
+   cswap --set-vision-token
+   ```
+
+3. Pull the Claude accounts that Vision grants you:
+
+   ```bash
+   cswap list
+   ```
+
+   Each Vision account has a `vision-…` alias. If Vision refuses the key or grants
+   you no Claude accounts, the command tells you why.
+
+4. Start Claude Code:
+
+   ```bash
+   cswap run                  # choose an authorized account for each request
+   cswap run -- --resume      # resume a native Claude conversation
+   cswap run 2                # use a specific account from cswap list
+   ```
+
+   Claude keeps its normal conversation home, so `--resume` works across accounts
+   without copying sessions.
+
+`claude-swap` is an alias for `cswap`. Set `VISION_API_URL` only for a Vision
+deployment other than `https://vision.infinity.inc`.
+
+### Which accounts you get
+
+Vision decides which accounts you can use. This tool lists and uses what Vision
+grants. For `cswap list` to show an account:
+
+- Your Vision user must be an invited member.
+- Your API key needs agent-account access. New keys have it by default.
+- An administrator or account manager must grant you **Can use** on the account,
+  under **Settings (gear) → Agent accounts**. When you register an account
+  yourself, you get use of it automatically.
+
+For the full permission rules, see Vision's
+[agent account settings](https://github.com/Infinity-AI-Institute/vision/blob/main/docs/AGENT_ACCOUNTS.md#permission-rules).
+
+To add a Claude account that Vision does not have yet, log in to it through the
+native login flow. With Vision configured and automatic registration on (the
+default), a successful login registers the account with Vision. Complete any
+handoff confirmation that the tool shows:
 
 ```bash
 cswap vision account-login work
 cswap run work
 ```
 
-With Vision configured, new managed logins register automatically unless you
-previously disabled auto-registration. Complete any displayed handoff confirmation.
-Successful registration grants you use of that account. Existing Vision accounts
-need no provider login on this machine. Conversation resume uses the native Claude
-home; no session transfer is required.
+### When a Vision account cannot serve
 
-### Saved key and troubleshooting
+`cswap run` checks your Vision accounts before it starts Claude. What it does when
+an account cannot serve depends on whether you named the account.
 
-The private key file is `${XDG_CONFIG_HOME:-~/.config}/vision/credentials.json`.
-Setup stores the Vision URL with the key. Run setup again to replace it.
-`VISION_API_KEY`, when set, takes precedence; otherwise the shared key takes
-precedence over an older `cswap vision login` browser sign-in. To return to browser
-sign-in, remove the shared key file and unset `VISION_API_KEY`; this removes the
-saved configuration for both wrappers, without revoking the server key.
+**You did not name an account** (no account argument, and no `cswap map` mapping
+for this directory). cswap picked the account, so it can pick another one:
 
-Run `cswap vision status` to check whether configuration is present. Saving a key
-and status do not test server access; `cswap run` verifies access when it loads
-accounts. If access is refused, check that the key is valid and your Vision user
-can use a Claude account. `VISION_API_URL` must match the saved URL. For a separate
-Vision deployment, set that variable before saving its key.
+1. If the default Vision account is at a usage limit and another Vision account
+   has quota, cswap launches that account. A warning on stderr names both
+   accounts and the limit.
+2. If no Vision account can serve, cswap uses a Claude login that this machine
+   already has. A warning on stderr says why Vision cannot serve and names the
+   login. Vision cannot serve when every account is at a usage limit, disabled,
+   or not granted; when Vision cannot be reached; or when Vision cannot issue a
+   credential. cswap tries these logins in order:
+   1. The login that plain `claude` uses on this machine.
+   2. Each enabled local (non-Vision) cswap account, in `cswap list` order.
 
-For browser sign-in, local-only accounts, and recovery, see the
-[Vision guide](docs/VISION.md) and [managed login guide](docs/vision-managed-logins.md).
-The local-account commands below are optional for Vision users.
+cswap skips a local login when it needs a re-login, or when the last usage reading
+from `cswap list` or `cswap auto` shows a full window. A login without a recent
+reading is not skipped. For the login that plain `claude` uses, this applies only
+when it is also a cswap account. The check makes no network calls.
+
+**You named an account** (an account argument such as `cswap run 2`, or a
+`cswap map` mapping). cswap does not replace it with a different login. If no Vision
+account can serve, `cswap run` exits with code 75 and says why. While Claude runs,
+its requests can still move between Vision accounts, as before.
+
+cswap never falls back to an API key, including `ANTHROPIC_API_KEY`, because API
+usage is billed per token. The fallback removes `ANTHROPIC_API_KEY` and Claude's
+other credential variables from Claude's environment.
+
+If no login can serve, `cswap run` exits with code **75** before Claude starts. The
+message names each account, why it cannot serve, and when its usage window resets
+(in UTC, with the time remaining). Scripts can test for the code:
+
+```bash
+cswap run -- -p "$PROMPT"
+if [ $? -eq 75 ]; then
+  echo "No Claude login can serve now; wait for the reset or use another provider." >&2
+fi
+```
+
+Code 75 comes only from this check. After Claude starts, `cswap run` exits with
+Claude's own exit code. If Vision cannot be reached or cannot issue a credential,
+and there is no local login, `cswap run` fails with Vision's error and exit code 1,
+as before. A launch without `--model` checks the 5-hour and 7-day
+windows. With `--model`, it also checks that model's weekly window.
+
+Only Claude writes to standard output. cswap's own messages, such as the
+`Launching Account-N` line, fallback notices and warnings, go to standard error,
+so `cswap run -- -p --output-format json` prints exactly Claude's JSON.
+
+If the accounts run out while Claude is running, Claude's next request fails at
+once with the same explanation instead of retrying. To keep working, exit and run
+`cswap run` again without naming an account, so that it can fall back to a local
+login.
+
+### Replace an upstream install
+
+The `claude-swap` package on PyPI and the `realiti4/claude-swap` repository are the
+upstream tool. They do not have Vision support. If `cswap vision status` fails with
+`unrecognized arguments`, you have the upstream tool. Replace it with the fork:
+
+```bash
+uv tool install --force --python 3.12 git+https://github.com/Infinity-AI-Institute/claude-swap-infinity
+```
+
+If you installed the upstream tool with `pipx`, run `pipx uninstall claude-swap`
+first. Account data is stored outside the tool's install directory, so a reinstall
+keeps it. The fork contains upstream changes up to August 20, 2026, and reports
+version `0.26.0b1+infinity.N`: upstream's `0.26.0b1` plus the number of the fork's
+release. Features from upstream 0.26.0 (released September 2, 2026),
+such as `cswap run --require-session`, are not in the fork yet.
 
 ### Update this Infinity installation
 
-From the cloned repository:
-
 ```bash
-git pull --ff-only
-uv tool install --force .
+cswap upgrade
 ```
 
-Use this repository when updating; the public `claude-swap` package and upstream
-update commands do not supply Infinity's Vision integration.
+This runs `uv tool upgrade claude-swap`, which installs the latest commit from the
+Git URL that you installed from. An installation made from a local clone
+(`uv tool install ./claude-swap-infinity`) does not get new commits this way.
+To change it to the Git URL, run the `uv tool install --force` command in
+[Replace an upstream install](#replace-an-upstream-install).
+
+### Saved key and troubleshooting
+
+The saved key file is `${XDG_CONFIG_HOME:-~/.config}/vision/credentials.json`.
+Setup stores the Vision URL with the key. Run setup again to replace the key.
+If `VISION_API_KEY` is set, it takes precedence. Otherwise the saved key takes
+precedence over an older `cswap vision login` browser sign-in. To return to browser
+sign-in, remove the saved key file and unset `VISION_API_KEY`. This removes the
+saved configuration for both wrappers. It does not revoke the key in Vision.
+For scripts, pipe the key to `cswap --set-vision-token -`. It reads the first line
+of standard input, so the key stays out of the process list and shell history:
+
+```bash
+sed -n 's/^VISION_API_KEY=//p' .env | tr -d "'\"" | cswap --set-vision-token -
+```
+
+`-` refuses a terminal, because typed input would be shown; use the prompt there.
+`cswap --set-vision-token TOKEN` also works, but the key is then visible to other
+local users in the process list and can land in shell history. A Vision API key is
+not a Claude provider token.
+
+`cswap vision status` shows which key source and Vision URL are configured. It does
+not test the key. `cswap list` contacts Vision and reports a refused key or missing
+access. `VISION_API_URL` must match the URL saved with a key. For a separate Vision
+deployment, set `VISION_API_URL` before you save its key.
+
+For browser sign-in, local-only accounts, and recovery, see the
+[Vision guide](docs/VISION.md) and [managed login guide](docs/vision-managed-logins.md).
+For where the key and provider tokens are stored, how Claude receives access
+tokens, and who refreshes them, see [How tokens work](docs/token-lifecycle.md).
+The local-account commands below are optional for Vision users.
 
 ## Usage
 
@@ -240,7 +365,7 @@ cswap unclaimed                 # List stashed credential entries (slot + why th
 cswap unclaimed --purge ID      # Drop one (deletes its bytes; recover with /login + `cswap add`)
 cswap tui                       # Interactive dashboard (also: bare `cswap`)
 cswap watch                     # Dashboard, opened on the live watch page
-cswap upgrade                   # Upgrade claude-swap to the latest version
+cswap upgrade                   # Upgrade claude-swap from the source you installed it from
 cswap purge                     # Remove all claude-swap data
 ```
 
@@ -279,10 +404,11 @@ On Linux/WSL, set `XDG_DATA_HOME` to override the default location.
 <details>
 <summary>Optional macOS menu bar app — usage at a glance, click to switch</summary>
 
-Needs the `menubar` extra (macOS only):
+Needs the `menubar` extra (macOS only). Install it from this fork; the PyPI package
+replaces the fork with the upstream tool, which has no Vision support:
 
 ```bash
-uv tool install 'claude-swap[menubar]'   # or: pipx install 'claude-swap[menubar]'
+uv tool install --force --python 3.12 'claude-swap[menubar] @ git+https://github.com/Infinity-AI-Institute/claude-swap-infinity'
 cswap menubar
 ```
 
@@ -408,8 +534,9 @@ pipx uninstall claude-swap
 
 ## Requirements
 
-- Python 3.12+
-- Claude Code installed and logged in
+- Python 3.12+ (`uv` installs it when needed)
+- Claude Code installed. Vision accounts need no Claude login on this machine;
+  local accounts need one.
 
 ## License
 
