@@ -757,6 +757,51 @@ Defaults live in settings.json in the backup root; flags override them.
         sys.exit(130)
 
 
+_ROTATE_COMMAND_DESCRIPTIONS = {
+    "rotate-proxy": (
+        "Serve one loopback endpoint that every Claude Code process on this "
+        "machine can share. Each request is forwarded with one pooled setup "
+        "token; when the provider rate-limits that account, the proxy moves "
+        "to the next. Runs in the foreground until interrupted."
+    ),
+    "rotate-env": (
+        "Print the two environment variables that point a Claude Code process "
+        "at `cswap rotate-proxy`, for example: export $(cswap rotate-env)"
+    ),
+}
+
+
+def _rotate_command(command: str, argv: list[str]) -> None:
+    """Handle `cswap rotate-proxy` and `cswap rotate-env`.
+
+    Pre-dispatched before the main parser is built, like `run` and `auto`.
+    """
+    from claude_swap import rotate_proxy
+
+    parser = argparse.ArgumentParser(
+        prog=f"cswap {command}",
+        description=_ROTATE_COMMAND_DESCRIPTIONS[command],
+        epilog=(
+            f"The proxy listens on 127.0.0.1 port {rotate_proxy.DEFAULT_PORT}. "
+            f"Set {rotate_proxy.PORT_ENVIRONMENT_VARIABLE} to use another port, "
+            "with the same value for both commands. See docs/rotate-proxy.md."
+        ),
+    )
+    parser.parse_args(argv)
+    try:
+        port = rotate_proxy.port_from_environment()
+        switcher = ClaudeAccountSwitcher()
+        if command == "rotate-env":
+            capability = rotate_proxy.load_or_create_capability(switcher)
+            print(f"ANTHROPIC_BASE_URL=http://127.0.0.1:{port}")
+            print(f"CLAUDE_CODE_OAUTH_TOKEN={capability}")
+        else:
+            rotate_proxy.serve(switcher, port=port)
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+
+
 def _config_command(argv: list[str]) -> None:
     """Handle `cswap config [list|get KEY|set KEY VALUE|unset KEY|path]`.
 
@@ -965,17 +1010,8 @@ def main() -> None:
     if argv and argv[0] == "auto":
         _auto_command(argv[1:])
         return  # only reachable in tests where sys.exit is mocked
-    if argv and argv[0] in ("rotate-proxy", "rotate-env"):
-        from claude_swap import rotate_proxy
-
-        switcher = ClaudeAccountSwitcher()
-        port = int(os.environ.get("CSWAP_ROTATE_PORT", rotate_proxy.DEFAULT_PORT))
-        if argv[0] == "rotate-env":
-            cap = rotate_proxy.load_or_create_capability(switcher)
-            print(f"ANTHROPIC_BASE_URL=http://127.0.0.1:{port}")
-            print(f"CLAUDE_CODE_OAUTH_TOKEN={cap}")
-            return
-        rotate_proxy.serve(switcher, port=port)
+    if argv and argv[0] in _ROTATE_COMMAND_DESCRIPTIONS:
+        _rotate_command(argv[0], argv[1:])
         return
     if len(sys.argv) > 1 and sys.argv[1] == "config":
         _config_command(sys.argv[2:])
@@ -1039,6 +1075,8 @@ Commands:
   %(prog)s swap <a> <b>               exchange two accounts' slot numbers
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
   %(prog)s auto                       auto-switch when nearing rate limits
+  %(prog)s rotate-proxy               share one endpoint that rotates setup tokens
+  %(prog)s rotate-env                 print the environment that points Claude at it
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
   %(prog)s unclaimed [--purge ID]     list or drop stashed credential entries
   %(prog)s export <path>              export accounts

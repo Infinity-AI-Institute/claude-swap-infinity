@@ -83,7 +83,11 @@ class CentralCredential:
 
 
 class InferenceProxy:
-    def __init__(self, credentials, *, upstream=UPSTREAM):
+    # Appended to the reason when no login can serve. A subclass whose callers
+    # are not `cswap run` children replaces it.
+    no_usable_login_advice = NO_USABLE_LOGIN_ADVICE
+
+    def __init__(self, credentials, *, upstream=UPSTREAM, port=0):
         parsed = urllib.parse.urlsplit(upstream)
         # Loopback is supported for synthetic acceptance; callers cannot choose
         # arbitrary hosts or follow a provider redirect with an access token.
@@ -102,6 +106,9 @@ class InferenceProxy:
             )
         self.credentials = credentials
         self.upstream = upstream.rstrip("/")
+        # 0 lets the system choose a free loopback port, so an adapter that
+        # serves one child cannot be found by guessing.
+        self.port = port
         self.capability = secrets.token_urlsafe(32)
         self.opener = urllib.request.build_opener(
             urllib.request.ProxyHandler({}), _NoRedirect()
@@ -151,7 +158,7 @@ class InferenceProxy:
                 """Fail native's turn at once with why no login can serve."""
                 self._error(
                     503,
-                    f"cswap: {error} {NO_USABLE_LOGIN_ADVICE}",
+                    f"cswap: {error} {proxy.no_usable_login_advice}",
                     error.retry_after_seconds,
                     retryable=False,
                 )
@@ -303,7 +310,9 @@ class InferenceProxy:
                 except (BrokenPipeError, ConnectionResetError):
                     pass
 
-        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server = http.server.ThreadingHTTPServer(
+            ("127.0.0.1", self.port), Handler
+        )
         self.server.daemon_threads = True
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()

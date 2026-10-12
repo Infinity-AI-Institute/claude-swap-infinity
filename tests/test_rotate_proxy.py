@@ -1,6 +1,21 @@
-import http.server, json, threading, urllib.request
+import http.server
+import json
+import os
+import stat
+import sys
+import threading
+import types
+import urllib.error
+import urllib.request
+from pathlib import Path
 
+import pytest
+
+from claude_swap import cli, rotate_proxy
+from claude_swap.exceptions import ClaudeSwitchError, NoUsableLogin
+from claude_swap.models import Platform
 from claude_swap.rotate_proxy import LocalTokenPool, SharedRotateProxy
+from claude_swap.switcher import ClaudeAccountSwitcher
 
 
 class Clock:
@@ -62,3 +77,288 @@ def test_proxy_replays_429_on_next_account():
             assert json.load(urllib.request.urlopen(req)) == {"ok": True}
     up.shutdown()
     assert seen == ["Bearer sk-ant-oat01-a", "Bearer sk-ant-oat01-b", "Bearer sk-ant-oat01-b"]
+
+
+@pytest.fixture
+def rotating_upstream():
+    seen = []
+    statuses = {}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *_):
+            pass
+
+        def do_POST(self):
+            body = self.rfile.read(int(self.headers["Content-Length"]))
+            account = self.headers["Authorization"].rsplit("-", 1)[-1]
+            seen.append((account, self.path, body))
+            self.send_response(statuses.get(account, 200))
+            self.send_header("Retry-After", "120")
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            self.wfile.write(b"data: ok\n\n")
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=lambda: server.serve_forever(poll_interval=0.01), daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}", statuses, seen
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def post(proxy, path="/v1/messages", payload=None, capability="cap", **headers):
+    return urllib.request.urlopen(urllib.request.Request(
+        proxy.url + path,
+        data=json.dumps(payload if payload is not None else {"model": "m", "stream": True}).encode(),
+        headers={"Authorization": "Bearer " + capability, "Content-Type": "application/json", **headers},
+    ), timeout=3)
+
+
+# ---------------------------------------------------------------------------
+# Which stored accounts are pooled
+# ---------------------------------------------------------------------------
+
+API_KEY = "sk-ant-api03-" + "a1b2c3d4e5" * 4
+
+
+def file_backed_switcher() -> ClaudeAccountSwitcher:
+    """A real switcher on the isolated test home, keeping credentials in files."""
+    switcher = ClaudeAccountSwitcher()
+    switcher.platform = Platform.LINUX
+    switcher._setup_directories()
+    switcher._init_sequence_file()
+    return switcher
+
+
+def test_pool_holds_every_enabled_setup_token_and_nothing_else(temp_home: Path):
+    switcher = file_backed_switcher()
+    switcher.add_account_from_token("sk-ant-oat01-default-label")
+    # `add-token --email` stores a setup token under a real address.
+    switcher.add_account_from_token("sk-ant-oat01-custom-email", email="me@example.com")
+    # An API key bills per token and must never be pooled.
+    switcher.add_account_from_token(API_KEY)
+    # A browser login has a refresh token that Claude Code owns and rotates.
+    switcher.add_account_from_token("sk-ant-oat01-login", email="login@example.com")
+    switcher._write_account_credentials("4", "login@example.com", json.dumps({
+        "claudeAiOauth": {
+            "accessToken": "sk-ant-oat01-login",
+            "refreshToken": "sk-ant-ort01-refresh",
+            "expiresAt": 9,
+        }
+    }))
+    switcher.add_account_from_token("sk-ant-oat01-disabled")
+    switcher.set_account_disabled("5", True)
+
+    pooled = rotate_proxy.load_token_accounts(switcher)
+
+    assert [(account["num"], account["token"]) for account in pooled] == [
+        ("1", "sk-ant-oat01-default-label"),
+        ("2", "sk-ant-oat01-custom-email"),
+    ]
+
+
+def test_machine_without_an_account_store_has_nothing_to_pool(temp_home: Path):
+    assert rotate_proxy.load_token_accounts(ClaudeAccountSwitcher()) == []
+
+
+# ---------------------------------------------------------------------------
+# Cooldowns
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("retry_after,cooldown_seconds", [
+    ("120", 120),
+    ("5", 30),  # never retry sooner than 30 seconds
+    ("999999", 6 * 3600),  # never set an account aside for longer than 6 hours
+    (None, 15 * 60),
+    ("Wed, 21 Oct 2026 07:28:00 GMT", 15 * 60),  # only the seconds form is read
+])
+def test_cooldown_follows_retry_after_within_bounds(retry_after, cooldown_seconds):
+    pool = LocalTokenPool(accounts(), clock=Clock())
+    pool.record_rate_limit(pool.get(), retry_after)
+    assert pool.status()[0]["cooling_s"] == cooldown_seconds
+
+
+# ---------------------------------------------------------------------------
+# No account can serve
+# ---------------------------------------------------------------------------
+
+
+def test_pool_with_every_token_rejected_reports_no_usable_login():
+    pool = LocalTokenPool(accounts(), clock=Clock())
+    second = pool.recover(pool.get())
+    with pytest.raises(NoUsableLogin, match="rejected"):
+        pool.recover(second)
+    with pytest.raises(NoUsableLogin, match="rejected"):
+        pool.get()
+
+
+def test_rejection_while_the_rest_are_rate_limited_reports_when_one_returns():
+    clock = Clock()
+    pool = LocalTokenPool(accounts(), clock=clock)
+    second = pool.rate_limited(pool.get(), "120")
+    clock.t = 20
+    with pytest.raises(NoUsableLogin, match="rate-limited") as error:
+        pool.recover(second)
+    assert error.value.retry_after_seconds == 100
+    assert [row["dead"] for row in pool.status()] == [False, True]
+
+
+def test_proxy_tells_the_agent_not_to_retry_when_no_token_can_serve(rotating_upstream):
+    url, statuses, seen = rotating_upstream
+    statuses["a"] = 401
+    pool = LocalTokenPool(accounts()[:1], clock=Clock())
+    with SharedRotateProxy(pool, port=0, capability="cap", upstream=url) as proxy:
+        with pytest.raises(urllib.error.HTTPError) as error:
+            post(proxy)
+        message = json.loads(error.value.read())["error"]["message"]
+        error.value.close()
+    assert error.value.code == 503
+    # Without this header Claude retries a 503 for minutes before showing it.
+    assert error.value.headers["x-should-retry"] == "false"
+    assert "rejected" in message and "add-token" in message
+    # `cswap run` advice belongs to the per-session adapter, not this pool.
+    assert "cswap run" not in message
+    assert len(seen) == 1
+
+
+# ---------------------------------------------------------------------------
+# Who may call the proxy, and where it listens
+# ---------------------------------------------------------------------------
+
+
+def test_caller_without_the_capability_never_reaches_the_provider(rotating_upstream):
+    url, _statuses, seen = rotating_upstream
+    pool = LocalTokenPool(accounts(), clock=Clock())
+    with SharedRotateProxy(pool, port=0, capability="cap", upstream=url) as proxy:
+        with pytest.raises(urllib.error.HTTPError) as error:
+            post(proxy, capability="wrong")
+        assert error.value.code == 401
+        error.value.close()
+    assert seen == []
+
+
+def test_occupied_port_is_a_usage_error(rotating_upstream):
+    url, _statuses, _seen = rotating_upstream
+    with SharedRotateProxy(
+        LocalTokenPool(accounts()), port=0, capability="cap", upstream=url
+    ) as running:
+        second = SharedRotateProxy(
+            LocalTokenPool(accounts()),
+            port=running.server.server_port,
+            capability="cap",
+            upstream=url,
+        )
+        with pytest.raises(ClaudeSwitchError, match="CSWAP_ROTATE_PORT"):
+            second.__enter__()
+
+
+def store_in(directory: Path) -> types.SimpleNamespace:
+    """The one switcher attribute the capability file depends on."""
+    return types.SimpleNamespace(backup_dir=directory)
+
+
+def test_capability_is_created_private_and_then_reused(tmp_path: Path):
+    capability = rotate_proxy.load_or_create_capability(store_in(tmp_path))
+    assert len(capability) >= 32
+    assert rotate_proxy.load_or_create_capability(store_in(tmp_path)) == capability
+    if sys.platform != "win32":
+        mode = stat.S_IMODE(os.stat(tmp_path / "rotate-capability").st_mode)
+        assert mode == 0o600
+
+
+def test_capability_waits_for_a_concurrent_creator_to_finish_writing(tmp_path: Path):
+    capability_file = tmp_path / "rotate-capability"
+    capability_file.touch()  # another process created the file and has not written it yet
+    writer = threading.Timer(0.05, capability_file.write_text, args=("from-the-other-process",))
+    writer.start()
+    try:
+        capability = rotate_proxy.load_or_create_capability(store_in(tmp_path))
+    finally:
+        writer.join()
+    assert capability == "from-the-other-process"
+
+
+def test_empty_capability_file_is_an_error_not_an_empty_capability(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(rotate_proxy, "CAPABILITY_WRITE_WAIT_S", 0.05)
+    (tmp_path / "rotate-capability").touch()
+    with pytest.raises(ClaudeSwitchError, match="empty"):
+        rotate_proxy.load_or_create_capability(store_in(tmp_path))
+
+
+def test_capability_needs_an_account_store(tmp_path: Path):
+    with pytest.raises(ClaudeSwitchError, match="add-token"):
+        rotate_proxy.load_or_create_capability(store_in(tmp_path / "missing"))
+
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+
+def test_serve_announces_its_address_and_accounts_until_interrupted(temp_home: Path, monkeypatch):
+    switcher = file_backed_switcher()
+    switcher.add_account_from_token("sk-ant-oat01-one")
+    announcements = []
+
+    def interrupt(_seconds):
+        raise KeyboardInterrupt
+
+    # serve() only sleeps while it waits to be interrupted.
+    monkeypatch.setattr(rotate_proxy.time, "sleep", interrupt)
+    rotate_proxy.serve(switcher, port=0, log=lambda message, **_: announcements.append(message))
+
+    assert len(announcements) == 1
+    assert announcements[0].startswith("rotate-proxy on http://127.0.0.1:")
+    assert announcements[0].endswith("with 1 accounts: setup-token-1@token.local")
+
+
+def run_cli(monkeypatch, *arguments: str) -> None:
+    monkeypatch.setattr(sys, "argv", ["cswap", *arguments])
+    cli.main()
+
+
+def test_rotate_env_prints_the_endpoint_and_capability(temp_home: Path, monkeypatch, capsys):
+    switcher = file_backed_switcher()
+    monkeypatch.setenv("CSWAP_ROTATE_PORT", "45000")
+    run_cli(monkeypatch, "rotate-env")
+    capability = rotate_proxy.load_or_create_capability(switcher)
+    assert capsys.readouterr().out.splitlines() == [
+        "ANTHROPIC_BASE_URL=http://127.0.0.1:45000",
+        f"CLAUDE_CODE_OAUTH_TOKEN={capability}",
+    ]
+
+
+@pytest.mark.parametrize("port", ["abc", "0", "70000", ""])
+def test_invalid_port_is_a_usage_error(temp_home: Path, monkeypatch, capsys, port):
+    file_backed_switcher()
+    monkeypatch.setenv("CSWAP_ROTATE_PORT", port)
+    with pytest.raises(SystemExit) as exit_info:
+        run_cli(monkeypatch, "rotate-env")
+    assert exit_info.value.code == 1
+    captured = capsys.readouterr()
+    assert "CSWAP_ROTATE_PORT" in captured.err
+    assert captured.out == ""
+
+
+def test_rotate_proxy_without_setup_tokens_is_a_usage_error(temp_home: Path, monkeypatch, capsys):
+    with pytest.raises(SystemExit) as exit_info:
+        run_cli(monkeypatch, "rotate-proxy")
+    assert exit_info.value.code == 1
+    assert "add-token" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("command", ["rotate-proxy", "rotate-env"])
+def test_rotation_commands_explain_themselves(monkeypatch, capsys, command):
+    with pytest.raises(SystemExit) as exit_info:
+        run_cli(monkeypatch, command, "--help")
+    assert exit_info.value.code == 0
+    assert "CSWAP_ROTATE_PORT" in capsys.readouterr().out
+
+
+def test_main_help_lists_the_rotation_commands(monkeypatch, capsys):
+    with pytest.raises(SystemExit):
+        run_cli(monkeypatch, "--help")
+    help_text = capsys.readouterr().out
+    assert "rotate-proxy" in help_text and "rotate-env" in help_text
