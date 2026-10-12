@@ -768,13 +768,25 @@ _ROTATE_COMMAND_DESCRIPTIONS = {
         "Print the two environment variables that point a Claude Code process "
         "at `cswap rotate-proxy`, for example: export $(cswap rotate-env)"
     ),
+    "rotate-status": (
+        "Show each pooled account's cooldown in the running proxy. This is the "
+        "proxy's own record of rate limits, not the provider's usage."
+    ),
+    "rotate-reset": (
+        "Clear one account's cooldown in the running proxy and switch to that "
+        "account, without restarting. Use it after the account's plan usage "
+        "has been reset; it does not reset usage at the provider."
+    ),
 }
 
 
 def _rotate_command(command: str, argv: list[str]) -> None:
-    """Handle `cswap rotate-proxy` and `cswap rotate-env`.
+    """Handle the `cswap rotate-*` commands.
 
-    Pre-dispatched before the main parser is built, like `run` and `auto`.
+    `rotate-proxy` serves the shared endpoint and `rotate-env` prints the
+    environment that points agents at it. `rotate-status` and `rotate-reset`
+    talk to a proxy that is already running. Pre-dispatched before the main
+    parser is built, like `run` and `auto`.
     """
     from claude_swap import rotate_proxy
 
@@ -784,14 +796,20 @@ def _rotate_command(command: str, argv: list[str]) -> None:
         epilog=(
             f"The proxy listens on 127.0.0.1 port {rotate_proxy.DEFAULT_PORT}. "
             f"Set {rotate_proxy.PORT_ENVIRONMENT_VARIABLE} to use another port, "
-            "with the same value for both commands. See docs/rotate-proxy.md."
+            "with the same value for every rotate command. See docs/rotate-proxy.md."
         ),
     )
-    parser.parse_args(argv)
+    if command == "rotate-reset":
+        parser.add_argument("account", help="alias or slot of the pooled account")
+    args = parser.parse_args(argv)
     try:
         port = rotate_proxy.port_from_environment()
         switcher = ClaudeAccountSwitcher()
-        if command == "rotate-env":
+        if command == "rotate-status":
+            rotate_proxy.control_command(switcher, command, port=port)
+        elif command == "rotate-reset":
+            rotate_proxy.control_command(switcher, command, account=args.account, port=port)
+        elif command == "rotate-env":
             capability = rotate_proxy.load_or_create_capability(switcher)
             print(f"ANTHROPIC_BASE_URL=http://127.0.0.1:{port}")
             print(f"CLAUDE_CODE_OAUTH_TOKEN={capability}")
@@ -1010,17 +1028,6 @@ def main() -> None:
     if argv and argv[0] == "auto":
         _auto_command(argv[1:])
         return  # only reachable in tests where sys.exit is mocked
-    if argv and argv[0] in ("rotate-status", "rotate-reset"):
-        from claude_swap import rotate_proxy
-
-        switcher = ClaudeAccountSwitcher()
-        port = int(os.environ.get("CSWAP_ROTATE_PORT", rotate_proxy.DEFAULT_PORT))
-        try:
-            rotate_proxy.control_command(switcher, argv[0], argv[1:], port=port)
-        except ClaudeSwitchError as exc:
-            print(error(str(exc)), file=sys.stderr)
-            sys.exit(1)
-        return
     if argv and argv[0] in _ROTATE_COMMAND_DESCRIPTIONS:
         _rotate_command(argv[0], argv[1:])
         return
@@ -1063,8 +1070,6 @@ def main() -> None:
         description="""Multi-Account Switcher for Claude Code
 
 Commands:
-  %(prog)s rotate-status              show local pool cooldowns (not provider usage)
-  %(prog)s rotate-reset <alias|slot>   clear a cooldown after resetting plan usage
   %(prog)s --set-vision-token [TOKEN] save a Vision API key for both swap tools
   %(prog)s --set-vision-token -       same, reading the key from stdin
   %(prog)s help                       show this help
@@ -1090,6 +1095,8 @@ Commands:
   %(prog)s auto                       auto-switch when nearing rate limits
   %(prog)s rotate-proxy               share one endpoint that rotates setup tokens
   %(prog)s rotate-env                 print the environment that points Claude at it
+  %(prog)s rotate-status              show the proxy's cooldowns (not provider usage)
+  %(prog)s rotate-reset <alias|slot>  clear a cooldown after resetting plan usage
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
   %(prog)s unclaimed [--purge ID]     list or drop stashed credential entries
   %(prog)s export <path>              export accounts

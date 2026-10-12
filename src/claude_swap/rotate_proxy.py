@@ -16,7 +16,6 @@ Setup, limits and the security trade-offs of one shared endpoint are in
 
 from __future__ import annotations
 
-import argparse
 import json
 import math
 import os
@@ -250,8 +249,36 @@ class SharedRotateProxy(InferenceProxy):
 
     def __init__(self, credentials, *, port=DEFAULT_PORT, capability, **kw):
         super().__init__(credentials, port=port, **kw)
-        self.max_attempts = len(credentials.accounts)
         self.capability = capability
+
+    def open_with_recovery(self, path, body, headers, credential, *, model):
+        """Send a message, moving through the pool until an account accepts it.
+
+        Each account is tried at most once per request. The pool is told about
+        every rejection, including the one that ends the request, so a rejected
+        token is dropped at once and the pool can say why nothing could serve.
+        As in the base adapter, only an explicit 401 or 429 is replayed.
+        """
+        attempted_slots = set()
+        while True:
+            attempted_slots.add(credential["num"])
+            response = self.open_message(path, body, headers, credential)
+            if response.status not in {401, 429}:
+                return response, credential
+            try:
+                if response.status == 401:
+                    replacement = self.credentials.recover(credential, model=model)
+                else:
+                    replacement = self.credentials.rate_limited(
+                        credential, response.headers.get("Retry-After"), model=model
+                    )
+            except BaseException:
+                response.close()
+                raise
+            if replacement is None or replacement["num"] in attempted_slots:
+                return response, credential
+            response.close()
+            credential = replacement
 
     def __enter__(self):
         try:
@@ -319,20 +346,49 @@ def serve(switcher, *, port=DEFAULT_PORT, log=print) -> None:
             pass
 
 
-def control_command(switcher, command, arguments, *, port=DEFAULT_PORT):
-    parser = argparse.ArgumentParser(prog=f"cswap {command}")
-    if command == "rotate-reset":
-        parser.add_argument("account", help="Pool account alias or slot after a manual usage reset")
-    args = parser.parse_args(arguments)
+# Refusals whose cause is the running proxy, not the request. The proxy's own
+# message for these describes its routes, which does not help the user.
+_CONTROL_FAILURE_HINTS = {
+    401: (
+        "The running proxy did not accept this machine's capability. "
+        "Restart `cswap rotate-proxy`."
+    ),
+    404: (
+        "The running proxy does not support this command. Restart it so that "
+        "it runs the installed version."
+    ),
+}
+
+
+def _control_failure(error: urllib.error.HTTPError) -> str:
+    """Why the proxy refused a control request, in its own words where it gave any."""
+    hint = _CONTROL_FAILURE_HINTS.get(error.code)
+    if hint is not None:
+        return hint
+    try:
+        reason = json.load(error)["error"]["message"]
+    except (ValueError, KeyError, TypeError):
+        reason = None
+    if isinstance(reason, str) and reason:
+        return reason
+    return f"Rotation control failed (HTTP {error.code})."
+
+
+def control_command(switcher, command, *, account=None, port=DEFAULT_PORT):
+    """Run ``rotate-status`` or ``rotate-reset`` against the running proxy.
+
+    Prints the proxy's answer as JSON. ``account`` is the alias or slot to
+    reset, and is required for ``rotate-reset``.
+    """
     path = capability_path(switcher)
     if not path.exists():
         raise ClaudeSwitchError("Start cswap rotate-proxy before using rotation controls.")
     action = "reset" if command == "rotate-reset" else "status"
-    payload = {"account": args.account} if action == "reset" else {}
+    payload = {"account": account} if action == "reset" else {}
     request = urllib.request.Request(
         f"http://127.0.0.1:{port}/local/rotation/{action}",
         data=json.dumps(payload).encode(),
-        headers={"Authorization": "Bearer " + path.read_text().strip(),
+        headers={"Authorization": "Bearer " + _read_capability(path),
                  "Content-Type": "application/json"},
     )
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -340,7 +396,8 @@ def control_command(switcher, command, arguments, *, port=DEFAULT_PORT):
         with opener.open(request, timeout=5) as response:
             result = json.load(response)
     except urllib.error.HTTPError as error:
-        raise ClaudeSwitchError(f"Rotation control failed (HTTP {error.code}); check the account and proxy version.") from None
+        with error:
+            raise ClaudeSwitchError(_control_failure(error)) from None
     except (OSError, ValueError):
         raise ClaudeSwitchError("Cannot reach the local rotation proxy.") from None
     print(json.dumps(result, indent=2))

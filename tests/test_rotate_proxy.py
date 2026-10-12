@@ -1,6 +1,7 @@
 import http.server
 import json
 import os
+import socket
 import stat
 import sys
 import threading
@@ -163,9 +164,9 @@ def test_reset_via_cli_reuses_account_without_restarting(rotating_upstream, tmp_
     (tmp_path / "rotate-capability").write_text("cap")
     with SharedRotateProxy(pool, port=0, capability="cap", upstream=url) as proxy:
         port = proxy.server.server_port
-        control_command(switcher, "rotate-status", [], port=port)
+        control_command(switcher, "rotate-status", port=port)
         assert all(a["cooling_s"] == 120 for a in json.loads(capsys.readouterr().out)["accounts"])
-        control_command(switcher, "rotate-reset", ["b"], port=port)
+        control_command(switcher, "rotate-reset", account="b", port=port)
         result = json.loads(capsys.readouterr().out)
         assert result["reset"] == "b"
         assert [a["cooling_s"] for a in result["accounts"]] == [120, 0, 120]
@@ -230,6 +231,48 @@ def test_single_account_exhaustion_is_recorded(rotating_upstream):
         error.value.close()
     assert len(seen) == 1
     assert pool.status()[0]["cooling_s"] == 120
+
+
+def test_last_account_rejected_while_another_is_only_rate_limited(rotating_upstream):
+    url, statuses, seen = rotating_upstream
+    statuses.update({"a": 429, "b": 401})
+    pool = LocalTokenPool(accounts(), clock=Clock())
+    with SharedRotateProxy(pool, port=0, capability="cap", upstream=url) as proxy:
+        with pytest.raises(urllib.error.HTTPError) as error:
+            post(proxy)
+        message = json.loads(error.value.read())["error"]["message"]
+        error.value.close()
+    # Account a is only rate-limited, so the agent must not be told to log in again.
+    assert error.value.code == 503
+    assert error.value.headers["x-should-retry"] == "false"
+    assert error.value.headers["Retry-After"] == "120"
+    assert "rate-limited" in message
+    # The rejected token is dropped by this request, not by the next one.
+    assert [row["dead"] for row in pool.status()] == [False, True]
+    assert [account for account, _, _ in seen] == ["a", "b"]
+
+
+def test_control_explains_a_proxy_that_predates_the_commands(rotating_upstream, tmp_path):
+    url, _statuses, _seen = rotating_upstream
+
+    class ProxyWithoutControls(SharedRotateProxy):
+        control_paths = ()
+
+    (tmp_path / "rotate-capability").write_text("cap")
+    pool = LocalTokenPool(accounts(), clock=Clock())
+    with ProxyWithoutControls(pool, port=0, capability="cap", upstream=url) as proxy:
+        with pytest.raises(ClaudeSwitchError, match="installed version"):
+            control_command(store_in(tmp_path), "rotate-status", port=proxy.server.server_port)
+
+
+def test_control_explains_a_capability_the_proxy_does_not_accept(rotating_upstream, tmp_path):
+    url, _statuses, _seen = rotating_upstream
+    (tmp_path / "rotate-capability").write_text("not-the-capability-the-proxy-started-with")
+    pool = LocalTokenPool(accounts(), clock=Clock())
+    with SharedRotateProxy(pool, port=0, capability="cap", upstream=url) as proxy:
+        with pytest.raises(ClaudeSwitchError, match="capability"):
+            control_command(store_in(tmp_path), "rotate-status", port=proxy.server.server_port)
+    assert pool.status()[0]["active"]
 
 
 # ---------------------------------------------------------------------------
@@ -322,8 +365,6 @@ def test_rejection_while_the_rest_are_rate_limited_reports_when_one_returns():
     assert [row["dead"] for row in pool.status()] == [False, True]
 
 
-@pytest.mark.xfail(strict=True, reason="the full-pool retry stops before reporting a "
-                   "rejection on its last attempt; fixed in the next commit")
 def test_proxy_tells_the_agent_not_to_retry_when_no_token_can_serve(rotating_upstream):
     url, statuses, seen = rotating_upstream
     statuses["a"] = 401
@@ -468,7 +509,43 @@ def test_rotate_proxy_without_setup_tokens_is_a_usage_error(temp_home: Path, mon
     assert "add-token" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("command", ["rotate-proxy", "rotate-env"])
+def unused_port() -> int:
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+def test_rotate_reset_reports_the_reason_the_proxy_gave(
+    temp_home: Path, monkeypatch, capsys, rotating_upstream
+):
+    url, _statuses, _seen = rotating_upstream
+    capability = rotate_proxy.load_or_create_capability(file_backed_switcher())
+    pool = LocalTokenPool(accounts(), clock=Clock())
+    pool.recover(pool.get())  # the provider rejected account a
+    with SharedRotateProxy(pool, port=0, capability=capability, upstream=url) as proxy:
+        monkeypatch.setenv("CSWAP_ROTATE_PORT", str(proxy.server.server_port))
+        with pytest.raises(SystemExit) as exit_info:
+            run_cli(monkeypatch, "rotate-reset", "a")
+    assert exit_info.value.code == 1
+    assert capsys.readouterr().err.splitlines() == [
+        "Error: This token was rejected; replace its credentials first."
+    ]
+
+
+def test_rotate_status_without_a_running_proxy_is_one_error_line(
+    temp_home: Path, monkeypatch, capsys
+):
+    rotate_proxy.load_or_create_capability(file_backed_switcher())
+    monkeypatch.setenv("CSWAP_ROTATE_PORT", str(unused_port()))
+    with pytest.raises(SystemExit) as exit_info:
+        run_cli(monkeypatch, "rotate-status")
+    assert exit_info.value.code == 1
+    assert capsys.readouterr().err.splitlines() == [
+        "Error: Cannot reach the local rotation proxy."
+    ]
+
+
+@pytest.mark.parametrize("command", ["rotate-proxy", "rotate-env", "rotate-status", "rotate-reset"])
 def test_rotation_commands_explain_themselves(monkeypatch, capsys, command):
     with pytest.raises(SystemExit) as exit_info:
         run_cli(monkeypatch, command, "--help")
@@ -480,4 +557,5 @@ def test_main_help_lists_the_rotation_commands(monkeypatch, capsys):
     with pytest.raises(SystemExit):
         run_cli(monkeypatch, "--help")
     help_text = capsys.readouterr().out
-    assert "rotate-proxy" in help_text and "rotate-env" in help_text
+    for command in ("rotate-proxy", "rotate-env", "rotate-status", "rotate-reset"):
+        assert command in help_text
