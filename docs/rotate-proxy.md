@@ -59,7 +59,8 @@ Accounts are used in slot order. An account with the alias `sweep` is used last.
 - The proxy stays on one account until the provider answers a request with 429.
 - It then sets that account aside for the time the provider's `Retry-After` header
   gives, kept between 30 seconds and 6 hours, or for 15 minutes when the header
-  is missing. The same request is replayed once on the next account.
+  is missing. The same request is then tried on each remaining account, once
+  each, until one accepts it.
 - An account whose token the provider rejects (401) is dropped until the proxy
   restarts.
 - While every account is set aside, the proxy still sends each request to the
@@ -73,6 +74,30 @@ Only an explicit 401 or 429 is replayed. A connection failure, a server error, o
 a response that has started streaming is passed to the agent, because the request
 may already have run.
 
+## Inspect and clear cooldowns
+
+The proxy cannot see a usage reset that happens at the provider, for example when
+you reset an account's plan usage by hand. Until the cooldown it recorded runs
+out, it keeps that account set aside.
+
+```bash
+cswap rotate-status                # every pooled account and its cooldown
+cswap rotate-reset <alias|slot>    # clear one cooldown and switch to that account
+```
+
+Both commands talk to the running proxy and print its answer as JSON. For each
+account, the status gives the slot, the name, whether it is the active account,
+whether its token was rejected (`dead`), and the seconds of cooldown left
+(`cooling_s`).
+
+They change only the proxy's own state. `rotate-reset` does not reset usage at
+the provider, and it cannot restore an account whose token was rejected. If you
+clear a cooldown while the account is still limited, the next request is
+rate-limited once and the proxy moves on.
+
+The commands use the same capability as agents, so any process that can use the
+proxy can also read the status and clear a cooldown.
+
 ## Limits
 
 - **Account changes need a restart.** The proxy reads the account list when it
@@ -83,7 +108,7 @@ may already have run.
 - **A cooldown is the proxy's estimate.** It neither shows nor changes the
   provider's usage limits.
 - **One proxy per port.** The default is 41871. To use another, set
-  `CSWAP_ROTATE_PORT` to the same value for `rotate-proxy` and `rotate-env`.
+  `CSWAP_ROTATE_PORT` to the same value for every `rotate-` command.
 
 ## Security
 
@@ -116,3 +141,5 @@ exposure, because it gives each session its own random port and capability.
 |---|---|
 | `cswap rotate-proxy` | Serves the endpoint in the foreground until interrupted. |
 | `cswap rotate-env` | Prints `ANTHROPIC_BASE_URL` and `CLAUDE_CODE_OAUTH_TOKEN` for agents. |
+| `cswap rotate-status` | Prints the running proxy's accounts and cooldowns as JSON. |
+| `cswap rotate-reset <alias\|slot>` | Clears one account's cooldown in the running proxy and switches to it. |
