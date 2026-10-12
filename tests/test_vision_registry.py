@@ -2,6 +2,8 @@
 
 import json
 import sys
+import threading
+import time
 from unittest.mock import Mock
 
 import pytest
@@ -109,6 +111,122 @@ def test_network_releases_account_lock_and_late_response_cannot_replace_newer_sy
     assert [a["email"] for a in roster(switcher)["accounts"].values()] == [
         item(2)["email"]
     ]
+
+
+def start_together(switcher, older, newer, *, newer_response_delay=0.3):
+    """Run two syncs whose discoveries overlap; the older response arrives first.
+
+    Returns the roster as it was when the older sync returned, and what the
+    newer sync returned. This is two `cswap run` starting in the same second on
+    a clean machine: both discover, and the one that asked first is superseded.
+    """
+    older_in_flight = threading.Event()
+    newer_started = threading.Event()
+
+    def older_discover():
+        older_in_flight.set()
+        assert newer_started.wait(5), "the newer discovery never started"
+        return [item(1)]
+
+    def newer_discover():
+        newer_started.set()
+        time.sleep(newer_response_delay)
+        return [item(1)]
+
+    older.discover.side_effect = older_discover
+    newer.discover.side_effect = newer_discover
+    seen = {}
+
+    def run_older():
+        try:
+            RegistryPool(switcher, older).sync(force=True)
+            seen["roster"] = roster(switcher) or {}
+        except BaseException as error:  # reported by the test, not lost in the thread
+            seen["error"] = error
+
+    thread = threading.Thread(target=run_older)
+    thread.start()
+    try:
+        assert older_in_flight.wait(5), "the older discovery never started"
+        newer_wrote = RegistryPool(switcher, newer).sync(force=True)
+    finally:
+        thread.join(20)
+    assert not thread.is_alive(), "the older sync never returned"
+    assert "error" not in seen, seen.get("error")
+    return seen["roster"], newer_wrote
+
+
+def test_superseded_sync_returns_only_after_the_newer_discovery_wrote_the_roster(
+    switcher,
+):
+    # Before the fix the older sync returned at once, with nothing written, and
+    # its caller read an empty roster: "No enabled Claude account is authorized
+    # through Vision", exit 75, although the account was granted.
+    roster_when_older_returned, newer_wrote = start_together(
+        switcher, client(), client()
+    )
+    assert newer_wrote
+    assert [
+        account["email"]
+        for account in roster_when_older_returned.get("accounts", {}).values()
+    ] == [item(1)["email"]]
+
+
+def test_superseded_sync_discovers_again_when_the_newer_discovery_never_commits(
+    switcher,
+):
+    clock = [0.0]
+
+    def sleep(seconds):
+        clock[0] += seconds
+
+    registry = client()
+    pool = RegistryPool(switcher, registry, sleep=sleep, monotonic=lambda: clock[0])
+    calls = []
+
+    def discover():
+        calls.append(len(calls))
+        if len(calls) == 1:
+            # Another process starts a newer discovery and dies before it commits.
+            with FileLock(switcher.lock_file):
+                state = pool._state()
+                switcher._write_json(
+                    pool.state_path, {**state, "revision": state["revision"] + 1}
+                )
+        return [item(1)]
+
+    registry.discover.side_effect = discover
+    assert pool.sync(force=True) is True
+    assert len(calls) == 2
+    assert [a["email"] for a in roster(switcher)["accounts"].values()] == [
+        item(1)["email"]
+    ]
+
+
+def test_sync_gives_up_when_every_discovery_is_superseded_and_none_commits(switcher):
+    clock = [0.0]
+    registry = client()
+    pool = RegistryPool(
+        switcher,
+        registry,
+        sleep=lambda seconds: clock.__setitem__(0, clock[0] + seconds),
+        monotonic=lambda: clock[0],
+    )
+
+    def always_superseded():
+        with FileLock(switcher.lock_file):
+            state = pool._state()
+            switcher._write_json(
+                pool.state_path, {**state, "revision": state["revision"] + 1}
+            )
+        return [item(1)]
+
+    registry.discover.side_effect = always_superseded
+    with pytest.raises(VisionError) as refused:
+        pool.sync(force=True)
+    assert refused.value.code == "service_unavailable"
+    assert registry.discover.call_count == 3
+    assert not (roster(switcher) or {}).get("accounts")
 
 
 def test_key_change_bypasses_discovery_ttl(switcher):

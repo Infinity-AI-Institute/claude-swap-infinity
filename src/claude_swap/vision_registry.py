@@ -169,11 +169,31 @@ def merge_accounts(
     return merged
 
 
+# A sync whose discovery was overtaken by a newer one waits this long for the
+# newer one to write the roster, then discovers again itself. One discovery is
+# one HTTP request with a 10 s timeout (vision.py).
+SUPERSEDED_WAIT_SECONDS = 15.0
+SUPERSEDED_POLL_SECONDS = 0.05
+# A sync makes at most this many discoveries of its own. Each further one
+# follows a discovery that was overtaken by a newer one that never committed.
+SUPERSEDED_ATTEMPTS = 3
+
+
 class RegistryPool:
-    def __init__(self, switcher, client: VisionClient, *, now=time.time):
+    def __init__(
+        self,
+        switcher,
+        client: VisionClient,
+        *,
+        now=time.time,
+        sleep=time.sleep,
+        monotonic=time.monotonic,
+    ):
         self.switcher = switcher
         self.client = client
         self.now = now
+        self.sleep = sleep
+        self.monotonic = monotonic
         self.state_path = switcher.backup_dir / "vision-sync.json"
         self.key_fingerprint = hashlib.sha256(client.api_key.encode()).hexdigest()
 
@@ -183,43 +203,77 @@ class RegistryPool:
             not isinstance(state, dict)
             or type(state.get("revision", 0)) is not int
             or state.get("revision", 0) < 0
+            or type(state.get("completedRevision", 0)) is not int
+            or state.get("completedRevision", 0) < 0
         ):
             raise ConfigError("Vision synchronization state needs repair.")
         return state
 
     def sync(self, *, force: bool = False) -> bool:
-        # Allocate a monotonically increasing request before networking. A late
-        # response may commit only if no newer discovery has started, regardless
-        # of wall-clock changes or whether the newer request succeeded.
-        with FileLock(self.switcher.lock_file):
-            state = self._state()
-            completed = state.get("completedAt")
-            if (
-                not force
-                and state.get("url") == self.client.url
-                and state.get("keyFingerprint") == self.key_fingerprint
-                and type(completed) in (int, float)
-                and 0 <= self.now() - completed < 30
-            ):
+        """Bring the roster up to date with Vision; return whether this call wrote it.
+
+        When this returns, the roster holds a discovery no older than the one
+        this call asked for: its own, or a newer one that another caller made
+        meanwhile. A caller may therefore read the roster right after.
+        """
+        for _ in range(SUPERSEDED_ATTEMPTS):
+            # Allocate a monotonically increasing request before networking. A late
+            # response may commit only if no newer discovery has started, regardless
+            # of wall-clock changes or whether the newer request succeeded.
+            with FileLock(self.switcher.lock_file):
+                state = self._state()
+                completed = state.get("completedAt")
+                if (
+                    not force
+                    and state.get("url") == self.client.url
+                    and state.get("keyFingerprint") == self.key_fingerprint
+                    and type(completed) in (int, float)
+                    and 0 <= self.now() - completed < 30
+                ):
+                    return False
+                revision = state.get("revision", 0) + 1
+                pending = {**state, "revision": revision}
+                self.switcher._write_json(self.state_path, pending)
+            items = self.client.discover()
+            with FileLock(self.switcher.lock_file):
+                if self._state().get("revision") == revision:
+                    current = self.switcher._get_sequence_data() or {}
+                    merged = merge_accounts(current, items, self.client.url)
+                    self.switcher._write_json(self.switcher.sequence_file, merged)
+                    self.switcher._write_json(
+                        self.state_path,
+                        {
+                            "revision": revision,
+                            "completedRevision": revision,
+                            "url": self.client.url,
+                            "keyFingerprint": self.key_fingerprint,
+                            "completedAt": self.now(),
+                            "accountCount": len(items),
+                        },
+                    )
+                    return True
+            # A newer discovery started while this one was in flight, so this
+            # response is dropped. The roster is current only once that newer
+            # discovery is written. Returning before then let a caller read a
+            # roster that was still empty on a clean machine: of two `cswap run`
+            # started together, one exited 75 with "No enabled Claude account is
+            # authorized through Vision" although the account was granted.
+            if self._newer_discovery_committed(revision):
                 return False
-            revision = state.get("revision", 0) + 1
-            pending = {**state, "revision": revision}
-            self.switcher._write_json(self.state_path, pending)
-        items = self.client.discover()
-        with FileLock(self.switcher.lock_file):
-            if self._state().get("revision") != revision:
+            # The newer discovery failed, or its process is gone: discover again.
+        raise VisionError("service_unavailable")
+
+    def _newer_discovery_committed(self, revision: int) -> bool:
+        """Wait for a discovery newer than ``revision`` to be written to the roster.
+
+        False when none was written within SUPERSEDED_WAIT_SECONDS.
+        """
+        deadline = self.monotonic() + SUPERSEDED_WAIT_SECONDS
+        while True:
+            with FileLock(self.switcher.lock_file):
+                committed = self._state().get("completedRevision", 0)
+            if committed > revision:
+                return True
+            if self.monotonic() >= deadline:
                 return False
-            current = self.switcher._get_sequence_data() or {}
-            merged = merge_accounts(current, items, self.client.url)
-            self.switcher._write_json(self.switcher.sequence_file, merged)
-            self.switcher._write_json(
-                self.state_path,
-                {
-                    "revision": revision,
-                    "url": self.client.url,
-                    "keyFingerprint": self.key_fingerprint,
-                    "completedAt": self.now(),
-                    "accountCount": len(items),
-                },
-            )
-        return True
+            self.sleep(SUPERSEDED_POLL_SECONDS)

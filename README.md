@@ -131,6 +131,12 @@ and there is no local login, `cswap run` fails with Vision's error and exit code
 as before. A launch without `--model` checks the 5-hour and 7-day
 windows. With `--model`, it also checks that model's weekly window.
 
+Several `cswap run` can start at the same moment on a machine that has not listed
+its Vision accounts yet, as two agents do in a new container. Each launch waits
+until the account list is written before it picks an account. Before version
+0.26.0b1+infinity.4, the launch whose request Vision answered first could read a
+list that was still empty and exit with code 75, although an account was granted.
+
 Only Claude writes to standard output. cswap's own messages, such as the
 `Launching Account-N` line, fallback notices and warnings, go to standard error,
 so `cswap run -- -p --output-format json` prints exactly Claude's JSON.

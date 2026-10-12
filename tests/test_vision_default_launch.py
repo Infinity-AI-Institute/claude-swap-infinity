@@ -1,5 +1,7 @@
 """A Vision key and central accounts suffice for an ordinary native launch."""
 
+import threading
+import time
 from unittest.mock import Mock
 
 import pytest
@@ -38,6 +40,61 @@ def test_empty_home_launch_discovers_account_without_login_or_explicit_selection
         "1", arguments, share=True, share_history=False, allow_fallback=True
     )
     assert not list(manager.switcher.credentials_dir.glob("*"))
+
+
+def test_a_launch_superseded_by_another_launch_still_finds_the_account(
+    temp_home, monkeypatch
+):
+    # Two `cswap run` start in the same second in a new container, as a harness
+    # with two agents does. Both discover; the one that asked first is
+    # superseded and its response is not written. It then read an empty roster
+    # and exited 75 ("No enabled Claude account is authorized through Vision")
+    # while the other launched the granted account.
+    from claude_swap.vision_registry import RegistryPool
+
+    switcher = ClaudeAccountSwitcher()
+    manager = SessionManager(switcher)
+    older = VisionClient("https://vision.example.invalid", "synthetic-key")
+    newer = VisionClient("https://vision.example.invalid", "synthetic-key")
+    older_in_flight = threading.Event()
+    newer_started = threading.Event()
+
+    def older_discover():
+        older_in_flight.set()
+        assert newer_started.wait(5), "the newer discovery never started"
+        return [item(1)]
+
+    def newer_discover():
+        newer_started.set()
+        time.sleep(0.3)
+        return [item(1)]
+
+    older.discover = Mock(side_effect=older_discover)
+    newer.discover = Mock(side_effect=newer_discover)
+    monkeypatch.setattr("claude_swap.vision.configured_client", lambda: older)
+    manager.run = Mock(side_effect=SystemExit(0))
+    manager._exec = Mock(side_effect=AssertionError("uncredentialed native launch"))
+    outcome = {}
+
+    def launch():
+        try:
+            manager.exec_default([])
+        except BaseException as error:  # the launch ends by SystemExit
+            outcome["error"] = error
+
+    thread = threading.Thread(target=launch)
+    thread.start()
+    try:
+        assert older_in_flight.wait(5), "the older discovery never started"
+        assert RegistryPool(switcher, newer).sync(force=True)
+    finally:
+        thread.join(20)
+    assert not thread.is_alive(), "the superseded launch never returned"
+    error = outcome.get("error")
+    assert isinstance(error, SystemExit) and error.code == 0, repr(error)
+    manager.run.assert_called_once_with(
+        "1", [], share=True, share_history=False, allow_fallback=True
+    )
 
 
 def test_disabled_account_is_skipped(setup):
