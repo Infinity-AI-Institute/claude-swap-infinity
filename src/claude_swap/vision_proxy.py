@@ -52,6 +52,10 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+class _ReauthenticationRequired(Exception):
+    """The provider rejected the login and there is no replacement for it."""
+
+
 class CentralCredential:
     def __init__(self, client, record):
         self.client = client
@@ -85,6 +89,8 @@ class CentralCredential:
 class InferenceProxy:
     # The listener. A subclass that agents find by a fixed port replaces it.
     server_class = http.server.ThreadingHTTPServer
+    # POST paths a subclass answers itself instead of forwarding upstream.
+    control_paths = ()
     # Appended to the reason when no login can serve. A subclass whose callers
     # are not `cswap run` children replaces it.
     no_usable_login_advice = NO_USABLE_LOGIN_ADVICE
@@ -179,7 +185,7 @@ class InferenceProxy:
                 if (
                     parsed.scheme
                     or parsed.netloc
-                    or parsed.path not in {"/v1/messages", "/v1/messages/count_tokens"}
+                    or parsed.path not in {"/v1/messages", "/v1/messages/count_tokens", *proxy.control_paths}
                 ):
                     self._error(404, "This native API route is not supported.")
                     return
@@ -210,6 +216,21 @@ class InferenceProxy:
                 except (ValueError, TypeError, UnicodeDecodeError):
                     self._error(400, "A native JSON message object is required.")
                     return
+                if parsed.path in proxy.control_paths:
+                    try:
+                        result = proxy.control_request(parsed.path, payload)
+                    except ValueError as error:
+                        self._error(400, str(error))
+                        return
+                    data = json.dumps(result).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
                 try:
                     credential = proxy.credentials.get(model=model)
                 except NoUsableLogin as error:
@@ -237,37 +258,9 @@ class InferenceProxy:
                 }
                 response_started = False
                 try:
-                    response = proxy.open_message(self.path, body, headers, credential)
-                    if response.status == 401:
-                        # An explicit authentication rejection precedes inference.
-                        # Close it before central recovery, and replay at most once.
-                        response.close()
-                        replacement = proxy.credentials.recover(credential, model=model)
-                        if replacement is None:
-                            self._error(
-                                401, "Central login reauthentication is required."
-                            )
-                            return
-                        credential = replacement
-                        response = proxy.open_message(
-                            self.path, body, headers, credential
-                        )
-                    elif response.status == 429:
-                        try:
-                            replacement = proxy.credentials.rate_limited(
-                                credential,
-                                response.headers.get("Retry-After"),
-                                model=model,
-                            )
-                        except BaseException:
-                            response.close()
-                            raise
-                        if replacement is not None:
-                            response.close()
-                            credential = replacement
-                            response = proxy.open_message(
-                                self.path, body, headers, credential
-                            )
+                    response, credential = proxy.open_with_recovery(
+                        self.path, body, headers, credential, model=model
+                    )
                     with response:
                         if response.status == 429:
                             proxy.credentials.record_rate_limit(
@@ -293,6 +286,8 @@ class InferenceProxy:
                         while chunk := response.read1(65536):
                             self.wfile.write(chunk)
                             self.wfile.flush()
+                except _ReauthenticationRequired:
+                    self._error(401, "Central login reauthentication is required.")
                 except VisionError as error:
                     status = error.status if error.status in {401, 403, 429} else 503
                     self._error(
@@ -327,6 +322,47 @@ class InferenceProxy:
             return self.opener.open(request, timeout=120)
         except urllib.error.HTTPError as error:
             return error
+
+    def open_with_recovery(self, path, body, headers, credential, *, model):
+        """Send a message, replaying it once after an explicit 401 or 429.
+
+        Returns the response to forward and the credential that produced it.
+        Only an explicit rejection is replayed. After a transport error, a
+        server error or a partial stream the request may already have run, so
+        the native client decides whether to send it again.
+        """
+        response = self.open_message(path, body, headers, credential)
+        if response.status == 401:
+            # An explicit authentication rejection precedes inference.
+            # Close it before central recovery, and replay at most once.
+            response.close()
+            replacement = self.credentials.recover(credential, model=model)
+            if replacement is None:
+                raise _ReauthenticationRequired()
+            credential = replacement
+            response = self.open_message(path, body, headers, credential)
+        elif response.status == 429:
+            try:
+                replacement = self.credentials.rate_limited(
+                    credential,
+                    response.headers.get("Retry-After"),
+                    model=model,
+                )
+            except BaseException:
+                response.close()
+                raise
+            if replacement is not None:
+                response.close()
+                credential = replacement
+                response = self.open_message(path, body, headers, credential)
+        return response, credential
+
+    def control_request(self, path, payload):
+        """Answer a request to one of ``control_paths``.
+
+        The base adapter declares no control paths, so this is never reached.
+        """
+        raise NotImplementedError
 
     def __exit__(self, *_args):
         if self.server is not None:

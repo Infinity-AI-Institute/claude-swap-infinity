@@ -25,6 +25,8 @@ import socket
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 from claude_swap.exceptions import ClaudeSwitchError, NoUsableLogin
@@ -199,11 +201,26 @@ class LocalTokenPool:
             self.index = i
             return self._credential(self.accounts[i])
 
+    def reset(self, target):
+        """Clear only the selected cooldown and prefer it on the next request."""
+        with self.lock:
+            matches = [(i, a) for i, a in enumerate(self.accounts)
+                       if target in {a["num"], a["name"]}]
+            if len(matches) != 1:
+                raise ValueError("Choose one unambiguous pool account alias or slot.")
+            i, account = matches[0]
+            if account["num"] in self.dead:
+                raise ValueError("This token was rejected; replace its credentials first.")
+            self.cooling.pop(account["num"], None)
+            self.index = i
+            return account["name"]
+
     def status(self):
         with self.lock:
             now = self.clock()
             return [
                 {
+                    "slot": a["num"],
                     "name": a["name"],
                     "active": i == self.index,
                     "dead": a["num"] in self.dead,
@@ -236,7 +253,7 @@ class SharedRotateProxy(InferenceProxy):
     """The native adapter on a fixed port with a capability every agent shares."""
 
     server_class = _ExclusivePortServer
-
+    control_paths = ("/local/rotation/status", "/local/rotation/reset")
     # The per-session adapter's advice is to relaunch `cswap run`, which does
     # not apply to agents that share this endpoint.
     no_usable_login_advice = (
@@ -244,9 +261,47 @@ class SharedRotateProxy(InferenceProxy):
         "`cswap rotate-proxy`."
     )
 
+    def control_request(self, path, payload):
+        if path.endswith("/reset"):
+            target = payload.get("account")
+            if not isinstance(target, str) or not target:
+                raise ValueError("An account alias or slot is required.")
+            name = self.credentials.reset(target)
+            return {"reset": name, "accounts": self.credentials.status()}
+        return {"accounts": self.credentials.status()}
+
     def __init__(self, credentials, *, port=DEFAULT_PORT, capability, **kw):
         super().__init__(credentials, port=port, **kw)
         self.capability = capability
+
+    def open_with_recovery(self, path, body, headers, credential, *, model):
+        """Send a message, moving through the pool until an account accepts it.
+
+        Each account is tried at most once per request. The pool is told about
+        every rejection, including the one that ends the request, so a rejected
+        token is dropped at once and the pool can say why nothing could serve.
+        As in the base adapter, only an explicit 401 or 429 is replayed.
+        """
+        attempted_slots = set()
+        while True:
+            attempted_slots.add(credential["num"])
+            response = self.open_message(path, body, headers, credential)
+            if response.status not in {401, 429}:
+                return response, credential
+            try:
+                if response.status == 401:
+                    replacement = self.credentials.recover(credential, model=model)
+                else:
+                    replacement = self.credentials.rate_limited(
+                        credential, response.headers.get("Retry-After"), model=model
+                    )
+            except BaseException:
+                response.close()
+                raise
+            if replacement is None or replacement["num"] in attempted_slots:
+                return response, credential
+            response.close()
+            credential = replacement
 
     def __enter__(self):
         try:
@@ -312,3 +367,60 @@ def serve(switcher, *, port=DEFAULT_PORT, log=print) -> None:
                 time.sleep(3600)
         except KeyboardInterrupt:
             pass
+
+
+# Refusals whose cause is the running proxy, not the request. The proxy's own
+# message for these describes its routes, which does not help the user.
+_CONTROL_FAILURE_HINTS = {
+    401: (
+        "The running proxy did not accept this machine's capability. "
+        "Restart `cswap rotate-proxy`."
+    ),
+    404: (
+        "The running proxy does not support this command. Restart it so that "
+        "it runs the installed version."
+    ),
+}
+
+
+def _control_failure(error: urllib.error.HTTPError) -> str:
+    """Why the proxy refused a control request, in its own words where it gave any."""
+    hint = _CONTROL_FAILURE_HINTS.get(error.code)
+    if hint is not None:
+        return hint
+    try:
+        reason = json.load(error)["error"]["message"]
+    except (ValueError, KeyError, TypeError):
+        reason = None
+    if isinstance(reason, str) and reason:
+        return reason
+    return f"Rotation control failed (HTTP {error.code})."
+
+
+def control_command(switcher, command, *, account=None, port=DEFAULT_PORT):
+    """Run ``rotate-status`` or ``rotate-reset`` against the running proxy.
+
+    Prints the proxy's answer as JSON. ``account`` is the alias or slot to
+    reset, and is required for ``rotate-reset``.
+    """
+    path = capability_path(switcher)
+    if not path.exists():
+        raise ClaudeSwitchError("Start cswap rotate-proxy before using rotation controls.")
+    action = "reset" if command == "rotate-reset" else "status"
+    payload = {"account": account} if action == "reset" else {}
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}/local/rotation/{action}",
+        data=json.dumps(payload).encode(),
+        headers={"Authorization": "Bearer " + _read_capability(path),
+                 "Content-Type": "application/json"},
+    )
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(request, timeout=5) as response:
+            result = json.load(response)
+    except urllib.error.HTTPError as error:
+        with error:
+            raise ClaudeSwitchError(_control_failure(error)) from None
+    except (OSError, ValueError):
+        raise ClaudeSwitchError("Cannot reach the local rotation proxy.") from None
+    print(json.dumps(result, indent=2))

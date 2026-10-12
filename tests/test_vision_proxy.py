@@ -269,6 +269,9 @@ def test_no_successor_returns_401_without_replaying_old_token(upstream):
         with pytest.raises(urllib.error.HTTPError) as error:
             request(proxy, body=b'{"reject":true}')
         assert error.value.code == 401
+        message = json.loads(error.value.read())["error"]["message"]
+    # The adapter's own explanation, not the provider's bare rejection.
+    assert message == "Central login reauthentication is required."
     assert len(seen) == 1
 
 

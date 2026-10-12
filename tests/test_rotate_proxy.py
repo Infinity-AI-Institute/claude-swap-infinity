@@ -9,14 +9,22 @@ import types
 import urllib.error
 import urllib.request
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
 from claude_swap import cli, rotate_proxy
 from claude_swap.exceptions import ClaudeSwitchError, NoUsableLogin
 from claude_swap.models import Platform
-from claude_swap.rotate_proxy import LocalTokenPool, SharedRotateProxy
+from claude_swap.rotate_proxy import LocalTokenPool, SharedRotateProxy, control_command
 from claude_swap.switcher import ClaudeAccountSwitcher
+
+
+@pytest.fixture(autouse=True)
+def quick_server_shutdown(monkeypatch):
+    serve = http.server.ThreadingHTTPServer.serve_forever
+    monkeypatch.setattr(http.server.ThreadingHTTPServer, "serve_forever",
+                        lambda self, poll_interval=0.01: serve(self, poll_interval))
 
 
 class Clock:
@@ -80,6 +88,10 @@ def test_proxy_replays_429_on_next_account():
     assert seen == ["Bearer sk-ant-oat01-a", "Bearer sk-ant-oat01-b", "Bearer sk-ant-oat01-b"]
 
 
+def three_accounts():
+    return accounts() + [{"num": "5", "name": "c", "token": "sk-ant-oat01-c"}]
+
+
 @pytest.fixture
 def rotating_upstream():
     seen = []
@@ -114,6 +126,153 @@ def post(proxy, path="/v1/messages", payload=None, capability="cap", **headers):
         data=json.dumps(payload if payload is not None else {"model": "m", "stream": True}).encode(),
         headers={"Authorization": "Bearer " + capability, "Content-Type": "application/json", **headers},
     ), timeout=3)
+
+
+@pytest.mark.parametrize("statuses,expected", [
+    ({"a": 429, "b": 429}, 200),
+    ({"a": 401, "b": 429}, 200),
+    ({"a": 429, "b": 401}, 200),
+    ({"a": 429, "b": 429, "c": 429}, 429),
+    ({"a": 500}, 500),
+])
+def test_pool_retries_all_accounts_and_preserves_stream(rotating_upstream, statuses, expected):
+    url, replies, seen = rotating_upstream
+    replies.update(statuses)
+    pool = LocalTokenPool(three_accounts(), clock=Clock())
+    with SharedRotateProxy(pool, port=0, capability="cap", upstream=url) as proxy:
+        if expected == 200:
+            with post(proxy) as response:
+                assert response.read() == b"data: ok\n\n"
+        else:
+            with pytest.raises(urllib.error.HTTPError) as error:
+                post(proxy)
+            assert error.value.code == expected
+            assert error.value.headers["Retry-After"] == "120"
+            error.value.close()
+    assert [a for a, _, _ in seen] == (["a"] if expected == 500 else ["a", "b", "c"])
+    assert len({body for _, _, body in seen}) == 1
+    if expected == 429:
+        assert all(row["cooling_s"] == 120 for row in pool.status())
+
+
+def test_reset_via_cli_reuses_account_without_restarting(rotating_upstream, tmp_path, capsys):
+    url, replies, seen = rotating_upstream
+    pool = LocalTokenPool(three_accounts(), clock=Clock())
+    for account in pool.accounts:
+        pool.record_rate_limit(pool._credential(account), "120")
+    switcher = Mock(backup_dir=tmp_path)
+    (tmp_path / "rotate-capability").write_text("cap")
+    with SharedRotateProxy(pool, port=0, capability="cap", upstream=url) as proxy:
+        port = proxy.server.server_port
+        control_command(switcher, "rotate-status", port=port)
+        assert all(a["cooling_s"] == 120 for a in json.loads(capsys.readouterr().out)["accounts"])
+        control_command(switcher, "rotate-reset", account="b", port=port)
+        result = json.loads(capsys.readouterr().out)
+        assert result["reset"] == "b"
+        assert [a["cooling_s"] for a in result["accounts"]] == [120, 0, 120]
+        assert result["accounts"][1]["active"]
+        with post(proxy) as response:
+            assert response.status == 200
+        assert seen[0][0] == "b"
+        with post(proxy, "/local/rotation/reset", {"account": "5"}) as response:
+            assert json.load(response)["reset"] == "c"
+
+
+@pytest.mark.parametrize("capability,headers,payload,expected", [
+    ("wrong", {}, {"account": "b"}, 401),
+    ("cap", {"Origin": "https://example.invalid"}, {"account": "b"}, 401),
+    ("cap", {}, {"account": "missing"}, 400),
+    ("cap", {}, {"account": []}, 400),
+])
+def test_control_rejects_invalid_requests(rotating_upstream, capability, headers, payload, expected):
+    url, _, seen = rotating_upstream
+    pool = LocalTokenPool(three_accounts(), clock=Clock())
+    pool.record_rate_limit(pool.get(), "120")
+    before = pool.status()
+    with SharedRotateProxy(pool, port=0, capability="cap", upstream=url) as proxy:
+        with pytest.raises(urllib.error.HTTPError) as error:
+            post(proxy, "/local/rotation/reset", payload, capability, **headers)
+        assert error.value.code == expected
+        error.value.close()
+    assert pool.status() == before
+    assert seen == []
+
+
+def test_reset_does_not_revive_rejected_token():
+    pool = LocalTokenPool(accounts(), clock=Clock())
+    pool.recover(pool.get())
+    with pytest.raises(ValueError, match="rejected"):
+        pool.reset("a")
+    assert pool.status()[0]["dead"]
+
+
+def test_retry_never_replays_same_token(rotating_upstream, monkeypatch):
+    url, replies, seen = rotating_upstream
+    replies["a"] = 429
+    pool = LocalTokenPool(three_accounts(), clock=Clock())
+    first = pool.get()
+    monkeypatch.setattr(pool, "rate_limited", lambda *a, **kw: first)
+    with SharedRotateProxy(pool, port=0, capability="cap", upstream=url) as proxy:
+        with pytest.raises(urllib.error.HTTPError) as error:
+            post(proxy)
+        assert error.value.code == 429
+        error.value.close()
+    assert [row[0] for row in seen] == ["a"]
+
+
+def test_single_account_exhaustion_is_recorded(rotating_upstream):
+    url, replies, seen = rotating_upstream
+    replies["a"] = 429
+    pool = LocalTokenPool(accounts()[:1], clock=Clock())
+    with SharedRotateProxy(pool, port=0, capability="cap", upstream=url) as proxy:
+        with pytest.raises(urllib.error.HTTPError) as error:
+            post(proxy)
+        assert error.value.code == 429
+        error.value.close()
+    assert len(seen) == 1
+    assert pool.status()[0]["cooling_s"] == 120
+
+
+def test_last_account_rejected_while_another_is_only_rate_limited(rotating_upstream):
+    url, statuses, seen = rotating_upstream
+    statuses.update({"a": 429, "b": 401})
+    pool = LocalTokenPool(accounts(), clock=Clock())
+    with SharedRotateProxy(pool, port=0, capability="cap", upstream=url) as proxy:
+        with pytest.raises(urllib.error.HTTPError) as error:
+            post(proxy)
+        message = json.loads(error.value.read())["error"]["message"]
+        error.value.close()
+    # Account a is only rate-limited, so the agent must not be told to log in again.
+    assert error.value.code == 503
+    assert error.value.headers["x-should-retry"] == "false"
+    assert error.value.headers["Retry-After"] == "120"
+    assert "rate-limited" in message
+    # The rejected token is dropped by this request, not by the next one.
+    assert [row["dead"] for row in pool.status()] == [False, True]
+    assert [account for account, _, _ in seen] == ["a", "b"]
+
+
+def test_control_explains_a_proxy_that_predates_the_commands(rotating_upstream, tmp_path):
+    url, _statuses, _seen = rotating_upstream
+
+    class ProxyWithoutControls(SharedRotateProxy):
+        control_paths = ()
+
+    (tmp_path / "rotate-capability").write_text("cap")
+    pool = LocalTokenPool(accounts(), clock=Clock())
+    with ProxyWithoutControls(pool, port=0, capability="cap", upstream=url) as proxy:
+        with pytest.raises(ClaudeSwitchError, match="installed version"):
+            control_command(store_in(tmp_path), "rotate-status", port=proxy.server.server_port)
+
+
+def test_control_explains_a_capability_the_proxy_does_not_accept(rotating_upstream, tmp_path):
+    url, _statuses, _seen = rotating_upstream
+    (tmp_path / "rotate-capability").write_text("not-the-capability-the-proxy-started-with")
+    pool = LocalTokenPool(accounts(), clock=Clock())
+    with SharedRotateProxy(pool, port=0, capability="cap", upstream=url) as proxy:
+        with pytest.raises(ClaudeSwitchError, match="capability"):
+            control_command(store_in(tmp_path), "rotate-status", port=proxy.server.server_port)
+    assert pool.status()[0]["active"]
 
 
 # ---------------------------------------------------------------------------
@@ -363,7 +522,43 @@ def test_rotate_proxy_without_setup_tokens_is_a_usage_error(temp_home: Path, mon
     assert "add-token" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("command", ["rotate-proxy", "rotate-env"])
+def unused_port() -> int:
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+def test_rotate_reset_reports_the_reason_the_proxy_gave(
+    temp_home: Path, monkeypatch, capsys, rotating_upstream
+):
+    url, _statuses, _seen = rotating_upstream
+    capability = rotate_proxy.load_or_create_capability(file_backed_switcher())
+    pool = LocalTokenPool(accounts(), clock=Clock())
+    pool.recover(pool.get())  # the provider rejected account a
+    with SharedRotateProxy(pool, port=0, capability=capability, upstream=url) as proxy:
+        monkeypatch.setenv("CSWAP_ROTATE_PORT", str(proxy.server.server_port))
+        with pytest.raises(SystemExit) as exit_info:
+            run_cli(monkeypatch, "rotate-reset", "a")
+    assert exit_info.value.code == 1
+    assert capsys.readouterr().err.splitlines() == [
+        "Error: This token was rejected; replace its credentials first."
+    ]
+
+
+def test_rotate_status_without_a_running_proxy_is_one_error_line(
+    temp_home: Path, monkeypatch, capsys
+):
+    rotate_proxy.load_or_create_capability(file_backed_switcher())
+    monkeypatch.setenv("CSWAP_ROTATE_PORT", str(unused_port()))
+    with pytest.raises(SystemExit) as exit_info:
+        run_cli(monkeypatch, "rotate-status")
+    assert exit_info.value.code == 1
+    assert capsys.readouterr().err.splitlines() == [
+        "Error: Cannot reach the local rotation proxy."
+    ]
+
+
+@pytest.mark.parametrize("command", ["rotate-proxy", "rotate-env", "rotate-status", "rotate-reset"])
 def test_rotation_commands_explain_themselves(monkeypatch, capsys, command):
     with pytest.raises(SystemExit) as exit_info:
         run_cli(monkeypatch, command, "--help")
@@ -375,4 +570,5 @@ def test_main_help_lists_the_rotation_commands(monkeypatch, capsys):
     with pytest.raises(SystemExit):
         run_cli(monkeypatch, "--help")
     help_text = capsys.readouterr().out
-    assert "rotate-proxy" in help_text and "rotate-env" in help_text
+    for command in ("rotate-proxy", "rotate-env", "rotate-status", "rotate-reset"):
+        assert command in help_text
