@@ -7,10 +7,14 @@ the fixed Anthropic endpoint. Refresh tokens are never accepted or stored here.
 
 from __future__ import annotations
 
+import http.client
 import http.server
 import json
+import logging
 import secrets
 import signal
+import socket
+import struct
 import subprocess
 import threading
 import urllib.error
@@ -46,10 +50,24 @@ NO_USABLE_LOGIN_ADVICE = (
     "machine's own Claude login if it has one, or wait for the reset."
 )
 
+# The adapter runs in the process whose terminal native Claude draws on, so it
+# must never write to stderr. Without a handler of its own, logging prints
+# warnings there as a last resort; with one, they reach only cswap's log file.
+_log = logging.getLogger("claude-swap.vision_proxy")
+_log.addHandler(logging.NullHandler())
+
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
+
+
+class _AdapterServer(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        # socketserver prints the traceback to stderr, over native's screen.
+        _log.error("Native adapter request failed unexpectedly.", exc_info=True)
 
 
 class CentralCredential:
@@ -146,6 +164,22 @@ class InferenceProxy:
                 self.end_headers()
                 self.close_connection = True
                 self.wfile.write(body)
+
+            def _reset(self):
+                """Drop native's connection with a reset, not a clean close.
+
+                A clean close would end an event stream as though the reply
+                were complete; a reset makes native see the failure and retry.
+                """
+                self.close_connection = True
+                try:
+                    self.connection.setsockopt(
+                        socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0)
+                    )
+                    # Closed now, before socketserver's shutdown would send a FIN.
+                    self.connection.close()
+                except OSError:
+                    pass
 
             def _no_usable_login(self, error):
                 """Fail native's turn at once with why no login can serve."""
@@ -295,16 +329,24 @@ class InferenceProxy:
                     self._no_usable_login(error)
                 except ClaudeSwitchError:
                     self._error(503, "No central login is available for recovery.")
-                except (urllib.error.URLError, TimeoutError):
-                    # No retry here: only the native client decides whether to
-                    # replay a request whose upstream execution is uncertain.
-                    if not response_started:
+                except (OSError, http.client.HTTPException) as error:
+                    # URLError and timeouts, but also what http.client raises
+                    # unwrapped while reading the reply: TLS alerts such as
+                    # BAD_RECORD_MAC, resets, a hang-up, a truncated stream.
+                    # After the reply started it may instead be native hanging
+                    # up. No retry here: only the native client decides whether
+                    # to replay a request whose upstream execution is uncertain.
+                    _log.warning(
+                        "Native request failed %s: %r",
+                        "mid-reply" if response_started else "before a reply",
+                        error,
+                    )
+                    if response_started:
+                        self._reset()
+                    else:
                         self._error(502, "The provider connection is unavailable.")
-                except (BrokenPipeError, ConnectionResetError):
-                    pass
 
-        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self.server.daemon_threads = True
+        self.server = _AdapterServer(("127.0.0.1", 0), Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         return self

@@ -1,7 +1,12 @@
 """A synthetic upstream verifies request-time credentials and native streaming."""
 
+import http.client
 import http.server
 import json
+import ssl
+import subprocess
+import sys
+import textwrap
 import threading
 import urllib.error
 import urllib.request
@@ -39,6 +44,20 @@ def upstream():
                 self.send_response(429)
                 self.send_header("Retry-After", "120")
                 self.end_headers()
+                return
+            if b"hangup" in body:
+                # The provider drops the connection without answering.
+                self.close_connection = True
+                return
+            if b"truncate" in body:
+                # The provider dies partway through a streamed reply.
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                self.wfile.write(b"11\r\ndata: synthetic\n\n\r\n")
+                self.wfile.flush()
+                self.close_connection = True
                 return
             if b"redirect" in body:
                 self.send_response(307)
@@ -327,3 +346,94 @@ def test_locally_blocked_pool_returns_retry_after_without_provider_request(upstr
         assert error.value.code == 429
         assert error.value.headers["Retry-After"] == "90"
     assert seen == []
+
+
+BAD_RECORD_MAC = ssl.SSLError(
+    1, "[SSL: SSLV3_ALERT_BAD_RECORD_MAC] ssl/tls alert bad record mac (_ssl.c:2580)"
+)
+
+
+def test_tls_alert_while_reading_provider_reply_returns_502(
+    upstream, monkeypatch, capfd
+):
+    url, _ = upstream
+    credentials = Mock()
+    credentials.get.return_value = {"accessToken": "synthetic"}
+    with InferenceProxy(credentials, upstream=url) as proxy:
+        # http.client raises TLS failures from getresponse() as they are;
+        # urllib wraps only failures while sending, as URLError.
+        monkeypatch.setattr(proxy.opener, "open", Mock(side_effect=BAD_RECORD_MAC))
+        with pytest.raises(urllib.error.HTTPError) as error:
+            request(proxy)
+        assert error.value.code == 502
+    assert capfd.readouterr().err == ""
+
+
+def test_provider_hanging_up_without_a_reply_returns_502(upstream):
+    url, seen = upstream
+    credentials = Mock()
+    credentials.get.return_value = {"accessToken": "synthetic"}
+    with InferenceProxy(credentials, upstream=url) as proxy:
+        with pytest.raises(urllib.error.HTTPError) as error:
+            request(proxy, body=b'{"hangup":true}')
+        assert error.value.code == 502
+    assert len(seen) == 1
+
+
+def test_provider_failure_mid_stream_resets_native_connection(upstream, capfd):
+    url, _ = upstream
+    credentials = Mock()
+    credentials.get.return_value = {"accessToken": "synthetic"}
+    with InferenceProxy(credentials, upstream=url) as proxy:
+        with request(proxy, body=b'{"truncate":true}') as response:
+            assert response.status == 200
+            # A clean end of stream would pass the partial reply off as complete.
+            with pytest.raises((ConnectionResetError, http.client.IncompleteRead)):
+                response.read()
+    assert capfd.readouterr().err == ""
+
+
+def test_adapter_failures_never_reach_the_native_terminal(tmp_path):
+    """Native Claude draws on this process's stderr, so the adapter writes nothing there.
+
+    A separate process, so no handler a test framework installs can absorb
+    what the logging module would otherwise print as a last resort.
+    """
+    script = tmp_path / "adapter.py"
+    script.write_text(
+        textwrap.dedent(
+            """
+            import ssl
+            import urllib.request
+            from unittest.mock import Mock
+
+            from claude_swap.vision_proxy import InferenceProxy
+
+            credentials = Mock()
+            credentials.get.side_effect = [
+                {"accessToken": "synthetic"},
+                RuntimeError("an unanticipated adapter failure"),
+            ]
+            with InferenceProxy(credentials) as proxy:
+                proxy.opener.open = Mock(side_effect=ssl.SSLError(1, "bad record mac"))
+                for _ in range(2):
+                    try:
+                        urllib.request.urlopen(
+                            urllib.request.Request(
+                                proxy.url + "/v1/messages",
+                                data=b"{}",
+                                headers={"Authorization": "Bearer " + proxy.capability},
+                            ),
+                            timeout=5,
+                        )
+                    except Exception as error:
+                        print(type(error).__name__, getattr(error, "code", ""))
+            """
+        )
+    )
+    result = subprocess.run(
+        [sys.executable, str(script)], capture_output=True, text=True, timeout=60
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.split("\n")[0] == "HTTPError 502"
+    assert result.stderr == ""
