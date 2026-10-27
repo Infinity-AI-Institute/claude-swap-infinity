@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import threading
 import time
@@ -10,7 +11,12 @@ from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 
 from claude_swap.autoswitch import rank_candidates
-from claude_swap.exceptions import ConfigError, NoUsableLogin
+from claude_swap.exceptions import (
+    ClaudeSwitchError,
+    ConfigError,
+    NoUsableLogin,
+    SessionError,
+)
 from claude_swap.locking import FileLock
 from claude_swap.oauth import (
     account_headroom,
@@ -27,8 +33,37 @@ from claude_swap.settings import (
 from claude_swap.vision import VisionError
 from claude_swap.vision_proxy import CentralCredential
 from claude_swap.vision_registry import RegistryPool
-from claude_swap.vision_session import recover_rejected_credential
-from claude_swap.vision_usage import read_usage
+from claude_swap.vision_session import ReloginRequired, recover_rejected_credential
+from claude_swap.vision_usage import RELOGIN_USAGE_ERROR, read_usage
+
+# The pool runs inside the native adapter, whose terminal native Claude draws
+# on: its warnings go to cswap's log file only, never to stderr.
+_log = logging.getLogger("claude-swap.vision_pool")
+_log.addHandler(logging.NullHandler())
+
+# How long a request waits for Vision to finish refreshing the selected login
+# before trying another one. A launch waits longer (acquire_credential's
+# default): there is no other login to serve it while it starts.
+REQUEST_RECOVERY_WAIT_SECONDS = 15
+# How long a login Vision could not issue stays out of rotation. A login that
+# needs re-login is re-checked less often; a re-login also bumps its
+# generation, which returns it at once.
+UNAVAILABLE_RETRY_SECONDS = 30
+RELOGIN_RECHECK_SECONDS = 300
+# Vision refusals about one login's credential. Anything else (the key, the
+# member's access, Vision's own health) affects every login alike, so trying
+# the next login would only repeat it.
+PER_LOGIN_VISION_CODES = frozenset(
+    {
+        "credential_unavailable",
+        "unavailable",
+        "identity_mismatch",
+        "invalid_credential",
+        "expired",
+        "conflict",
+        "request_conflict",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -38,6 +73,9 @@ class IneligibleLogin:
     email: str
     reason: str
     available_at: float | None = None  # UTC epoch seconds; None when unknown
+    # The command a person must run before this login can serve again, when
+    # waiting will not help (it needs a re-login). Also part of ``reason``.
+    command: str | None = None
 
 
 @dataclass(frozen=True)
@@ -61,7 +99,13 @@ class NoCentralQuota(NoUsableLogin):
     launcher and native (through the adapter's error body) can say what to do.
     """
 
-    def __init__(self, logins: list[IneligibleLogin], *, now: float):
+    def __init__(
+        self,
+        logins: list[IneligibleLogin],
+        *,
+        now: float,
+        retry_after_seconds: int | None = None,
+    ):
         self.logins = tuple(logins)
         known = [
             login.available_at
@@ -69,13 +113,41 @@ class NoCentralQuota(NoUsableLogin):
             if login.available_at is not None
         ]
         self.available_at = min(known, default=None)
-        retry_after = None
-        if self.available_at is not None:
+        retry_after = retry_after_seconds
+        if retry_after is None and self.available_at is not None:
             retry_after = max(1, math.ceil(self.available_at - now))
         super().__init__(
             describe_ineligible(self.logins, self.available_at, now),
             retry_after_seconds=retry_after,
         )
+
+    @property
+    def needs_action(self) -> bool:
+        """Whether a person must run a command (a re-login) for a login to return."""
+        return any(login.command for login in self.logins)
+
+
+class ProviderRateLimited(NoCentralQuota):
+    """Every remaining login is inside a provider Retry-After window.
+
+    ``retry_after_seconds`` is the soonest such window's end: retrying then is
+    expected to succeed, so native may retry on its own.
+    """
+
+
+def relogin_command(row: dict) -> str:
+    """The command that logs a Vision roster row's account in again."""
+    alias = row.get("alias")
+    if not isinstance(alias, str) or not alias:
+        alias = str(row.get("email", "")).partition("@")[0] or "<alias>"
+    return f"cswap vision account-login {alias}"
+
+
+def relogin_login(row: dict, cause: str) -> IneligibleLogin:
+    command = relogin_command(row)
+    return IneligibleLogin(
+        row.get("email", ""), f"{cause}; run `{command}`", None, command
+    )
 
 
 def describe_moment(timestamp: float, now: float) -> str:
@@ -90,7 +162,7 @@ def describe_ineligible(
     if not logins:
         return "Vision authorizes no Claude account for this key."
     details = "; ".join(f"{login.email} ({login.reason})" for login in logins)
-    message = f"No Vision Claude account has known quota available: {details}."
+    message = f"No Vision Claude account can serve this request now: {details}."
     if len(logins) > 1 and available_at is not None:
         message += f" Earliest reset: {describe_moment(available_at, now)}."
     return message
@@ -169,6 +241,11 @@ class CentralPoolCredential:
         self.lock = threading.RLock()
         self.rejected = {}
         self.rate_limits = {}
+        # login -> (generation, retry_at, why): logins Vision could not issue.
+        self.unavailable: dict[str, tuple[int, float, IneligibleLogin]] = {}
+        # Logins whose last usage reading says their credential expired; None
+        # until the first reading.
+        self.observed_relogin: frozenset[str] | None = None
 
     def _records(self):
         """Selectable Vision rows by login, and why each other one is not (by login)."""
@@ -215,6 +292,13 @@ class CentralPoolCredential:
                     )
                     continue
                 del self.rejected[login]
+            unavailable = self.unavailable.get(login)
+            if unavailable is not None:
+                generation, retry_at, why = unavailable
+                if row.get("visionGeneration", 0) <= generation and now < retry_at:
+                    excluded[login] = why
+                    continue
+                del self.unavailable[login]
             if row.get("disabled", False):
                 excluded[login] = IneligibleLogin(
                     email, f"disabled here; `cswap enable {number}` re-enables it"
@@ -224,14 +308,63 @@ class CentralPoolCredential:
         return records, excluded
 
     def get(self, *, model=None):
+        """A credential from the best login that can issue one now.
+
+        A login Vision cannot issue (it needs a re-login, its refresh is still
+        running, its identity changed) is set aside and the next is tried in
+        the same call; each pass sets one more aside, so this ends with a
+        credential or NoCentralQuota naming every login and why.
+        """
         with self.lock:
-            record, now, _ = self._select(model, request_models)
-            credential = CentralCredential(self.client, record).get(model=model)
-            selected = record["visionLoginId"]
-            if selected != self.current:
-                self.current = selected
-                self.last_switch = now
-            return credential
+            while True:
+                record, now, _ = self._select(model, request_models)
+                try:
+                    credential = CentralCredential(
+                        self.client,
+                        record,
+                        wait_seconds=REQUEST_RECOVERY_WAIT_SECONDS,
+                    ).get(model=model)
+                except (SessionError, VisionError) as error:
+                    if not self._set_aside(record, error):
+                        raise
+                    continue
+                selected = record["visionLoginId"]
+                if selected != self.current:
+                    self.current = selected
+                    self.last_switch = now
+                return credential
+
+    def _set_aside(self, record: dict, error: ClaudeSwitchError) -> bool:
+        """Exclude a login whose own credential failed; False if the error is not its own."""
+        now = self.clock()
+        email = record.get("email", "")
+        if isinstance(error, ReloginRequired):
+            retry_at = now + RELOGIN_RECHECK_SECONDS
+            why = relogin_login(record, "needs re-login")
+        elif isinstance(error, SessionError) or (
+            isinstance(error, VisionError) and error.code in PER_LOGIN_VISION_CODES
+        ):
+            retry_at = now + UNAVAILABLE_RETRY_SECONDS
+            cause = (
+                error.code
+                if isinstance(error, VisionError)
+                else str(error).rstrip(".")
+            )
+            why = IneligibleLogin(
+                email,
+                f"Vision could not issue its login ({cause}); retrying "
+                + describe_moment(retry_at, now),
+                retry_at,
+            )
+        else:
+            return False
+        _log.warning("Vision login %s set aside: %s", email, why.reason)
+        self.unavailable[record["visionLoginId"]] = (
+            record.get("visionGeneration", 0),
+            retry_at,
+            why,
+        )
+        return True
 
     def check_launch(self, *, model=None):
         """The LaunchSelection for native's first request, or NoCentralQuota.
@@ -263,6 +396,7 @@ class CentralPoolCredential:
                 ) from None
             try:
                 observations = read_usage(self.client, now=now)
+                self.observed_relogin = _relogin_logins(observations)
             except VisionError:
                 # An observation outage is not evidence that another account
                 # has quota. An existing authorized login can still be used;
@@ -330,8 +464,11 @@ class CentralPoolCredential:
             if selected not in records or (forced and not ordered):
                 # Reached only when the current login is spent or gone and no other
                 # has known headroom, so every remaining row is spent or unread.
+                expired = self.observed_relogin or frozenset()
                 spent = [
-                    spent_login(row, usage[login], models, now)
+                    relogin_login(row, "Vision's usage check found its login expired")
+                    if login in expired
+                    else spent_login(row, usage[login], models, now)
                     for login, row in records.items()
                 ]
                 self._unavailable(list(excluded.values()) + spent, now)
@@ -362,12 +499,63 @@ class CentralPoolCredential:
         remaining = [deadline - now for deadline in self.rate_limits.values()]
         remaining = [delay for delay in remaining if delay > 0]
         if remaining:
-            raise VisionError(
-                "rate_limited",
-                status=429,
+            raise ProviderRateLimited(
+                logins,
+                now=now,
                 retry_after_seconds=max(1, math.ceil(min(remaining))),
             )
         raise NoCentralQuota(logins, now=now)
+
+    def relogin_command(self, credential: dict) -> str:
+        """The re-login command for the roster row an issued credential came from."""
+        with FileLock(self.switcher.lock_file):
+            data = self.switcher._get_sequence_data() or {}
+        for row in (data.get("accounts") or {}).values():
+            if (
+                isinstance(row, dict)
+                and row.get("visionUrl") == self.client.url
+                and row.get("visionLoginId") == credential.get("login_id")
+            ):
+                return relogin_command(row)
+        return relogin_command({"email": credential.get("email", "")})
+
+    def relogin_notices(self, *, timeout_seconds: float = 2.0) -> list[str]:
+        """One line per login that needs a re-login, with its command; [] if none.
+
+        For the moment before native starts. Bounded by ``timeout_seconds`` and
+        never raises: a slow or unreachable Vision skips the notices rather than
+        delaying or failing the launch.
+        """
+        result: list[str] = []
+
+        def collect():
+            try:
+                with self.lock:
+                    records, excluded = self._records()
+                    expired = self.observed_relogin
+                if expired is None:
+                    expired = _relogin_logins(read_usage(self.client, now=self.clock()))
+                needing = [
+                    why for why in excluded.values() if why.command is not None
+                ] + [
+                    relogin_login(row, "needs re-login")
+                    for login, row in records.items()
+                    if login in expired
+                ]
+                result.extend(
+                    f"cswap: {why.email} needs re-login: run `{why.command}`"
+                    for why in needing
+                )
+            except ClaudeSwitchError as error:
+                _log.warning("Launch re-login check skipped: %s", error)
+
+        worker = threading.Thread(target=collect, daemon=True)
+        worker.start()
+        worker.join(timeout_seconds)
+        if worker.is_alive():
+            _log.warning("Launch re-login check skipped: Vision did not answer in time.")
+            return []
+        return result
 
     def record_rate_limit(self, credential, retry_after):
         with self.lock:
@@ -388,3 +576,11 @@ class CentralPoolCredential:
                 if error.code == "rate_limited":
                     return None
                 raise
+
+
+def _relogin_logins(observations) -> frozenset[str]:
+    return frozenset(
+        login
+        for login, (_, entry) in observations.items()
+        if entry.last_error == RELOGIN_USAGE_ERROR
+    )

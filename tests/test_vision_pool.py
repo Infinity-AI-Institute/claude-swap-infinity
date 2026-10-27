@@ -11,8 +11,10 @@ from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.usage_store import UsageEntry
 from claude_swap.vision import VisionClient, VisionError
 from claude_swap.vision_pool import (
+    RELOGIN_USAGE_ERROR,
     CentralPoolCredential,
     NoCentralQuota,
+    ProviderRateLimited,
     request_models,
     retry_delay,
 )
@@ -158,7 +160,7 @@ def test_no_known_quota_fails_without_provider_request(setup):
     pool, _, client, observations, _, _ = setup
     for index in range(1, 4):
         observations[item(index)["login_id"]] = observation(index, 100)
-    with pytest.raises(SessionError, match="known quota"):
+    with pytest.raises(SessionError, match="can serve this request now"):
         pool.get()
     client.credential.assert_not_called()
 
@@ -318,10 +320,12 @@ def test_all_accounts_limited_returns_remaining_retry_delay(setup):
     assert pool.rate_limited(third, "240") is None
     calls = client.credential.call_count
     clock.return_value += 30
-    with pytest.raises(VisionError) as error:
+    with pytest.raises(ProviderRateLimited) as error:
         pool.get()
-    assert error.value.status == 429
     assert error.value.retry_after_seconds == 90
+    assert not error.value.needs_action
+    # Each login is named with its own window, not a bare "rate_limited".
+    assert str(error.value).count("rate-limited by the provider until") == 3
     assert client.credential.call_count == calls
 
 
@@ -330,3 +334,205 @@ def test_all_logins_for_limited_account_are_excluded(setup):
     client.discover.return_value[2]["account_id"] = item(2)["account_id"]
     credential = pool.get()
     assert pool.rate_limited(credential, "120")["accessToken"] == "synthetic-token-1"
+
+
+def _needs_relogin(client, *indexes):
+    """Vision cannot issue these logins, and its refresh says they need a re-login."""
+    issue = client.credential.side_effect
+    blocked = {item(index)["login_id"] for index in indexes}
+
+    def credential(account, login):
+        if login in blocked:
+            raise VisionError("credential_unavailable", status=409)
+        return issue(account, login)
+
+    client.credential.side_effect = credential
+    client.refresh.side_effect = None
+    client.refresh.return_value = {"version": 1, "generation": 1, "state": "reauth_required"}
+
+
+def test_login_needing_relogin_is_skipped_within_the_same_request(setup):
+    """P1: the request that finds a dead login is served by the next one."""
+    pool, _, client, _, _, _ = setup
+    _needs_relogin(client, 2)
+    assert pool.get()["accessToken"] == "synthetic-token-3"
+    calls = client.credential.call_count
+    assert pool.get()["accessToken"] == "synthetic-token-3"
+    # The dead login is not asked again on the next request.
+    assert client.credential.call_count == calls + 1
+    excluded = pool._records()[1]
+    why = excluded[item(2)["login_id"]]
+    assert why.command is not None and why.command.startswith(
+        "cswap vision account-login "
+    )
+    assert why.command in why.reason
+    assert why.available_at is None
+
+
+def test_login_vision_cannot_issue_is_skipped_and_retried_later(setup):
+    pool, _, client, observations, clock, _ = setup
+    issue = client.credential.side_effect
+
+    def credential(account, login):
+        if login == item(2)["login_id"]:
+            raise VisionError("unavailable", status=404)
+        return issue(account, login)
+
+    client.credential.side_effect = credential
+    assert pool.get()["accessToken"] == "synthetic-token-3"
+    why = pool._records()[1][item(2)["login_id"]]
+    assert why.command is None and why.available_at is not None
+    client.credential.side_effect = issue
+    observations[item(1)["login_id"]] = observation(1, 100)
+    observations[item(3)["login_id"]] = observation(3, 100)
+    with pytest.raises(NoCentralQuota):
+        pool.get()  # Login 2 is still set aside; 1 and 3 are now spent.
+    clock.return_value = why.available_at + 1
+    assert pool.get()["accessToken"] == "synthetic-token-2"
+
+
+def test_identity_change_of_one_login_does_not_stop_the_pool(setup):
+    pool, _, client, _, _, _ = setup
+    issue = client.credential.side_effect
+
+    def credential(account, login):
+        token = issue(account, login)
+        if login == item(2)["login_id"]:
+            token["email"] = "someone-else@example.invalid"
+        return token
+
+    client.credential.side_effect = credential
+    assert pool.get()["accessToken"] == "synthetic-token-3"
+
+
+def test_every_login_failing_names_each_with_its_command(setup):
+    pool, _, client, _, _, _ = setup
+    _needs_relogin(client, 1, 2, 3)
+    with pytest.raises(NoCentralQuota) as refused:
+        pool.get()
+    assert len(refused.value.logins) == 3
+    assert all(login.command for login in refused.value.logins)
+    assert str(refused.value).count("cswap vision account-login ") == 3
+    assert refused.value.needs_action
+
+
+def test_refused_key_is_not_mistaken_for_a_dead_login(setup):
+    pool, _, client, _, _, _ = setup
+    client.credential.side_effect = VisionError("unauthorized", status=401)
+    with pytest.raises(VisionError) as refused:
+        pool.get()
+    assert refused.value.code == "unauthorized"
+    assert client.credential.call_count == 1
+
+
+def test_relogin_returns_the_login_to_the_pool_at_its_new_generation(setup):
+    pool, _, client, observations, _, _ = setup
+    issue = client.credential.side_effect
+    _needs_relogin(client, 2)
+    assert pool.get()["accessToken"] == "synthetic-token-3"
+    client.credential.side_effect = issue
+    client.discover.return_value[1]["login_generation"] = 2
+    pool.pool.sync(force=True)
+    observations[item(3)["login_id"]] = observation(3, 100)
+    assert pool.get()["accessToken"] == "synthetic-token-2"
+
+
+def test_expired_usage_reading_names_the_relogin_command(setup):
+    """Vision's usage check sees an expired login before any request fails."""
+    pool, _, _, observations, _, _ = setup
+    account, entry = observations[item(2)["login_id"]]
+    observations[item(2)["login_id"]] = (
+        account,
+        UsageEntry(last_error=RELOGIN_USAGE_ERROR, decision_blocked=True),
+    )
+    for index in (1, 3):
+        observations[item(index)["login_id"]] = observation(index, 100)
+    with pytest.raises(NoCentralQuota) as refused:
+        pool.get()
+    reasons = {login.email: login for login in refused.value.logins}
+    expired = reasons["user2@example.invalid"]
+    assert expired.command and expired.command in expired.reason
+    assert pool.relogin_notices() == [
+        f"cswap: user2@example.invalid needs re-login: run `{expired.command}`"
+    ]
+
+
+def test_relogin_notices_are_empty_when_every_login_is_fine(setup):
+    pool, _, _, _, _, _ = setup
+    assert pool.relogin_notices() == []
+
+
+def test_relogin_notices_never_fail_a_launch(setup):
+    pool, _, client, _, _, read = setup
+    client.discover.side_effect = VisionError("service_unavailable")
+    read.side_effect = VisionError("service_unavailable")
+    pool.pool.state_path.unlink(missing_ok=True)
+    assert pool.relogin_notices() == []
+
+
+def _expire(observations, *indexes):
+    for index in indexes:
+        account, _ = observations[item(index)["login_id"]]
+        observations[item(index)["login_id"]] = (
+            account,
+            UsageEntry(last_error=RELOGIN_USAGE_ERROR, decision_blocked=True),
+        )
+
+
+def test_adapter_start_prints_one_line_per_login_needing_relogin(setup, capsys):
+    """P5: the warning appears before native starts, and only when needed."""
+    from claude_swap.vision_proxy import InferenceProxy
+
+    pool, _, _, observations, _, _ = setup
+    with InferenceProxy(pool):
+        pass
+    assert capsys.readouterr().err == ""
+    _expire(observations, 2)
+    with InferenceProxy(pool):
+        pass
+    lines = capsys.readouterr().err.splitlines()
+    assert len(lines) == 1
+    assert lines[0].startswith("cswap: user2@example.invalid needs re-login: run `")
+
+
+def test_relogin_notices_follow_a_subclass_that_narrows_the_pool(setup):
+    """The yoco launcher narrows ``_records()``; its hidden logins stay unmentioned."""
+    pool, switcher, client, observations, clock, _ = setup
+
+    class Narrowed(CentralPoolCredential):
+        def _records(self):
+            records, excluded = super()._records()
+            keep = item(1)["email"]
+            return (
+                {k: v for k, v in records.items() if v.get("email") == keep},
+                {k: v for k, v in excluded.items() if v.email == keep},
+            )
+
+    narrowed = Narrowed(
+        switcher, client, {"visionLoginId": item(1)["login_id"]}, clock=clock
+    )
+    _expire(observations, 1, 2)
+    assert narrowed.relogin_notices() == [
+        f"cswap: {item(1)['email']} needs re-login: run "
+        f"`{narrowed.relogin_command({'login_id': item(1)['login_id']})}`"
+    ]
+
+
+def test_relogin_notices_give_up_quickly_when_vision_hangs(setup):
+    import threading
+    import time as real_time
+
+    pool, _, _, _, _, read = setup
+    release = threading.Event()
+
+    def hang(*_args, **_kwargs):
+        release.wait(5)
+        return {}
+
+    read.side_effect = hang
+    started = real_time.monotonic()
+    try:
+        assert pool.relogin_notices(timeout_seconds=0.2) == []
+    finally:
+        release.set()
+    assert real_time.monotonic() - started < 2

@@ -38,6 +38,10 @@ class CredentialUnavailable(SessionError):
     """
 
 
+class ReloginRequired(CredentialUnavailable):
+    """Vision says this login's provider session is gone: a person must log it in again."""
+
+
 @dataclass(frozen=True)
 class RemoteLaunch:
     directory: Path  # Existing native config/conversation home, not credential storage.
@@ -60,7 +64,7 @@ def acquire_credential(client: VisionClient, record: dict, *, wait_seconds=90):
         raise VisionError("credential_unavailable")
     receipt = client.refresh(account, login, generation)
     if receipt["state"] == "reauth_required":
-        raise CredentialUnavailable(
+        raise ReloginRequired(
             "The Vision login needs reauthentication before launch."
         )
     # Only queued/running receipts schedule recovery work. Re-read once in
