@@ -239,3 +239,80 @@ def test_dash_through_a_real_pipe_keeps_the_key_out_of_argv(tmp_path):
     assert KEY not in completed.stdout + completed.stderr + " ".join(arguments)
     saved = json.loads((tmp_path / "config" / "vision" / "credentials.json").read_text())
     assert saved["api_key"] == KEY
+
+
+class _KeyCheckingVision:
+    """Network boundary: Vision accepts only ``accepted`` keys; records each key seen."""
+
+    def __init__(self, monkeypatch, accepted):
+        import urllib.error
+
+        self.accepted = set(accepted)
+        self.seen = []
+        outer = self
+
+        class Opener:
+            def open(self, req, timeout):
+                key = req.get_header("X-api-key")
+                outer.seen.append(key)
+                if key not in outer.accepted:
+                    body = io.BytesIO(json.dumps({"error": {"code": "unauthorized"}}).encode())
+                    raise urllib.error.HTTPError(req.full_url, 401, "refused", {}, body)
+                return io.BytesIO(json.dumps({"data": {"ok": True}}).encode())
+
+        monkeypatch.setattr("urllib.request.build_opener", lambda *args: Opener())
+
+
+ROTATED = "vsk_" + "b" * 40
+
+
+def test_revoked_saved_key_is_reread_and_the_request_retried_once(monkeypatch):
+    """P3: a key replaced in credentials.json is picked up without a relaunch."""
+    save_token(KEY)
+    client = configured_client()
+    save_token(ROTATED)
+    vision = _KeyCheckingVision(monkeypatch, accepted={ROTATED})
+    assert client.request("GET", "/api/me") == {"ok": True}
+    assert vision.seen == [KEY, ROTATED]
+    assert client.api_key == ROTATED
+    assert client.request("GET", "/api/me") == {"ok": True}
+    assert vision.seen == [KEY, ROTATED, ROTATED]
+
+
+def test_rejected_key_with_no_replacement_is_not_retried(monkeypatch):
+    save_token(KEY)
+    client = configured_client()
+    vision = _KeyCheckingVision(monkeypatch, accepted=set())
+    from claude_swap.vision import VisionError
+
+    with pytest.raises(VisionError) as refused:
+        client.request("GET", "/api/me")
+    assert refused.value.code == "unauthorized"
+    assert vision.seen == [KEY]
+    assert client.key_source == "saved"
+
+
+def test_environment_key_reports_its_source_and_is_not_replaced_by_the_file(monkeypatch):
+    """VISION_API_KEY wins at launch, so a re-read keeps it (and its source) too."""
+    save_token(ROTATED)
+    monkeypatch.setenv("VISION_API_KEY", KEY)
+    client = configured_client()
+    assert client.key_source == "environment"
+    vision = _KeyCheckingVision(monkeypatch, accepted={ROTATED})
+    from claude_swap.vision import VisionError
+
+    with pytest.raises(VisionError):
+        client.request("GET", "/api/me")
+    assert vision.seen == [KEY]
+
+
+def test_unreadable_saved_key_on_reread_keeps_the_original_refusal(monkeypatch):
+    save_token(KEY)
+    client = configured_client()
+    token_path().write_text("malformed")
+    _KeyCheckingVision(monkeypatch, accepted=set())
+    from claude_swap.vision import VisionError
+
+    with pytest.raises(VisionError) as refused:
+        client.request("GET", "/api/me")
+    assert refused.value.code == "unauthorized"
