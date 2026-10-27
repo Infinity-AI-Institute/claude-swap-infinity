@@ -12,6 +12,12 @@ from claude_swap.oauth import build_usage_result
 from claude_swap.usage_store import UsageEntry
 from claude_swap.vision import VisionClient, VisionError, registry_id
 
+# UsageEntry.last_error for a login whose stored credential Vision's usage
+# worker found expired or invalid: Vision could not refresh it, so the account
+# needs a fresh login.
+RELOGIN_USAGE_ERROR = "vision-relogin-required"
+RELOGIN_USAGE_CODES = frozenset({"expired_credential", "invalid_credential"})
+
 
 def timestamp(value: Any, *, nullable: bool = False) -> float | None:
     if value is None and nullable:
@@ -102,7 +108,13 @@ def project_status(status: Any, *, now: float) -> UsageEntry:
         age_s=max(0, now - observed) if observed is not None else None,
         last_attempt_at=attempted,
         next_poll_at=next_attempt,
-        last_error=None if not blocked else "vision-usage-unavailable",
+        last_error=(
+            RELOGIN_USAGE_ERROR
+            if status.get("error_code") in RELOGIN_USAGE_CODES
+            else "vision-usage-unavailable"
+            if blocked
+            else None
+        ),
         decision_blocked=blocked,
     )
 

@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import os
 import stat
+import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -36,6 +38,10 @@ class CredentialUnavailable(SessionError):
     """
 
 
+class ReloginRequired(CredentialUnavailable):
+    """Vision says this login's provider session is gone: a person must log it in again."""
+
+
 @dataclass(frozen=True)
 class RemoteLaunch:
     directory: Path  # Existing native config/conversation home, not credential storage.
@@ -58,7 +64,7 @@ def acquire_credential(client: VisionClient, record: dict, *, wait_seconds=90):
         raise VisionError("credential_unavailable")
     receipt = client.refresh(account, login, generation)
     if receipt["state"] == "reauth_required":
-        raise CredentialUnavailable(
+        raise ReloginRequired(
             "The Vision login needs reauthentication before launch."
         )
     # Only queued/running receipts schedule recovery work. Re-read once in
@@ -138,6 +144,70 @@ def credential_directory(backup_dir, url, login_id):
     )
 
 
+def move_stray_logins(directory: Path, backup_dir: Path) -> list[Path]:
+    """Move a native login out of a central login's secure storage; return where.
+
+    The store exists only to give native its own Keychain scope, so the only
+    login ever found there is one /login saved inside a cswap session. Native
+    would read it in place of the central access token. It is never adopted,
+    overwritten or deleted: it moves to a new directory under
+    ``vision-stray-logins`` exactly as native would store it for that directory
+    (file, or Keychain service derived from it), where
+    ``cswap vision existing-logins --profile <dir>`` still finds it. Only this
+    directory's own Keychain entry is touched.
+    """
+    from claude_swap.session import _mkdir_private, keychain_service_name
+
+    auth_path = directory / ".credentials.json"
+    has_file = auth_path.exists() or auth_path.is_symlink()
+    keychain = None
+    account = macos_keychain.keychain_account_name()
+    service = keychain_service_name(directory)
+    if Platform.detect() == Platform.MACOS:
+        try:
+            keychain = macos_keychain.get_password(service, account)
+        except macos_keychain.KEYCHAIN_ERRORS:
+            raise SessionError(
+                "The Vision credential Keychain entry is unavailable; unlock it and retry."
+            ) from None
+    if not has_file and keychain is None:
+        return []
+    root = backup_dir / "vision-stray-logins"
+    _mkdir_private(root)
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    destination = Path(tempfile.mkdtemp(prefix=f"{stamp}-", dir=root))
+    if has_file:
+        try:
+            # A rename moves a symlink itself, never what it points to.
+            os.replace(auth_path, destination / ".credentials.json")
+        except FileNotFoundError:
+            # A concurrent launch of the same login moved it first.
+            if keychain is None:
+                destination.rmdir()
+                return []
+    if keychain is not None:
+        kept = keychain_service_name(destination)
+        try:
+            macos_keychain.set_password(kept, account, keychain)
+            saved = macos_keychain.get_password(kept, account)
+        except macos_keychain.KEYCHAIN_ERRORS:
+            saved = None
+        if saved != keychain:
+            raise SessionError(
+                "A login saved by /login inside a cswap session could not be "
+                "moved out of the Keychain; unlock the Keychain and retry."
+            )
+        try:
+            macos_keychain.delete_password(service, account)
+        except macos_keychain.KEYCHAIN_ERRORS:
+            raise SessionError(
+                "A login saved by /login inside a cswap session could not be "
+                "removed from the Keychain after it was copied; unlock the "
+                "Keychain and retry."
+            ) from None
+    return [destination]
+
+
 def prepare_launch(
     manager,
     record: dict,
@@ -146,11 +216,7 @@ def prepare_launch(
     share: bool,
     share_history: bool,
 ) -> RemoteLaunch:
-    from claude_swap.session import (
-        AUTH_OVERRIDE_ENV_VARS,
-        _mkdir_private,
-        keychain_service_name,
-    )
+    from claude_swap.session import AUTH_OVERRIDE_ENV_VARS, _mkdir_private
 
     if client is None or record.get("visionUrl") != client.url:
         raise SessionError(
@@ -181,27 +247,12 @@ def prepare_launch(
                 "The Vision credential storage path must be a real directory."
             )
     _mkdir_private(directory)
-    # Never overwrite or silently adopt credentials created by a native login.
-    # That grant needs the explicit ownership handoff before central use resumes.
-    auth_path = directory / ".credentials.json"
-    if auth_path.exists() or auth_path.is_symlink():
-        raise SessionError(
-            "This Vision credential store contains a local login that needs handoff."
+    for moved in move_stray_logins(directory, manager.switcher.backup_dir):
+        print(
+            "cswap: moved aside a Claude login that /login saved inside a cswap "
+            f"session; it is kept in {moved}",
+            file=sys.stderr,
         )
-    if Platform.detect() == Platform.MACOS:
-        try:
-            native_login = macos_keychain.get_password(
-                keychain_service_name(directory),
-                macos_keychain.keychain_account_name(),
-            )
-        except macos_keychain.KEYCHAIN_ERRORS:
-            raise SessionError(
-                "The Vision credential Keychain entry is unavailable; unlock it and retry."
-            ) from None
-        if native_login is not None:
-            raise SessionError(
-                "This Vision credential store contains a local Keychain login that needs handoff."
-            )
     env = {
         key: value
         for key, value in os.environ.items()

@@ -175,7 +175,12 @@ class RegistryPool:
         self.client = client
         self.now = now
         self.state_path = switcher.backup_dir / "vision-sync.json"
-        self.key_fingerprint = hashlib.sha256(client.api_key.encode()).hexdigest()
+
+    @property
+    def key_fingerprint(self) -> str:
+        # Read per use: the client re-reads a key Vision refuses (P3), and a
+        # roster synchronized under the old key must not count as current.
+        return hashlib.sha256(self.client.api_key.encode()).hexdigest()
 
     def _state(self) -> dict[str, Any]:
         state = self.switcher._read_json(self.state_path, strict=True) or {}

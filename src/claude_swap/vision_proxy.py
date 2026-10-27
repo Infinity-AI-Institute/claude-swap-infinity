@@ -16,6 +16,7 @@ import signal
 import socket
 import struct
 import subprocess
+import sys
 import threading
 import urllib.error
 import urllib.parse
@@ -50,6 +51,39 @@ NO_USABLE_LOGIN_ADVICE = (
     "machine's own Claude login if it has one, or wait for the reset."
 )
 
+# How native Claude (2.1.311, measured against a fake upstream) shows an
+# adapter error: it puts "Please run /login" before every 401 and 403, which
+# can never fix a Vision-side problem, so the adapter sends neither. A 400 is
+# shown verbatim and never retried: the status for problems a person must fix.
+# A 5xx with ``x-should-retry: false`` is shown at once, with "This is a
+# server-side issue, usually temporary" appended; without that header, native
+# retries a 5xx or 429 for about three minutes before showing it.
+NEEDS_ACTION_STATUS = 400
+
+# Sent when native presents a login other than this adapter's capability,
+# which happens after /login inside a swap session.
+STRAY_LOGIN_MESSAGE = (
+    "cswap: this Claude session is using a login other than the one cswap "
+    "gave it, usually because /login was run inside it. /login cannot fix a "
+    "cswap session: exit and relaunch, and the launch moves that login aside."
+)
+
+
+def rejected_key_message(key_source: str | None) -> str:
+    """What to do when Vision refuses the API key, even after re-reading it."""
+    message = (
+        "cswap: Vision rejected this session's Vision API key (revoked or "
+        "unknown). Create a new key at https://vision.infinity.inc (gear → "
+        "API keys) and save it with `cswap --set-vision-token`, which writes "
+        "~/.config/vision/credentials.json; "
+    )
+    if key_source == "environment":
+        return message + (
+            "this session read its key from VISION_API_KEY, which takes "
+            "precedence, so also update VISION_API_KEY and relaunch."
+        )
+    return message + "this session picks it up on your next message."
+
 # The adapter runs in the process whose terminal native Claude draws on, so it
 # must never write to stderr. Without a handler of its own, logging prints
 # warnings there as a last resort; with one, they reach only cswap's log file.
@@ -71,14 +105,17 @@ class _AdapterServer(http.server.ThreadingHTTPServer):
 
 
 class CentralCredential:
-    def __init__(self, client, record):
+    def __init__(self, client, record, *, wait_seconds=90):
         self.client = client
         self.record = dict(record)
+        self.wait_seconds = wait_seconds
         self.lock = threading.Lock()
 
     def get(self, *, model=None):
         with self.lock:
-            credential = acquire_credential(self.client, self.record)
+            credential = acquire_credential(
+                self.client, self.record, wait_seconds=self.wait_seconds
+            )
             if (
                 credential["email"] != self.record["email"]
                 or credential["organization_id"] != self.record["organizationUuid"]
@@ -98,6 +135,11 @@ class CentralCredential:
 
     def rate_limited(self, credential, retry_after, *, model=None):
         return None
+
+    def relogin_command(self, credential):
+        from claude_swap.vision_pool import relogin_command
+
+        return relogin_command(self.record)
 
 
 class InferenceProxy:
@@ -134,6 +176,7 @@ class InferenceProxy:
         return f"http://127.0.0.1:{self.server.server_port}"
 
     def __enter__(self):
+        self._announce_relogin()
         proxy = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -143,10 +186,15 @@ class InferenceProxy:
                 pass
 
             def _error(self, status, message, retry_after=None, *, retryable=True):
+                error_type = (
+                    "invalid_request_error"
+                    if status == NEEDS_ACTION_STATUS
+                    else "api_error"
+                )
                 body = json.dumps(
                     {
                         "type": "error",
-                        "error": {"type": "api_error", "message": message},
+                        "error": {"type": error_type, "message": message},
                     }
                 ).encode()
                 self.send_response(status)
@@ -181,13 +229,75 @@ class InferenceProxy:
                 except OSError:
                     pass
 
+            def _needs_action(self, message):
+                """Fail native's turn at once with what a person must do."""
+                self._error(NEEDS_ACTION_STATUS, message, retryable=False)
+
             def _no_usable_login(self, error):
-                """Fail native's turn at once with why no login can serve."""
-                self._error(
-                    503,
-                    f"cswap: {error} {NO_USABLE_LOGIN_ADVICE}",
-                    error.retry_after_seconds,
-                    retryable=False,
+                """Fail native's turn with why no login can serve, naming each."""
+                from claude_swap.vision_pool import ProviderRateLimited
+
+                _log.warning("No Vision login can serve a request: %s", error)
+                if isinstance(error, ProviderRateLimited):
+                    # Every login is inside a provider Retry-After window, so
+                    # native's own retry after it is expected to succeed.
+                    self._error(429, f"cswap: {error}", error.retry_after_seconds)
+                elif getattr(error, "needs_action", False):
+                    self._needs_action(f"cswap: {error}")
+                else:
+                    self._error(
+                        503,
+                        f"cswap: {error} {NO_USABLE_LOGIN_ADVICE}",
+                        error.retry_after_seconds,
+                        retryable=False,
+                    )
+
+            def _vision_failure(self, error):
+                """Answer a Vision refusal or outage that affects every login."""
+                _log.warning(
+                    "Vision refused or failed a credential request: %s (HTTP %s)",
+                    error.code,
+                    error.status,
+                )
+                if error.code == "unauthorized":
+                    client = getattr(proxy.credentials, "client", None)
+                    self._needs_action(
+                        rejected_key_message(getattr(client, "key_source", None))
+                    )
+                elif error.code in {"not_permitted", "forbidden"}:
+                    self._needs_action(f"cswap: {error}")
+                elif error.code in {"rate_limited", "slow_down"}:
+                    self._error(
+                        429,
+                        "cswap: Vision is limiting this key's requests; Claude "
+                        "retries on its own.",
+                        error.retry_after_seconds,
+                    )
+                else:
+                    # An outage: native's own retries (about three minutes)
+                    # ride out a short one without the person seeing it.
+                    self._error(
+                        503,
+                        f"cswap: Vision could not be reached or failed "
+                        f"({error.code}); Claude retries on its own. If this "
+                        "persists, check https://vision.infinity.inc.",
+                        error.retry_after_seconds,
+                    )
+
+            def _setup_failure(self, error):
+                """A local cswap problem (roster, settings, identity): say which."""
+                _log.warning("Credential request failed: %s", error)
+                self._needs_action(f"cswap: {error}")
+
+            def _rejected_login(self, credential):
+                """The provider refused a login and Vision has no newer one."""
+                command = proxy.credentials.relogin_command(credential)
+                email = credential.get("email", "this account")
+                _log.warning("The provider rejected the login for %s.", email)
+                self._needs_action(
+                    f"cswap: Anthropic rejected the login for {email}, and "
+                    f"Vision has no newer one. Log it in again with `{command}`, "
+                    "then retry."
                 )
 
             def do_POST(self):
@@ -198,7 +308,7 @@ class InferenceProxy:
                 if not secrets.compare_digest(
                     provided.encode(), expected.encode()
                 ) or self.headers.get("Origin"):
-                    self._error(401, "Native adapter authorization required.")
+                    self._needs_action(STRAY_LOGIN_MESSAGE)
                     return
                 parsed = urllib.parse.urlsplit(self.path)
                 if (
@@ -241,18 +351,10 @@ class InferenceProxy:
                     self._no_usable_login(error)
                     return
                 except VisionError as error:
-                    status = error.status if error.status in {401, 403, 429} else 503
-                    self._error(
-                        status,
-                        "Central credentials are unavailable; " + error.code + ".",
-                        error.retry_after_seconds,
-                    )
+                    self._vision_failure(error)
                     return
-                except ClaudeSwitchError:
-                    self._error(
-                        503,
-                        "Central account configuration or recovery needs attention.",
-                    )
+                except ClaudeSwitchError as error:
+                    self._setup_failure(error)
                     return
                 headers = {
                     key: value
@@ -269,14 +371,18 @@ class InferenceProxy:
                         response.close()
                         replacement = proxy.credentials.recover(credential, model=model)
                         if replacement is None:
-                            self._error(
-                                401, "Central login reauthentication is required."
-                            )
+                            self._rejected_login(credential)
                             return
                         credential = replacement
                         response = proxy.open_message(
                             self.path, body, headers, credential
                         )
+                        if response.status == 401:
+                            # Replayed once already; a 401 passed through would
+                            # make native say "Please run /login".
+                            response.close()
+                            self._rejected_login(credential)
+                            return
                     elif response.status == 429:
                         try:
                             replacement = proxy.credentials.rate_limited(
@@ -319,16 +425,11 @@ class InferenceProxy:
                             self.wfile.write(chunk)
                             self.wfile.flush()
                 except VisionError as error:
-                    status = error.status if error.status in {401, 403, 429} else 503
-                    self._error(
-                        status,
-                        "Central credential recovery is unavailable.",
-                        error.retry_after_seconds,
-                    )
+                    self._vision_failure(error)
                 except NoUsableLogin as error:
                     self._no_usable_login(error)
-                except ClaudeSwitchError:
-                    self._error(503, "No central login is available for recovery.")
+                except ClaudeSwitchError as error:
+                    self._setup_failure(error)
                 except (OSError, http.client.HTTPException) as error:
                     # URLError and timeouts, but also what http.client raises
                     # unwrapped while reading the reply: TLS alerts such as
@@ -350,6 +451,18 @@ class InferenceProxy:
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         return self
+
+    def _announce_relogin(self):
+        """Print which logins need a re-login, before native starts drawing.
+
+        The one moment the adapter may write to the terminal: once native
+        runs, stderr is its screen. Bounded and never raises (P5).
+        """
+        from claude_swap.vision_pool import CentralPoolCredential
+
+        if isinstance(self.credentials, CentralPoolCredential):
+            for line in self.credentials.relogin_notices():
+                print(line, file=sys.stderr)
 
     def open_message(self, path, body, headers, credential):
         headers = {**headers, "Authorization": "Bearer " + credential["accessToken"]}

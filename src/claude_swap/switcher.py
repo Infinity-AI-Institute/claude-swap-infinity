@@ -201,6 +201,10 @@ ERROR_NOTES = {
         "this slot's stashed successor is unreadable — unlock the keychain "
         "or fix the file, then retry; `cswap unclaimed` inspects it"
     ),
+    "vision-relogin-required": (
+        "Vision reports this login expired — log it in again with "
+        "`cswap vision account-login <alias>`"
+    ),
 }
 
 SENTINEL_NOTES = {

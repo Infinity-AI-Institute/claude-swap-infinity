@@ -144,14 +144,29 @@ def test_disabled_or_other_registry_selection_never_delivers_credentials(setup, 
     registry.credential.assert_not_called()
 
 
-def test_existing_native_login_is_preserved_and_requires_handoff(setup):
+def test_stray_file_login_is_moved_aside_not_adopted_or_deleted(setup, capsys):
+    """P4: /login inside a cswap session no longer locks the next launch out."""
     manager, registry, record, _ = setup
     launch = prepare_launch(manager, record, registry, share=False, share_history=False)
-    auth = Path(launch.env["CLAUDE_SECURESTORAGE_CONFIG_DIR"]) / ".credentials.json"
-    auth.write_text("synthetic native login")
-    with pytest.raises(SessionError, match="handoff"):
-        prepare_launch(manager, record, registry, share=False, share_history=False)
-    assert auth.read_text() == "synthetic native login"
+    store = Path(launch.env["CLAUDE_SECURESTORAGE_CONFIG_DIR"])
+    (store / ".credentials.json").write_text("synthetic native login")
+    capsys.readouterr()
+    again = prepare_launch(manager, record, registry, share=False, share_history=False)
+    assert again.env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] == str(store)
+    assert again.env["CLAUDE_CODE_OAUTH_TOKEN"] == "synthetic-access-token"
+    assert not (store / ".credentials.json").exists()
+    kept = list((manager.switcher.backup_dir / "vision-stray-logins").glob("*/.credentials.json"))
+    assert [path.read_text() for path in kept] == ["synthetic native login"]
+    notice = capsys.readouterr().err.strip().splitlines()
+    assert len(notice) == 1 and str(kept[0].parent) in notice[0]
+    assert "/login" in notice[0]
+
+
+def test_clean_store_launch_prints_nothing(setup, capsys):
+    manager, registry, record, _ = setup
+    prepare_launch(manager, record, registry, share=False, share_history=False)
+    prepare_launch(manager, record, registry, share=False, share_history=False)
+    assert capsys.readouterr().err == ""
 
 
 @pytest.mark.parametrize("windows", [False, True])
@@ -213,10 +228,64 @@ def test_remote_run_bypasses_local_bootstrap_and_preserves_resume_arguments(
     )
 
 
-@pytest.mark.parametrize("unreadable", [False, True])
-def test_keychain_native_login_or_unknown_store_blocks_remote_launch(
-    setup, monkeypatch, unreadable
+def test_stray_keychain_login_is_moved_to_its_own_store_and_others_are_untouched(
+    setup, monkeypatch, block_real_keychain, capsys
 ):
+    from claude_swap import macos_keychain
+    from claude_swap.models import Platform
+    from claude_swap.session import keychain_service_name
+
+    manager, registry, record, _ = setup
+    monkeypatch.setattr(Platform, "detect", lambda: Platform.MACOS)
+    monkeypatch.setattr(macos_keychain, "keychain_account_name", lambda: "test-user")
+    first = prepare_launch(manager, record, registry, share=False, share_history=False)
+    store = first.env["CLAUDE_SECURESTORAGE_CONFIG_DIR"]
+    keychain = block_real_keychain.data
+    keychain[(keychain_service_name(store), "test-user")] = "synthetic Keychain login"
+    others = {
+        ("Claude Code-credentials", "test-user"): "the native default login",
+        ("Claude Code-credentials-0123abcd", "test-user"): "another profile's login",
+    }
+    keychain.update(others)
+    capsys.readouterr()
+    prepare_launch(manager, record, registry, share=False, share_history=False)
+    assert (keychain_service_name(store), "test-user") not in keychain
+    [kept] = list((manager.switcher.backup_dir / "vision-stray-logins").iterdir())
+    # Kept where Claude Code itself would look for that directory's login, so
+    # `cswap vision existing-logins --profile <dir>` can still find it.
+    assert keychain[(keychain_service_name(str(kept)), "test-user")] == (
+        "synthetic Keychain login"
+    )
+    assert all(keychain[key] == value for key, value in others.items())
+    assert len(keychain) == 3
+    assert str(kept) in capsys.readouterr().err
+
+
+def test_stray_keychain_login_stays_put_when_its_copy_cannot_be_saved(
+    setup, monkeypatch, block_real_keychain
+):
+    from claude_swap import macos_keychain
+    from claude_swap.models import Platform
+    from claude_swap.session import keychain_service_name
+
+    manager, registry, record, _ = setup
+    monkeypatch.setattr(Platform, "detect", lambda: Platform.MACOS)
+    monkeypatch.setattr(macos_keychain, "keychain_account_name", lambda: "test-user")
+    first = prepare_launch(manager, record, registry, share=False, share_history=False)
+    key = (keychain_service_name(first.env["CLAUDE_SECURESTORAGE_CONFIG_DIR"]), "test-user")
+    block_real_keychain.data[key] = "synthetic Keychain login"
+    monkeypatch.setattr(
+        macos_keychain,
+        "set_password",
+        Mock(side_effect=macos_keychain.KeychainError("secret-bearing details")),
+    )
+    with pytest.raises(SessionError) as refused:
+        prepare_launch(manager, record, registry, share=False, share_history=False)
+    assert "secret-bearing" not in str(refused.value)
+    assert block_real_keychain.data[key] == "synthetic Keychain login"
+
+
+def test_unreadable_keychain_store_blocks_remote_launch(setup, monkeypatch):
     from claude_swap import macos_keychain
     from claude_swap.models import Platform
     from claude_swap.session import keychain_service_name
@@ -225,9 +294,7 @@ def test_keychain_native_login_or_unknown_store_blocks_remote_launch(
     monkeypatch.setattr(Platform, "detect", lambda: Platform.LINUX)
     first = prepare_launch(manager, record, registry, share=False, share_history=False)
     monkeypatch.setattr(Platform, "detect", lambda: Platform.MACOS)
-    lookup = Mock(return_value="synthetic Keychain login")
-    if unreadable:
-        lookup.side_effect = OSError("secret-bearing backend details")
+    lookup = Mock(side_effect=OSError("secret-bearing backend details"))
     monkeypatch.setattr(macos_keychain, "get_password", lookup)
     monkeypatch.setattr(macos_keychain, "keychain_account_name", lambda: "test-user")
     manager._sync_sharing = Mock()

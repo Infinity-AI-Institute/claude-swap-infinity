@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import logging
 import math
 import os
 import re
@@ -17,12 +18,21 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from claude_swap.exceptions import ClaudeSwitchError
+
+# Where a VisionClient's key came from, in configured_client's precedence order.
+KeySource = Literal["environment", "saved", "sign_in"]
+
+# This module runs inside the native adapter too, whose terminal native Claude
+# draws on: never let logging fall back to printing warnings on stderr.
+_log = logging.getLogger("claude-swap.vision")
+_log.addHandler(logging.NullHandler())
 
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 SUBSCRIPTION_FIELDS = {
@@ -258,6 +268,13 @@ class VisionTransport:
 class VisionClient(VisionTransport):
     url: str
     api_key: str = field(repr=False)
+    # Set by configured_client. With ``reload``, a key Vision refuses is re-read
+    # from where it was loaded, so a key rotated while a long-running process
+    # (the native adapter) holds the old one does not end its session.
+    key_source: KeySource | None = field(default=None, compare=False)
+    reload: Callable[[], VisionClient | None] | None = field(
+        default=None, repr=False, compare=False
+    )
 
     def __post_init__(self):
         self.url = origin(self.url)
@@ -275,6 +292,50 @@ class VisionClient(VisionTransport):
 
     def _headers(self):
         return {"Accept": "application/json", "X-Api-Key": self.api_key}
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        body: Any = None,
+        *,
+        handoff_secret: str | None = None,
+    ) -> Any:
+        sent = self.api_key
+        try:
+            return super().request(method, path, body, handoff_secret=handoff_secret)
+        except VisionError as error:
+            # Vision answers 401 only for an unknown or revoked key, before
+            # doing anything, so replaying the request with a new key is safe.
+            if error.code != "unauthorized" or not self._adopt_reloaded_key(sent):
+                raise
+        return super().request(method, path, body, handoff_secret=handoff_secret)
+
+    def _adopt_reloaded_key(self, rejected: str) -> bool:
+        """Re-read the key from its source; True when a different key is now in use."""
+        if self.api_key != rejected:
+            return True  # Another request already replaced it.
+        if self.reload is None:
+            return False
+        try:
+            fresh = self.reload()
+        except ClaudeSwitchError:
+            # An unreadable source is no replacement; the refusal stands.
+            return False
+        if fresh is None or fresh.url != self.url or fresh.api_key == rejected:
+            _log.warning(
+                "Vision rejected the API key loaded from %s; no other key is saved there.",
+                self.key_source,
+            )
+            return False
+        self.api_key = fresh.api_key
+        self.key_source = fresh.key_source
+        _log.warning(
+            "Vision rejected the API key this process loaded; continuing with "
+            "the key now in %s.",
+            fresh.key_source,
+        )
+        return True
 
     def discover(self) -> list[dict[str, Any]]:
         result, cursor = [], None
@@ -446,15 +507,23 @@ def configured_client(state_root: Path | None = None) -> VisionClient | None:
     from claude_swap.paths import get_backup_root
     from claude_swap.vision_state import VisionState
 
+    def reload() -> VisionClient | None:
+        return configured_client(state_root)
+
     key = os.environ.get("VISION_API_KEY")
     if key:
         return VisionClient(
-            os.environ.get("VISION_API_URL", "https://vision.infinity.inc"), key
+            os.environ.get("VISION_API_URL", "https://vision.infinity.inc"),
+            key,
+            key_source="environment",
+            reload=reload,
         )
     from claude_swap.vision_token import saved_token_client
 
     shared = saved_token_client()
     if shared is not None:
+        shared.key_source = "saved"
+        shared.reload = reload
         return shared
     saved = VisionState(
         state_root if state_root is not None else get_backup_root()
@@ -480,4 +549,6 @@ def configured_client(state_root: Path | None = None) -> VisionClient | None:
         raise SessionError(
             "Saved Vision sign-in belongs to another origin; sign in there separately."
         )
-    return VisionClient(saved_url, saved["api_key"])
+    return VisionClient(
+        saved_url, saved["api_key"], key_source="sign_in", reload=reload
+    )

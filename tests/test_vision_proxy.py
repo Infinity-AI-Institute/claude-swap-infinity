@@ -14,8 +14,9 @@ from unittest.mock import Mock
 
 import pytest
 
-from claude_swap.exceptions import NoUsableLogin, SessionError
+from claude_swap.exceptions import ConfigError, NoUsableLogin, SessionError
 from claude_swap.vision import VisionError
+from claude_swap.vision_pool import IneligibleLogin, NoCentralQuota, ProviderRateLimited
 from claude_swap.vision_proxy import InferenceProxy
 
 
@@ -127,7 +128,7 @@ def test_each_request_gets_current_central_token_and_streams_upstream_response(
 @pytest.mark.parametrize(
     "path,token,status",
     [
-        ("/v1/messages", "wrong", 401),
+        ("/v1/messages", "wrong", 400),
         ("/oauth/token", None, 404),
         ("/api/hosts", None, 404),
     ],
@@ -152,8 +153,10 @@ def test_revoked_vision_access_stops_new_upstream_requests(upstream):
     with InferenceProxy(credentials, upstream=url) as proxy:
         with pytest.raises(urllib.error.HTTPError) as error:
             request(proxy)
-        assert error.value.code == 403
-        assert json.loads(error.value.read())["type"] == "error"
+        assert error.value.code == 400
+        body = json.loads(error.value.read())
+        assert body["type"] == "error"
+        assert "Vision admin" in body["error"]["message"]
     assert not seen
 
 
@@ -266,28 +269,39 @@ def test_recovery_with_no_usable_login_tells_native_not_to_retry(upstream):
     assert len(seen) == 1
 
 
-def test_second_401_is_returned_without_another_replay(upstream):
+def test_second_401_is_answered_with_the_relogin_command_not_a_401(upstream):
     url, seen = upstream
     credentials = Mock()
     credentials.get.return_value = {"accessToken": "rejected"}
-    credentials.recover.return_value = {"accessToken": "also-rejected"}
+    credentials.recover.return_value = {
+        "accessToken": "also-rejected",
+        "email": "luke-3@infinity.inc",
+    }
+    credentials.relogin_command.return_value = "cswap vision account-login luke-3"
     with InferenceProxy(credentials, upstream=url) as proxy:
         with pytest.raises(urllib.error.HTTPError) as error:
             request(proxy, body=b'{"reject":true}')
-        assert error.value.code == 401
+        message = refusal(error.value, status=400)
+    assert "luke-3@infinity.inc" in message
+    assert "`cswap vision account-login luke-3`" in message
     assert len(seen) == 2
     assert credentials.recover.call_count == 1
 
 
-def test_no_successor_returns_401_without_replaying_old_token(upstream):
+def test_no_successor_names_the_relogin_command_without_replaying(upstream):
     url, seen = upstream
     credentials = Mock()
-    credentials.get.return_value = {"accessToken": "rejected"}
+    credentials.get.return_value = {
+        "accessToken": "rejected",
+        "email": "luke-3@infinity.inc",
+    }
     credentials.recover.return_value = None
+    credentials.relogin_command.return_value = "cswap vision account-login luke-3"
     with InferenceProxy(credentials, upstream=url) as proxy:
         with pytest.raises(urllib.error.HTTPError) as error:
             request(proxy, body=b'{"reject":true}')
-        assert error.value.code == 401
+        message = refusal(error.value, status=400)
+    assert "`cswap vision account-login luke-3`" in message
     assert len(seen) == 1
 
 
@@ -337,15 +351,130 @@ def test_second_rate_limit_is_recorded_without_third_request(upstream):
 def test_locally_blocked_pool_returns_retry_after_without_provider_request(upstream):
     url, seen = upstream
     credentials = Mock()
-    credentials.get.side_effect = VisionError(
-        "rate_limited", status=429, retry_after_seconds=90
+    credentials.get.side_effect = ProviderRateLimited(
+        [
+            IneligibleLogin(
+                "luke-2@infinity.inc",
+                "rate-limited by the provider until 2026-10-26 20:00 UTC, in 1m",
+                NOW + 60,
+            )
+        ],
+        now=NOW,
+        retry_after_seconds=90,
     )
     with InferenceProxy(credentials, upstream=url) as proxy:
         with pytest.raises(urllib.error.HTTPError) as error:
             request(proxy)
-        assert error.value.code == 429
+        # Retryable: native waits out the window by itself.
+        message = refusal(error.value, status=429, retryable=True)
         assert error.value.headers["Retry-After"] == "90"
+    assert "luke-2@infinity.inc" in message
     assert seen == []
+
+
+def refusal(error, *, status, retryable=False):
+    """The adapter's message, after checking native will show it without "/login"."""
+    assert error.code == status
+    # Native Claude prefixes "Please run /login" to every 401 and 403.
+    assert status not in (401, 403)
+    assert (error.headers.get("x-should-retry") == "false") is not retryable
+    message = json.loads(error.read())["error"]["message"]
+    assert message.startswith("cswap: ")
+    assert "run /login" not in message
+    return message
+
+
+NOW = 1_800_000_000.0
+
+
+def test_logins_needing_relogin_are_named_with_their_commands(upstream):
+    """P2: what native shows when no login can serve and a person must act."""
+    url, seen = upstream
+    credentials = Mock()
+    credentials.get.side_effect = NoCentralQuota(
+        [
+            IneligibleLogin(
+                "luke-3@infinity.inc",
+                "needs re-login; run `cswap vision account-login luke-3`",
+                None,
+                "cswap vision account-login luke-3",
+            ),
+            IneligibleLogin(
+                "luke-2@infinity.inc",
+                "7d window at 100%, resets 2027-01-15 08:15 UTC, in 15m",
+                NOW + 900,
+            ),
+        ],
+        now=NOW,
+    )
+    with InferenceProxy(credentials, upstream=url) as proxy:
+        with pytest.raises(urllib.error.HTTPError) as error:
+            request(proxy)
+        message = refusal(error.value, status=400)
+    assert "luke-3@infinity.inc (needs re-login; run `cswap vision account-login luke-3`)" in message
+    assert "luke-2@infinity.inc (7d window at 100%, resets 2027-01-15 08:15 UTC" in message
+    assert seen == []
+
+
+@pytest.mark.parametrize(
+    "source,advice",
+    [
+        ("saved", "picks it up on your next message"),
+        ("environment", "VISION_API_KEY"),
+    ],
+)
+def test_rejected_vision_key_says_how_to_replace_it(upstream, source, advice):
+    """P3: a key Vision refuses even after re-reading it is not a Claude login problem."""
+    url, seen = upstream
+    credentials = Mock()
+    credentials.client.key_source = source
+    credentials.get.side_effect = VisionError("unauthorized", status=401)
+    with InferenceProxy(credentials, upstream=url) as proxy:
+        with pytest.raises(urllib.error.HTTPError) as error:
+            request(proxy)
+        message = refusal(error.value, status=400)
+    assert "Vision API key" in message
+    assert "vision.infinity.inc" in message and "API keys" in message
+    assert "cswap --set-vision-token" in message
+    assert advice in message
+    assert seen == []
+
+
+def test_vision_outage_is_retried_by_native_and_logged(upstream, caplog):
+    url, seen = upstream
+    credentials = Mock()
+    credentials.get.side_effect = VisionError("service_unavailable", status=503)
+    with InferenceProxy(credentials, upstream=url) as proxy:
+        with pytest.raises(urllib.error.HTTPError) as error:
+            request(proxy)
+        message = refusal(error.value, status=503, retryable=True)
+    assert "service_unavailable" in message
+    assert "service_unavailable" in caplog.text
+
+
+def test_configuration_failure_shows_and_logs_its_real_cause(upstream, caplog):
+    """The audit found 503 "configuration or recovery needs attention" hiding the cause."""
+    url, seen = upstream
+    credentials = Mock()
+    credentials.get.side_effect = ConfigError("The account roster needs repair.")
+    with InferenceProxy(credentials, upstream=url) as proxy:
+        with pytest.raises(urllib.error.HTTPError) as error:
+            request(proxy)
+        message = refusal(error.value, status=400)
+    assert "The account roster needs repair." in message
+    assert "The account roster needs repair." in caplog.text
+
+
+def test_login_other_than_the_capability_says_to_relaunch(upstream):
+    """P4: /login inside a swap session makes native send its own login here."""
+    url, seen = upstream
+    credentials = Mock()
+    with InferenceProxy(credentials, upstream=url) as proxy:
+        with pytest.raises(urllib.error.HTTPError) as error:
+            request(proxy, token="a-login-from-slash-login")
+        message = refusal(error.value, status=400)
+    assert "relaunch" in message
+    credentials.get.assert_not_called()
 
 
 BAD_RECORD_MAC = ssl.SSLError(
