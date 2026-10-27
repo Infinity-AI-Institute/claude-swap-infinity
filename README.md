@@ -140,6 +140,36 @@ once with the same explanation instead of retrying. To keep working, exit and ru
 `cswap run` again without naming an account, so that it can fall back to a local
 login.
 
+### While Claude runs on Vision accounts
+
+Each request Claude sends goes to the best Vision account that can serve it. An
+account that cannot hand out a login (it needs a re-login, Vision is still
+refreshing it, or Vision refuses that one login) is set aside, and the same
+request moves on to the next account. You see nothing while any account works.
+
+When no account can serve, Claude shows one error that names each account, why
+it cannot serve, and either when it resets or the command that fixes it:
+
+```text
+API Error: 400 cswap: No Vision Claude account can serve this request now:
+luke-3@infinity.inc (needs re-login; run `cswap vision account-login luke-3`); …
+```
+
+Run the command in another terminal, then send your message again. Running
+`/login` inside a cswap session does not help: Claude would use that login instead
+of Vision's. The next launch moves such a login aside, prints one line saying
+where it went, and starts normally. `cswap vision existing-logins --profile <dir>`
+shows what it was.
+
+If Vision stops accepting your Vision API key (an admin revoked it, say), cswap
+reads the key again from where it came from and retries. A key saved with
+`cswap --set-vision-token` is therefore picked up on your next message, with no
+relaunch. A key from `VISION_API_KEY` takes a relaunch with the new value.
+
+When Claude starts, cswap prints one line for each account that needs a re-login,
+with its command. It prints nothing when every account is fine, and skips the
+check if Vision does not answer within two seconds.
+
 ### Replace an upstream install
 
 The `claude-swap` package on PyPI and the `realiti4/claude-swap` repository are the
