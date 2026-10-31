@@ -57,6 +57,13 @@ _OPEN_FLAGS = (
 _log = logging.getLogger("claude-swap.account_ledger")
 _log.addHandler(logging.NullHandler())
 
+# POSIX O_APPEND makes each write land whole at the end of the file, across
+# threads and processes. Windows' C runtime emulates O_APPEND as a seek then a
+# write, so two threads can overwrite each other (measured in CI: a 16-thread
+# test read back NUL-filled lines). Serializing appends in this process closes
+# that; across processes on Windows, lines can still collide (see README).
+_append_lock = threading.Lock()
+
 _pruned_lock = threading.Lock()
 _pruned_directories: set[Path] = set()
 
@@ -183,6 +190,10 @@ class AccountLedger:
         return None
 
     def _append(self, path: Path, data: bytes) -> None:
+        with _append_lock:
+            self._append_unlocked(path, data)
+
+    def _append_unlocked(self, path: Path, data: bytes) -> None:
         try:
             descriptor = os.open(path, _OPEN_FLAGS, 0o600)
         except FileNotFoundError:

@@ -188,7 +188,9 @@ Vision login id, and the provider's HTTP status (null when it never answered):
 No token, key, prompt or reply is ever written. The file is for infy to upload
 beside the session's transcript. Files untouched for 30 days are deleted when Claude next
 starts through cswap. If the ledger cannot be written, requests go on unaffected
-and cswap's log says so once.
+and cswap's log says so once. On Windows, two cswap processes writing the same
+file at the same instant (normally only `_unknown.jsonl` is shared) can garble a line:
+Windows has no atomic append.
 
 ### Replace an upstream install
 
