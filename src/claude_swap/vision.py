@@ -275,6 +275,9 @@ class VisionClient(VisionTransport):
     reload: Callable[[], VisionClient | None] | None = field(
         default=None, repr=False, compare=False
     )
+    # Counts the re-read keys this client adopted, so what was learned about
+    # the previous key (its owner, for the account ledger) is asked again.
+    key_generation: int = field(default=0, compare=False)
 
     def __post_init__(self):
         self.url = origin(self.url)
@@ -330,6 +333,7 @@ class VisionClient(VisionTransport):
             return False
         self.api_key = fresh.api_key
         self.key_source = fresh.key_source
+        self.key_generation += 1
         _log.warning(
             "Vision rejected the API key this process loaded; continuing with "
             "the key now in %s.",

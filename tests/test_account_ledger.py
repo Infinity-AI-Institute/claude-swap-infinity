@@ -41,6 +41,7 @@ FIELDS = [
     "account_email",
     "vision_login_id",
     "status",
+    "key_owner_email",
 ]
 TS = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$")
 
@@ -150,6 +151,7 @@ def test_a_request_with_a_session_header_writes_one_line_naming_its_account(
         "account_email": "luke-1@infinity.inc",
         "vision_login_id": LOGIN_A,
         "status": 200,
+        "key_owner_email": None,
     }
     assert sorted(path.name for path in tmp_path.iterdir()) == [f"{SESSION}.jsonl"]
 
