@@ -18,15 +18,18 @@ import struct
 import subprocess
 import sys
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
+from claude_swap import __version__
 from claude_swap.account_ledger import AccountLedger, LedgerEntry, default_ledger_dir
 from claude_swap.exceptions import ClaudeSwitchError, NoUsableLogin, SessionError
 from claude_swap.response_usage import TokenUsage, usage_reader
+from claude_swap.usage_report import LocalLimitGate, UsageReporter
 from claude_swap.usage_totals import (
     UsageRecord,
     UsageTotals,
@@ -43,9 +46,12 @@ UPSTREAM = "https://api.anthropic.com"
 # every /v1/messages request; the account ledger files lines under it.
 SESSION_HEADER = "X-Claude-Code-Session-Id"
 COUNT_TOKENS_PATH = "/v1/messages/count_tokens"
-# How long leaving the adapter waits for requests still writing their ledger
-# lines. Native has exited by then, so only a request stuck upstream waits.
+# How long leaving the adapter may take, in all: requests still writing their
+# ledger lines, then the last usage report. Native has exited by then, so only
+# a request stuck upstream or a slow Vision uses it up.
 FINISH_WAIT_SECONDS = 2.0
+# The last report's share of that, even when requests used the rest.
+FINAL_REPORT_MIN_SECONDS = 0.25
 FORWARDED_HEADERS = {
     "anthropic-version",
     "anthropic-beta",
@@ -221,6 +227,16 @@ class InferenceProxy:
         self.key_owner = (
             KeyOwnerLookup(client) if isinstance(client, VisionClient) else _NoKeyOwner()
         )
+        # Usage goes to Vision with the key the credentials come from; without
+        # a Vision client it is only counted locally.
+        self.reporter = (
+            UsageReporter(self.usage_totals, client, self.key_owner, version=__version__)
+            if isinstance(client, VisionClient)
+            else None
+        )
+        self.limit_gate = (
+            self.reporter.limit_gate if self.reporter is not None else LocalLimitGate()
+        )
         self.upstream = upstream.rstrip("/")
         self.capability = secrets.token_urlsafe(32)
         self.opener = urllib.request.build_opener(
@@ -239,6 +255,8 @@ class InferenceProxy:
         self._announce_relogin()
         self.ledger.prune_once()
         self.key_owner.start()
+        if self.reporter is not None:
+            self.reporter.start()
         proxy = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -482,6 +500,10 @@ class InferenceProxy:
                     self._error(400, "A native JSON message object is required.")
                     return
                 self._requested_model = model
+                refusal = proxy.limit_gate.refusal()
+                if refusal is not None:
+                    self._needs_action(refusal)
+                    return
                 try:
                     credential = proxy.credentials.get(model=model)
                 except NoUsableLogin as error:
@@ -640,8 +662,18 @@ class InferenceProxy:
                 )
         # count_tokens generates nothing and uses none of the account's
         # quota, so it is in the ledger but not in the usage totals.
-        if not count_tokens:
+        if count_tokens or not records:
+            return
+        if self.reporter is None:
             self.usage_totals.add(records)
+            return
+        if key_id is None:
+            # The key is not identified yet; filed under it once it is, so the
+            # rows can be reported with the key that served them.
+            self.reporter.hold(records)
+        else:
+            self.usage_totals.add(records)
+        self.reporter.nudge(len(records))
 
     def open_message(self, path, body, headers, credential):
         headers = {**headers, "Authorization": "Bearer " + credential["accessToken"]}
@@ -654,17 +686,26 @@ class InferenceProxy:
             return error
 
     def __exit__(self, *_args):
+        deadline = time.monotonic() + FINISH_WAIT_SECONDS
         if self.server is not None:
             self.server.shutdown()
             # Handler threads are daemons the server does not join; give the
             # ones still writing their ledger lines a moment to finish.
             with self._idle:
                 self._idle.wait_for(
-                    lambda: self._active_requests == 0, timeout=FINISH_WAIT_SECONDS
+                    lambda: self._active_requests == 0,
+                    timeout=max(0.0, deadline - time.monotonic()),
                 )
             self.server.server_close()
         if self.thread is not None:
             self.thread.join(timeout=5)
+        if self.reporter is not None:
+            self.reporter.stop(
+                max(FINAL_REPORT_MIN_SECONDS, deadline - time.monotonic())
+            )
+            if self.reporter.notice is not None:
+                # Native has exited: stderr is the person's terminal again.
+                print(self.reporter.notice, file=sys.stderr)
 
     def environment(self, native_env):
         env = dict(native_env)

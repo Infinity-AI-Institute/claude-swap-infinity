@@ -3,8 +3,10 @@
 Vision's report contract v1 (``POST /api/ai-accounts/usage/reports``) takes
 hourly running totals per ``(bucket_start, login_id, model)``, upserted under
 the reporting key and a stable ``machine_id``. This module keeps exactly those
-rows on disk, so a report is a filter and a copy (``report_body``). Nothing is
-uploaded yet: the endpoint is still being built on the Vision side.
+rows on disk, plus three local fields: the key that served them
+(``api_key_id``), a ``version`` that grows with every change, and the
+``sent_version`` Vision last accepted. A row whose version is ahead of its
+sent version is due for (re)sending; ``usage_report`` sends them.
 
 The file is shared by every cswap process on the machine. Each update takes a
 cross-process lock, re-reads, adds, and atomically replaces the file, so
@@ -52,6 +54,17 @@ COUNT_FIELDS = (
 # A row's identity: the report's upsert key (minus machine, which is global
 # here) plus the key that served it.
 ROW_KEY = ("api_key_id", "bucket_start", "login_id", "model")
+# A report row, exactly as the contract names its fields, in its order.
+REPORT_FIELDS = (
+    "bucket_start",
+    "account_id",
+    "login_id",
+    "harness",
+    "model",
+    "requests",
+    *COUNT_FIELDS,
+    "reasoning_output_tokens",
+)
 # The report contract's model rule; other names cannot be reported.
 _MODEL = re.compile(r"[A-Za-z0-9._:/-]{1,128}")
 _ACCOUNT_ID = re.compile(r"aia_[A-Za-z0-9-]{1,64}")
@@ -85,6 +98,16 @@ class UsageRecord:
     harness: str
     model: str | None
     usage: TokenUsage
+
+
+def row_key(row: dict[str, Any]) -> tuple[Any, ...]:
+    return tuple(row.get(field) for field in ROW_KEY)
+
+
+def _version(row: dict[str, Any], field: str, default: int) -> int:
+    # Rows written before versions existed count as changed and never sent.
+    value = row.get(field, default)
+    return value if type(value) is int else default
 
 
 def bucket_start(moment: datetime) -> str:
@@ -201,23 +224,69 @@ class UsageTotals:
             **{field: getattr(usage, field) or 0 for field in COUNT_FIELDS},
             # Anthropic gives no reasoning breakdown (thinking is in output).
             "reasoning_output_tokens": None,
+            "version": 1,
+            "sent_version": 0,
         }
 
+    def pending(self, api_key_id: str) -> list[dict[str, Any]]:
+        """``api_key_id``'s rows changed since Vision last accepted them."""
+        state = self._load(set_aside_corrupt=False)
+        if state is None:
+            return []
+        cutoff = self._cutoff()
+        return [
+            row
+            for row in state["rows"]
+            if isinstance(row, dict)
+            and row.get("api_key_id") == api_key_id
+            and str(row.get("bucket_start", "")) >= cutoff
+            and _version(row, "version", 1) > _version(row, "sent_version", 0)
+        ]
+
+    def settle(
+        self,
+        sent: dict[tuple[Any, ...], int],
+        rejected: set[tuple[Any, ...]],
+    ) -> None:
+        """Record what Vision accepted (row key -> version sent) and drop what it rejected.
+
+        A row that changed after it was sent keeps its newer version, so it
+        stays due. Rejected rows are dropped: no resend can change a verdict.
+        """
+        with self._thread_lock, FileLock(
+            self.path.with_name(self.path.name + ".lock"), timeout=LOCK_TIMEOUT_SECONDS
+        ):
+            state = self._load_for_update()
+            kept = []
+            for row in state["rows"]:
+                key = row_key(row)
+                if key in rejected:
+                    continue
+                if key in sent and _version(row, "sent_version", 0) < sent[key]:
+                    row["sent_version"] = sent[key]
+                kept.append(row)
+            state["rows"] = kept
+            self._write(state)
+
+    def _cutoff(self) -> str:
+        return bucket_start(datetime.fromtimestamp(self.clock() - RETENTION_SECONDS, UTC))
+
     def _merge(self, state: dict[str, Any], rows: list[dict[str, Any]]) -> None:
-        cutoff = bucket_start(datetime.fromtimestamp(self.clock() - RETENTION_SECONDS, UTC))
+        cutoff = self._cutoff()
         kept = {
-            tuple(row.get(field) for field in ROW_KEY): row
+            row_key(row): row
             for row in state["rows"]
             if isinstance(row, dict) and str(row.get("bucket_start", "")) >= cutoff
         }
         for row in rows:
             if row["bucket_start"] < cutoff:
                 continue
-            key = tuple(row[field] for field in ROW_KEY)
+            key = row_key(row)
             existing = kept.get(key)
             if existing is None:
                 kept[key] = row
                 continue
+            existing["version"] = _version(existing, "version", 1) + 1
             existing["requests"] = int(existing.get("requests", 0)) + 1
             for field in COUNT_FIELDS:
                 existing[field] = int(existing.get(field) or 0) + row[field]
@@ -276,25 +345,3 @@ class UsageTotals:
             "process are not logged).",
             message,
         )
-
-
-def report_body(state: dict[str, Any], *, version: str, api_key_id: str | None) -> dict[str, Any]:
-    """The report request for one key: its rows, without the local key field.
-
-    Rows whose key was never identified (``api_key_id`` null: Vision's
-    api-keys/self had not answered when the request finished) are left out,
-    since this machine may use more than one key. Batching to the contract's
-    500 rows per request is the uploader's job.
-    """
-    return {
-        "reporter": {
-            "tool": REPORTER_TOOL,
-            "version": version,
-            "machine_id": state["machine_id"],
-        },
-        "rows": [
-            {field: value for field, value in row.items() if field != "api_key_id"}
-            for row in state["rows"]
-            if api_key_id is not None and row.get("api_key_id") == api_key_id
-        ],
-    }

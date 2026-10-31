@@ -213,7 +213,18 @@ each key's report apart. `machine_id` (`mch_<uuid>`, kept in `machine_id`
 beside it) identifies this machine to that report. Every cswap process on the
 machine adds to the one file under a lock. `count_tokens` requests, which use
 none of an account's quota, are left out, and hours older than 35 days are
-dropped. Nothing is uploaded yet.
+dropped.
+
+cswap sends these totals to Vision (`POST /api/ai-accounts/usage/reports`, with
+your Vision API key) in the background: when Claude starts, every five
+minutes, sooner after a burst of requests, and once more when Claude exits
+(waiting at most about two seconds). Each row is sent as the hour's running
+total whenever it changed, and Vision replaces what it had. Rows Vision
+rejects are dropped, with the reason in cswap's log; if Vision is down or
+busy, cswap tries the whole batch again later, waiting longer each time. If
+Vision refuses the key itself, cswap stops reporting for that session and,
+after Claude exits, prints one line saying what to do. Reporting never delays
+or fails a request. Usage limits are not enforced yet.
 
 No token, key, prompt or reply is ever written. The file is for infy to upload
 beside the session's transcript. Files untouched for 30 days are deleted when Claude next
