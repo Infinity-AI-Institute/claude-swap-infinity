@@ -170,6 +170,26 @@ When Claude starts, cswap prints one line for each account that needs a re-login
 with its command. It prints nothing when every account is fine, and skips the
 check if Vision does not answer within two seconds.
 
+#### Which account served each request
+
+cswap records which Vision account served each request Claude sends, one line
+per attempt (a retry on another account is a second line), in
+`${XDG_STATE_HOME:-~/.local/state}/agent-account-ledger/claude/<session id>.jsonl`.
+The session id is the one Claude names its transcript with; a request that names
+none goes to `_unknown.jsonl`. A line holds the time the request was sent, the
+session id, Anthropic's `request-id` (the `requestId` on the matching assistant
+line of Claude's transcript), the account's alias, `@infinity.inc` address and
+Vision login id, and the provider's HTTP status (null when it never answered):
+
+```json
+{"v": 1, "ts": "2026-10-31T17:30:56.591Z", "harness": "claude", "session_id": "6f1c2a4e-0b7d-4c8e-9f3a-2d5e7b9c1a03", "request_id": "req_011CVfakeServerDemo0001", "account_alias": "luke-3", "account_email": "luke-3@infinity.inc", "vision_login_id": "ail_00000000-0000-4000-8000-000000000003", "status": 200}
+```
+
+No token, key, prompt or reply is ever written. The file is for infy to upload
+beside the session's transcript. Files untouched for 30 days are deleted when Claude next
+starts through cswap. If the ledger cannot be written, requests go on unaffected
+and cswap's log says so once.
+
 ### Replace an upstream install
 
 The `claude-swap` package on PyPI and the `realiti4/claude-swap` repository are the
