@@ -21,13 +21,18 @@ import threading
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import UTC, datetime
 
+from claude_swap.account_ledger import AccountLedger, LedgerEntry, default_ledger_dir
 from claude_swap.exceptions import ClaudeSwitchError, NoUsableLogin, SessionError
 from claude_swap.vision import VisionError
 from claude_swap.vision_session import acquire_credential, recover_rejected_credential
 
 MAX_REQUEST_BYTES = 64 * 1024 * 1024
 UPSTREAM = "https://api.anthropic.com"
+# Claude Code (2.1.316, measured against a fake upstream) names its session on
+# every /v1/messages request; the account ledger files lines under it.
+SESSION_HEADER = "X-Claude-Code-Session-Id"
 FORWARDED_HEADERS = {
     "anthropic-version",
     "anthropic-beta",
@@ -141,9 +146,15 @@ class CentralCredential:
 
         return relogin_command(self.record)
 
+    def account_alias(self, credential):
+        """The roster alias of the login that issued ``credential``, if known."""
+        if credential.get("login_id") == self.record.get("visionLoginId"):
+            return self.record.get("alias")
+        return None
+
 
 class InferenceProxy:
-    def __init__(self, credentials, *, upstream=UPSTREAM):
+    def __init__(self, credentials, *, upstream=UPSTREAM, ledger=None):
         parsed = urllib.parse.urlsplit(upstream)
         # Loopback is supported for synthetic acceptance; callers cannot choose
         # arbitrary hosts or follow a provider redirect with an access token.
@@ -161,6 +172,7 @@ class InferenceProxy:
                 "The native inference upstream must be the fixed provider endpoint."
             )
         self.credentials = credentials
+        self.ledger = AccountLedger(default_ledger_dir()) if ledger is None else ledger
         self.upstream = upstream.rstrip("/")
         self.capability = secrets.token_urlsafe(32)
         self.opener = urllib.request.build_opener(
@@ -177,6 +189,7 @@ class InferenceProxy:
 
     def __enter__(self):
         self._announce_relogin()
+        self.ledger.prune_once()
         proxy = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -300,6 +313,17 @@ class InferenceProxy:
                     "then retry."
                 )
 
+            def _attempt(self, body, headers, credential):
+                """Send one upstream attempt and write its account ledger line."""
+                sent_at = datetime.now(UTC)
+                try:
+                    response = proxy.open_message(self.path, body, headers, credential)
+                except (OSError, http.client.HTTPException):
+                    proxy.record_attempt(self.headers, credential, sent_at, None)
+                    raise
+                proxy.record_attempt(self.headers, credential, sent_at, response)
+                return response
+
             def do_POST(self):
                 self.connection.settimeout(30)
                 self.close_connection = True
@@ -364,7 +388,7 @@ class InferenceProxy:
                 }
                 response_started = False
                 try:
-                    response = proxy.open_message(self.path, body, headers, credential)
+                    response = self._attempt(body, headers, credential)
                     if response.status == 401:
                         # An explicit authentication rejection precedes inference.
                         # Close it before central recovery, and replay at most once.
@@ -374,9 +398,7 @@ class InferenceProxy:
                             self._rejected_login(credential)
                             return
                         credential = replacement
-                        response = proxy.open_message(
-                            self.path, body, headers, credential
-                        )
+                        response = self._attempt(body, headers, credential)
                         if response.status == 401:
                             # Replayed once already; a 401 passed through would
                             # make native say "Please run /login".
@@ -396,9 +418,7 @@ class InferenceProxy:
                         if replacement is not None:
                             response.close()
                             credential = replacement
-                            response = proxy.open_message(
-                                self.path, body, headers, credential
-                            )
+                            response = self._attempt(body, headers, credential)
                     with response:
                         if response.status == 429:
                             proxy.credentials.record_rate_limit(
@@ -463,6 +483,22 @@ class InferenceProxy:
         if isinstance(self.credentials, CentralPoolCredential):
             for line in self.credentials.relogin_notices():
                 print(line, file=sys.stderr)
+
+    def record_attempt(self, request_headers, credential, sent_at, response):
+        """Write the ledger line for one upstream attempt; ``response`` None = no reply."""
+        self.ledger.record(
+            LedgerEntry(
+                sent_at=sent_at,
+                session_id=request_headers.get(SESSION_HEADER),
+                request_id=(
+                    None if response is None else response.headers.get("request-id")
+                ),
+                account_alias=self.credentials.account_alias(credential),
+                account_email=credential.get("email"),
+                vision_login_id=credential.get("login_id"),
+                status=None if response is None else response.status,
+            )
+        )
 
     def open_message(self, path, body, headers, credential):
         headers = {**headers, "Authorization": "Bearer " + credential["accessToken"]}

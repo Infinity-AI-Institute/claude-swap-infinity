@@ -246,6 +246,10 @@ class CentralPoolCredential:
         # Logins whose last usage reading says their credential expired; None
         # until the first reading.
         self.observed_relogin: frozenset[str] | None = None
+        # login -> roster alias of the row each issued credential came from,
+        # for the account ledger. Kept from selection so a request never
+        # re-reads the roster just to name its account.
+        self.aliases: dict[str, str | None] = {}
 
     def _records(self):
         """Selectable Vision rows by login, and why each other one is not (by login)."""
@@ -329,6 +333,7 @@ class CentralPoolCredential:
                         raise
                     continue
                 selected = record["visionLoginId"]
+                self.aliases[selected] = record.get("alias")
                 if selected != self.current:
                     self.current = selected
                     self.last_switch = now
@@ -518,6 +523,10 @@ class CentralPoolCredential:
             ):
                 return relogin_command(row)
         return relogin_command({"email": credential.get("email", "")})
+
+    def account_alias(self, credential: dict) -> str | None:
+        """The roster alias of the login that issued ``credential``, if known."""
+        return self.aliases.get(credential.get("login_id"))
 
     def relogin_notices(self, *, timeout_seconds: float = 2.0) -> list[str]:
         """One line per login that needs a re-login, with its command; [] if none.
