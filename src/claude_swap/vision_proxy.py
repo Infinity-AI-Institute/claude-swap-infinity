@@ -601,6 +601,8 @@ class InferenceProxy:
         Runs after native's reply has ended; both writers swallow their own
         I/O failures, so bookkeeping can never fail a request.
         """
+        count_tokens = path.split("?", 1)[0] == COUNT_TOKENS_PATH
+        endpoint = "count_tokens" if count_tokens else "messages"
         identity = self.key_owner.current()
         owner_email = None if identity is None else identity.owner_email
         key_id = None if identity is None else identity.key_id
@@ -621,6 +623,7 @@ class InferenceProxy:
                     account_id=credential.get("account_id"),
                     model=model,
                     usage=attempt.usage,
+                    endpoint=endpoint,
                 )
             )
             if attempt.usage is not None:
@@ -637,7 +640,7 @@ class InferenceProxy:
                 )
         # count_tokens generates nothing and uses none of the account's
         # quota, so it is in the ledger but not in the usage totals.
-        if path.split("?", 1)[0] != COUNT_TOKENS_PATH:
+        if not count_tokens:
             self.usage_totals.add(records)
 
     def open_message(self, path, body, headers, credential):

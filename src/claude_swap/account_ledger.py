@@ -12,7 +12,10 @@ show the account per message). Do not change the format here alone.
   account_email, vision_login_id, status``, then the v1-compatible additions
   ``key_owner_email, account_id, model, input_tokens, output_tokens,
   cache_read_input_tokens, cache_creation_input_tokens,
-  reasoning_output_tokens``; all present, null when unknown
+  reasoning_output_tokens, endpoint``; all present, null when unknown
+- ``endpoint`` says what the line records (Claude: ``messages`` or
+  ``count_tokens``); token sums are taken over ``messages`` lines only,
+  since count_tokens uses no quota
 - a line is written when its request finishes, so it can carry the
   provider's usage; ``ts`` is still when the request was sent
 - never tokens, keys, prompts or bodies
@@ -49,6 +52,7 @@ _REQUEST_ID = re.compile(r"[\x21-\x7e]{1,256}")
 _VISION_LOGIN_ID = re.compile(r"ail_[A-Za-z0-9-]{1,64}")
 _ACCOUNT_ID = re.compile(r"aia_[A-Za-z0-9-]{1,64}")
 _MAX_MODEL_LENGTH = 256
+ENDPOINTS = frozenset({"messages", "count_tokens", "turn"})
 _MAX_ALIAS_LENGTH = 128
 _MAX_EMAIL_LENGTH = 320
 
@@ -109,6 +113,8 @@ class LedgerEntry:
     model: object = None
     # The provider's counts; None for an error or an aborted stream.
     usage: TokenUsage | None = None
+    # "messages" or "count_tokens" (codex-swap writes "turn").
+    endpoint: object = None
 
 
 def _match(pattern: re.Pattern[str], value: object) -> str | None:
@@ -189,6 +195,11 @@ class AccountLedger:
             },
             # Anthropic reports no reasoning breakdown; thinking is output.
             "reasoning_output_tokens": None,
+            "endpoint": (
+                entry.endpoint
+                if isinstance(entry.endpoint, str) and entry.endpoint in ENDPOINTS
+                else None
+            ),
         }
         data = (json.dumps(line, ensure_ascii=True) + "\n").encode("ascii")
         name = f"{session_id}.jsonl" if session_id else UNKNOWN_SESSION_FILE

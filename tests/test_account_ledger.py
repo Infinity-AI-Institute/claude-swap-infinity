@@ -49,6 +49,7 @@ FIELDS = [
     "cache_read_input_tokens",
     "cache_creation_input_tokens",
     "reasoning_output_tokens",
+    "endpoint",
 ]
 TS = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$")
 
@@ -167,6 +168,7 @@ def test_a_request_with_a_session_header_writes_one_line_naming_its_account(
         "cache_read_input_tokens": None,
         "cache_creation_input_tokens": None,
         "reasoning_output_tokens": None,
+        "endpoint": "messages",
     }
     assert sorted(path.name for path in tmp_path.iterdir()) == [f"{SESSION}.jsonl"]
 

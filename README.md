@@ -184,7 +184,7 @@ answered), the Vision email of the person whose Vision API key cswap is using,
 the model, and the tokens the provider reported:
 
 ```json
-{"v": 1, "ts": "2026-10-31T19:29:18.224Z", "harness": "claude", "session_id": "6f1c2a4e-0b7d-4c8e-9f3a-2d5e7b9c1a03", "request_id": "req_011CVfakeServerDemo0002", "account_alias": "luke-3", "account_email": "luke-3@infinity.inc", "vision_login_id": "ail_00000000-0000-4000-8000-000000000003", "status": 200, "key_owner_email": "owner-1@infinity.inc", "account_id": "aia_00000000-0000-4000-8000-000000000003", "model": "claude-opus-4-6", "input_tokens": 12, "output_tokens": 57, "cache_read_input_tokens": 4000, "cache_creation_input_tokens": 300, "reasoning_output_tokens": null}
+{"v": 1, "ts": "2026-10-31T19:29:18.224Z", "harness": "claude", "session_id": "6f1c2a4e-0b7d-4c8e-9f3a-2d5e7b9c1a03", "request_id": "req_011CVfakeServerDemo0002", "account_alias": "luke-3", "account_email": "luke-3@infinity.inc", "vision_login_id": "ail_00000000-0000-4000-8000-000000000003", "status": 200, "key_owner_email": "owner-1@infinity.inc", "account_id": "aia_00000000-0000-4000-8000-000000000003", "model": "claude-opus-4-6", "input_tokens": 12, "output_tokens": 57, "cache_read_input_tokens": 4000, "cache_creation_input_tokens": 300, "reasoning_output_tokens": null, "endpoint": "messages"}
 ```
 
 A line is written when its request finishes, so it can carry the usage; `ts`
@@ -195,7 +195,9 @@ streamed reply counts only if it ended normally: an error reply or a stream
 cut off midway records null tokens. `model` is the one the provider named, else
 the one Claude asked for. `input_tokens` is uncached input only, as Anthropic
 reports it; thinking is part of `output_tokens`. A `count_tokens` request is
-recorded with its `input_tokens` and null output.
+recorded with its `input_tokens`, null output and `"endpoint": "count_tokens"`
+(every other line says `"messages"`); it uses none of an account's quota, so
+sum tokens over `messages` lines only.
 
 cswap asks Vision who owns the key (`GET /api/api-keys/self`) in the background
 when Claude starts, and again after it switches to a re-read key, so the lookup

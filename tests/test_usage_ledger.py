@@ -254,6 +254,8 @@ def test_count_tokens_records_input_only_and_stays_out_of_the_totals(
         )
     [line] = ledger(tmp_path)
     assert tokens(line) == ("claude-opus-4-6", 1234, None, None, None)
+    # Readers sum tokens over "messages" lines only.
+    assert line["endpoint"] == "count_tokens"
     # count_tokens is not inference: it uses no tokens of the account's quota.
     assert total_rows(tmp_path) == []
 
@@ -558,3 +560,54 @@ def test_the_default_totals_live_beside_the_ledger(provider, monkeypatch, tmp_pa
         f"{SESSION}.jsonl"
     ]
     assert os.path.isdir(root / "claude")
+
+
+@pytest.mark.parametrize(
+    "path,body,endpoint",
+    [
+        ("/v1/messages?beta=true", b'{"model":"claude-opus-4-6"}', "messages"),
+        ("/v1/messages", b'{"model":"claude-sonnet-4-6","plain":true}', "messages"),
+        (
+            "/v1/messages/count_tokens?beta=true",
+            b'{"model":"claude-opus-4-6"}',
+            "count_tokens",
+        ),
+    ],
+)
+def test_each_line_names_its_endpoint(provider, tmp_path, path, body, endpoint):
+    url, _ = provider
+    with proxy_for(url, tmp_path) as proxy:
+        post(proxy, body, path=path)
+    [line] = ledger(tmp_path)
+    assert line["endpoint"] == endpoint
+    assert list(line)[-1] == "endpoint"
+
+
+def test_a_failed_attempt_still_names_its_endpoint(provider, tmp_path):
+    url, _ = provider
+    with proxy_for(url, tmp_path) as proxy:
+        with pytest.raises(urllib.error.HTTPError):
+            post(proxy, b'{"model":"claude-opus-4-6","overloaded":true}')
+    [line] = ledger(tmp_path)
+    assert (line["endpoint"], line["output_tokens"]) == ("messages", None)
+
+
+def test_an_unknown_endpoint_value_is_recorded_as_null(tmp_path):
+    from tests.test_account_ledger import entry
+
+    from claude_swap.account_ledger import LedgerEntry
+
+    base = entry()
+    ledger_ = AccountLedger(tmp_path)
+    for value in ("messages", "count_tokens", "batches", None, 3, ["messages"]):
+        ledger_.record(
+            LedgerEntry(**{**base.__dict__, "endpoint": value})
+        )
+    assert [row["endpoint"] for row in lines(tmp_path / f"{SESSION}.jsonl")] == [
+        "messages",
+        "count_tokens",
+        None,
+        None,
+        None,
+        None,
+    ]
