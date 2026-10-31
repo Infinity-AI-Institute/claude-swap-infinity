@@ -9,7 +9,8 @@ show the account per message). Do not change the format here alone.
 - one JSON object per line, appended with O_APPEND in a single write, so lines
   from concurrent threads and processes never interleave; files 0600, dirs 0700
 - fields ``v, ts, harness, session_id, request_id, account_alias,
-  account_email, vision_login_id, status``, all present, null when unknown
+  account_email, vision_login_id, status, key_owner_email``, all present,
+  null when unknown (``key_owner_email`` is a v1-compatible addition)
 - never tokens, keys, prompts or bodies
 - files whose mtime is over 30 days old are deleted once per process start
 
@@ -41,6 +42,7 @@ _SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
 _REQUEST_ID = re.compile(r"[\x21-\x7e]{1,256}")
 _VISION_LOGIN_ID = re.compile(r"ail_[A-Za-z0-9-]{1,64}")
 _MAX_ALIAS_LENGTH = 128
+_MAX_EMAIL_LENGTH = 320
 
 _OPEN_FLAGS = (
     os.O_WRONLY
@@ -91,10 +93,26 @@ class LedgerEntry:
     account_email: object
     vision_login_id: object
     status: object
+    # The Vision email of the person whose API key the adapter uses. Unlike
+    # account_email it is a person's address, kept as Vision returns it.
+    key_owner_email: object = None
 
 
 def _match(pattern: re.Pattern[str], value: object) -> str | None:
     if isinstance(value, str) and pattern.fullmatch(value):
+        return value
+    return None
+
+
+def person_email(value: object) -> str | None:
+    """A person's address as given, if it is one string that can be one."""
+    if (
+        isinstance(value, str)
+        and 3 <= len(value) <= _MAX_EMAIL_LENGTH
+        and "@" in value
+        and value.isprintable()
+        and not any(c.isspace() for c in value)
+    ):
         return value
     return None
 
@@ -142,6 +160,7 @@ class AccountLedger:
                 if type(status) is int and 100 <= status <= 599
                 else None
             ),
+            "key_owner_email": person_email(entry.key_owner_email),
         }
         data = (json.dumps(line, ensure_ascii=True) + "\n").encode("ascii")
         name = f"{session_id}.jsonl" if session_id else UNKNOWN_SESSION_FILE

@@ -25,7 +25,8 @@ from datetime import UTC, datetime
 
 from claude_swap.account_ledger import AccountLedger, LedgerEntry, default_ledger_dir
 from claude_swap.exceptions import ClaudeSwitchError, NoUsableLogin, SessionError
-from claude_swap.vision import VisionError
+from claude_swap.vision import VisionClient, VisionError
+from claude_swap.vision_key_owner import KeyOwnerLookup
 from claude_swap.vision_session import acquire_credential, recover_rejected_credential
 
 MAX_REQUEST_BYTES = 64 * 1024 * 1024
@@ -153,6 +154,16 @@ class CentralCredential:
         return None
 
 
+class _NoKeyOwner:
+    """Credentials without a Vision client: the key owner is never known."""
+
+    def start(self):
+        pass
+
+    def current(self):
+        return None
+
+
 class InferenceProxy:
     def __init__(self, credentials, *, upstream=UPSTREAM, ledger=None):
         parsed = urllib.parse.urlsplit(upstream)
@@ -173,6 +184,10 @@ class InferenceProxy:
             )
         self.credentials = credentials
         self.ledger = AccountLedger(default_ledger_dir()) if ledger is None else ledger
+        client = getattr(credentials, "client", None)
+        self.key_owner = (
+            KeyOwnerLookup(client) if isinstance(client, VisionClient) else _NoKeyOwner()
+        )
         self.upstream = upstream.rstrip("/")
         self.capability = secrets.token_urlsafe(32)
         self.opener = urllib.request.build_opener(
@@ -190,6 +205,7 @@ class InferenceProxy:
     def __enter__(self):
         self._announce_relogin()
         self.ledger.prune_once()
+        self.key_owner.start()
         proxy = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -497,6 +513,7 @@ class InferenceProxy:
                 account_email=credential.get("email"),
                 vision_login_id=credential.get("login_id"),
                 status=None if response is None else response.status,
+                key_owner_email=self.key_owner.current(),
             )
         )
 

@@ -179,11 +179,17 @@ The session id is the one Claude names its transcript with; a request that names
 none goes to `_unknown.jsonl`. A line holds the time the request was sent, the
 session id, Anthropic's `request-id` (the `requestId` on the matching assistant
 line of Claude's transcript), the account's alias, `@infinity.inc` address and
-Vision login id, and the provider's HTTP status (null when it never answered):
+Vision login id, the provider's HTTP status (null when it never answered), and
+the Vision email of the person whose Vision API key cswap is using:
 
 ```json
-{"v": 1, "ts": "2026-10-31T17:30:56.591Z", "harness": "claude", "session_id": "6f1c2a4e-0b7d-4c8e-9f3a-2d5e7b9c1a03", "request_id": "req_011CVfakeServerDemo0001", "account_alias": "luke-3", "account_email": "luke-3@infinity.inc", "vision_login_id": "ail_00000000-0000-4000-8000-000000000003", "status": 200}
+{"v": 1, "ts": "2026-10-31T17:30:56.591Z", "harness": "claude", "session_id": "6f1c2a4e-0b7d-4c8e-9f3a-2d5e7b9c1a03", "request_id": "req_011CVfakeServerDemo0001", "account_alias": "luke-3", "account_email": "luke-3@infinity.inc", "vision_login_id": "ail_00000000-0000-4000-8000-000000000003", "status": 200, "key_owner_email": "owner-1@infinity.inc"}
 ```
+
+cswap asks Vision who owns the key (`GET /api/api-keys/self`) in the background
+when Claude starts, and again after it switches to a re-read key, so the lookup
+never delays a request; until Vision answers, `key_owner_email` is null. It is
+recorded as Vision returns it and never written to cswap's log.
 
 No token, key, prompt or reply is ever written. The file is for infy to upload
 beside the session's transcript. Files untouched for 30 days are deleted when Claude next
