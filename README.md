@@ -178,18 +178,40 @@ per attempt (a retry on another account is a second line), in
 The session id is the one Claude names its transcript with; a request that names
 none goes to `_unknown.jsonl`. A line holds the time the request was sent, the
 session id, Anthropic's `request-id` (the `requestId` on the matching assistant
-line of Claude's transcript), the account's alias, `@infinity.inc` address and
-Vision login id, the provider's HTTP status (null when it never answered), and
-the Vision email of the person whose Vision API key cswap is using:
+line of Claude's transcript), the account's alias, `@infinity.inc` address,
+Vision login and account ids, the provider's HTTP status (null when it never
+answered), the Vision email of the person whose Vision API key cswap is using,
+the model, and the tokens the provider reported:
 
 ```json
-{"v": 1, "ts": "2026-10-31T17:30:56.591Z", "harness": "claude", "session_id": "6f1c2a4e-0b7d-4c8e-9f3a-2d5e7b9c1a03", "request_id": "req_011CVfakeServerDemo0001", "account_alias": "luke-3", "account_email": "luke-3@infinity.inc", "vision_login_id": "ail_00000000-0000-4000-8000-000000000003", "status": 200, "key_owner_email": "owner-1@infinity.inc"}
+{"v": 1, "ts": "2026-10-31T19:29:18.224Z", "harness": "claude", "session_id": "6f1c2a4e-0b7d-4c8e-9f3a-2d5e7b9c1a03", "request_id": "req_011CVfakeServerDemo0002", "account_alias": "luke-3", "account_email": "luke-3@infinity.inc", "vision_login_id": "ail_00000000-0000-4000-8000-000000000003", "status": 200, "key_owner_email": "owner-1@infinity.inc", "account_id": "aia_00000000-0000-4000-8000-000000000003", "model": "claude-opus-4-6", "input_tokens": 12, "output_tokens": 57, "cache_read_input_tokens": 4000, "cache_creation_input_tokens": 300, "reasoning_output_tokens": null}
 ```
+
+A line is written when its request finishes, so it can carry the usage; `ts`
+is still when the request was sent. cswap reads the usage from the reply as it
+passes through to Claude, after each chunk has been delivered, so Claude
+receives nothing later (`scripts/bench_usage_reader.py` measures it). A
+streamed reply counts only if it ended normally: an error reply or a stream
+cut off midway records null tokens. `model` is the one the provider named, else
+the one Claude asked for. `input_tokens` is uncached input only, as Anthropic
+reports it; thinking is part of `output_tokens`. A `count_tokens` request is
+recorded with its `input_tokens` and null output.
 
 cswap asks Vision who owns the key (`GET /api/api-keys/self`) in the background
 when Claude starts, and again after it switches to a re-read key, so the lookup
 never delays a request; until Vision answers, `key_owner_email` is null. It is
 recorded as Vision returns it and never written to cswap's log.
+
+cswap also keeps hourly totals per Vision login and model, for reporting to
+Vision, in `${XDG_STATE_HOME:-~/.local/state}/agent-account-ledger/usage-hourly-claude.json`.
+Its rows have the shape of Vision's usage report (`bucket_start` on the UTC
+hour, `account_id`, `login_id`, `harness`, `model`, `requests` and the token
+counts), plus the Vision id of the key that served them, since Vision keeps
+each key's report apart. `machine_id` (`mch_<uuid>`, kept in `machine_id`
+beside it) identifies this machine to that report. Every cswap process on the
+machine adds to the one file under a lock. `count_tokens` requests, which use
+none of an account's quota, are left out, and hours older than 35 days are
+dropped. Nothing is uploaded yet.
 
 No token, key, prompt or reply is ever written. The file is for infy to upload
 beside the session's transcript. Files untouched for 30 days are deleted when Claude next

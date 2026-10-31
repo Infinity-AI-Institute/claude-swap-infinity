@@ -21,10 +21,18 @@ import threading
 import urllib.error
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from claude_swap.account_ledger import AccountLedger, LedgerEntry, default_ledger_dir
 from claude_swap.exceptions import ClaudeSwitchError, NoUsableLogin, SessionError
+from claude_swap.response_usage import TokenUsage, usage_reader
+from claude_swap.usage_totals import (
+    UsageRecord,
+    UsageTotals,
+    default_machine_id_path,
+    default_totals_path,
+)
 from claude_swap.vision import VisionClient, VisionError
 from claude_swap.vision_key_owner import KeyOwnerLookup
 from claude_swap.vision_session import acquire_credential, recover_rejected_credential
@@ -34,6 +42,10 @@ UPSTREAM = "https://api.anthropic.com"
 # Claude Code (2.1.316, measured against a fake upstream) names its session on
 # every /v1/messages request; the account ledger files lines under it.
 SESSION_HEADER = "X-Claude-Code-Session-Id"
+COUNT_TOKENS_PATH = "/v1/messages/count_tokens"
+# How long leaving the adapter waits for requests still writing their ledger
+# lines. Native has exited by then, so only a request stuck upstream waits.
+FINISH_WAIT_SECONDS = 2.0
 FORWARDED_HEADERS = {
     "anthropic-version",
     "anthropic-beta",
@@ -154,6 +166,18 @@ class CentralCredential:
         return None
 
 
+@dataclass
+class _Attempt:
+    """One upstream send of a request, recorded when the request finishes."""
+
+    sent_at: datetime
+    credential: dict
+    status: int | None = None  # None: the provider never answered
+    request_id: str | None = None
+    model: str | None = None  # as the provider named it
+    usage: TokenUsage | None = None
+
+
 class _NoKeyOwner:
     """Credentials without a Vision client: the key owner is never known."""
 
@@ -165,7 +189,9 @@ class _NoKeyOwner:
 
 
 class InferenceProxy:
-    def __init__(self, credentials, *, upstream=UPSTREAM, ledger=None):
+    def __init__(
+        self, credentials, *, upstream=UPSTREAM, ledger=None, usage_totals=None
+    ):
         parsed = urllib.parse.urlsplit(upstream)
         # Loopback is supported for synthetic acceptance; callers cannot choose
         # arbitrary hosts or follow a provider redirect with an access token.
@@ -184,6 +210,13 @@ class InferenceProxy:
             )
         self.credentials = credentials
         self.ledger = AccountLedger(default_ledger_dir()) if ledger is None else ledger
+        self.usage_totals = (
+            UsageTotals(default_totals_path(), default_machine_id_path())
+            if usage_totals is None
+            else usage_totals
+        )
+        self._active_requests = 0
+        self._idle = threading.Condition()
         client = getattr(credentials, "client", None)
         self.key_owner = (
             KeyOwnerLookup(client) if isinstance(client, VisionClient) else _NoKeyOwner()
@@ -249,6 +282,7 @@ class InferenceProxy:
                 were complete; a reset makes native see the failure and retry.
                 """
                 self.close_connection = True
+                self._was_reset = True
                 try:
                     self.connection.setsockopt(
                         socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0)
@@ -330,17 +364,79 @@ class InferenceProxy:
                 )
 
             def _attempt(self, body, headers, credential):
-                """Send one upstream attempt and write its account ledger line."""
-                sent_at = datetime.now(UTC)
-                try:
-                    response = proxy.open_message(self.path, body, headers, credential)
-                except (OSError, http.client.HTTPException):
-                    proxy.record_attempt(self.headers, credential, sent_at, None)
-                    raise
-                proxy.record_attempt(self.headers, credential, sent_at, response)
+                """Send one upstream attempt, noted for the ledger at the end."""
+                attempt = _Attempt(datetime.now(UTC), credential)
+                self._attempts.append(attempt)
+                response = proxy.open_message(self.path, body, headers, credential)
+                attempt.status = response.status
+                attempt.request_id = response.headers.get("request-id")
                 return response
 
+            def _relay(self, response):
+                """Copy the reply to native, reading its usage on the way.
+
+                Each chunk reaches native before it is parsed, so reading usage
+                adds no delay to any byte native receives.
+                """
+                attempt = self._attempts[-1]
+                reader = usage_reader(self.path, response.status, response.headers)
+                complete = False
+                try:
+                    while chunk := response.read1(65536):
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+                        if reader is not None:
+                            try:
+                                reader.feed(chunk)
+                            except Exception:
+                                # A parser bug must cost only the usage, never
+                                # the reply native is receiving.
+                                _log.warning(
+                                    "Could not read usage from a reply.", exc_info=True
+                                )
+                                reader = None
+                    complete = True
+                finally:
+                    if reader is not None:
+                        attempt.model = reader.model()
+                        attempt.usage = reader.usage(complete=complete)
+
+            def _release_client(self):
+                """End native's reply now, before the bookkeeping that follows."""
+                if self._was_reset:
+                    # A shutdown would send a clean FIN after the reset was
+                    # armed: the socket stays open while wfile refers to it.
+                    return
+                try:
+                    self.wfile.flush()
+                    self.connection.shutdown(socket.SHUT_WR)
+                except OSError:
+                    pass  # already closed or reset
+
             def do_POST(self):
+                with proxy._idle:
+                    proxy._active_requests += 1
+                self._attempts = []
+                self._requested_model = None
+                self._was_reset = False
+                try:
+                    self._serve()
+                finally:
+                    try:
+                        if self._attempts:
+                            self._release_client()
+                            proxy.record_request(
+                                self.headers,
+                                self.path,
+                                self._requested_model,
+                                self._attempts,
+                            )
+                    finally:
+                        with proxy._idle:
+                            proxy._active_requests -= 1
+                            proxy._idle.notify_all()
+
+            def _serve(self):
                 self.connection.settimeout(30)
                 self.close_connection = True
                 expected = "Bearer " + proxy.capability
@@ -385,6 +481,7 @@ class InferenceProxy:
                 except (ValueError, TypeError, UnicodeDecodeError):
                     self._error(400, "A native JSON message object is required.")
                     return
+                self._requested_model = model
                 try:
                     credential = proxy.credentials.get(model=model)
                 except NoUsableLogin as error:
@@ -457,9 +554,7 @@ class InferenceProxy:
                         self.send_header("Cache-Control", "no-store")
                         self.send_header("Connection", "close")
                         self.end_headers()
-                        while chunk := response.read1(65536):
-                            self.wfile.write(chunk)
-                            self.wfile.flush()
+                        self._relay(response)
                 except VisionError as error:
                     self._vision_failure(error)
                 except NoUsableLogin as error:
@@ -500,22 +595,50 @@ class InferenceProxy:
             for line in self.credentials.relogin_notices():
                 print(line, file=sys.stderr)
 
-    def record_attempt(self, request_headers, credential, sent_at, response):
-        """Write the ledger line for one upstream attempt; ``response`` None = no reply."""
-        self.ledger.record(
-            LedgerEntry(
-                sent_at=sent_at,
-                session_id=request_headers.get(SESSION_HEADER),
-                request_id=(
-                    None if response is None else response.headers.get("request-id")
-                ),
-                account_alias=self.credentials.account_alias(credential),
-                account_email=credential.get("email"),
-                vision_login_id=credential.get("login_id"),
-                status=None if response is None else response.status,
-                key_owner_email=self.key_owner.current(),
+    def record_request(self, request_headers, path, requested_model, attempts):
+        """Write a finished request's ledger lines and add its usage to the totals.
+
+        Runs after native's reply has ended; both writers swallow their own
+        I/O failures, so bookkeeping can never fail a request.
+        """
+        identity = self.key_owner.current()
+        owner_email = None if identity is None else identity.owner_email
+        key_id = None if identity is None else identity.key_id
+        records = []
+        for attempt in attempts:
+            credential = attempt.credential
+            model = attempt.model or requested_model
+            self.ledger.record(
+                LedgerEntry(
+                    sent_at=attempt.sent_at,
+                    session_id=request_headers.get(SESSION_HEADER),
+                    request_id=attempt.request_id,
+                    account_alias=self.credentials.account_alias(credential),
+                    account_email=credential.get("email"),
+                    vision_login_id=credential.get("login_id"),
+                    status=attempt.status,
+                    key_owner_email=owner_email,
+                    account_id=credential.get("account_id"),
+                    model=model,
+                    usage=attempt.usage,
+                )
             )
-        )
+            if attempt.usage is not None:
+                records.append(
+                    UsageRecord(
+                        sent_at=attempt.sent_at,
+                        api_key_id=key_id,
+                        account_id=credential.get("account_id"),
+                        login_id=credential.get("login_id"),
+                        harness="claude",
+                        model=model,
+                        usage=attempt.usage,
+                    )
+                )
+        # count_tokens generates nothing and uses none of the account's
+        # quota, so it is in the ledger but not in the usage totals.
+        if path.split("?", 1)[0] != COUNT_TOKENS_PATH:
+            self.usage_totals.add(records)
 
     def open_message(self, path, body, headers, credential):
         headers = {**headers, "Authorization": "Bearer " + credential["accessToken"]}
@@ -530,6 +653,12 @@ class InferenceProxy:
     def __exit__(self, *_args):
         if self.server is not None:
             self.server.shutdown()
+            # Handler threads are daemons the server does not join; give the
+            # ones still writing their ledger lines a moment to finish.
+            with self._idle:
+                self._idle.wait_for(
+                    lambda: self._active_requests == 0, timeout=FINISH_WAIT_SECONDS
+                )
             self.server.server_close()
         if self.thread is not None:
             self.thread.join(timeout=5)

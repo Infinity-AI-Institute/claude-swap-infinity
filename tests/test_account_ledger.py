@@ -42,6 +42,13 @@ FIELDS = [
     "vision_login_id",
     "status",
     "key_owner_email",
+    "account_id",
+    "model",
+    "input_tokens",
+    "output_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+    "reasoning_output_tokens",
 ]
 TS = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$")
 
@@ -152,6 +159,14 @@ def test_a_request_with_a_session_header_writes_one_line_naming_its_account(
         "vision_login_id": LOGIN_A,
         "status": 200,
         "key_owner_email": None,
+        "account_id": ACCOUNT_A["account_id"],
+        "model": "claude-opus-4-6",
+        # The synthetic provider here sends no usage.
+        "input_tokens": None,
+        "output_tokens": None,
+        "cache_read_input_tokens": None,
+        "cache_creation_input_tokens": None,
+        "reasoning_output_tokens": None,
     }
     assert sorted(path.name for path in tmp_path.iterdir()) == [f"{SESSION}.jsonl"]
 
@@ -175,7 +190,7 @@ def test_no_secret_reaches_the_ledger(upstream, tmp_path):
         send(proxy, body=b'{"model":"m","messages":"synthetic-prompt-text"}')
         capability = proxy.capability
     text = (tmp_path / f"{SESSION}.jsonl").read_text()
-    for secret in ("token-a", capability, "synthetic-prompt-text", "aia_"):
+    for secret in ("token-a", capability, "synthetic-prompt-text"):
         assert secret not in text
 
 

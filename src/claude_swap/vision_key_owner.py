@@ -2,9 +2,10 @@
 
 Vision describes the calling key at ``GET /api/api-keys/self`` (capability
 ``self:read``, which every key holds and cannot lose): ``data.owner.email`` is
-the Vision account of the person who minted it. That person may differ from
-the shared Claude account serving a request, which is why the ledger records
-both.
+the Vision account of the person who minted it, and ``data.key.id`` the key's
+id. That person may differ from the shared Claude account serving a request,
+which is why the ledger records both; the hourly usage totals are kept per key
+id because Vision's usage report upserts them per key.
 
 The lookup runs on a background thread: once when the adapter starts, again
 whenever the client adopts a re-read key after Vision rejected the old one
@@ -18,9 +19,11 @@ The address is a person's: it is never logged.
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 
 from claude_swap.account_ledger import person_email
 from claude_swap.exceptions import ClaudeSwitchError
@@ -34,18 +37,35 @@ _log = logging.getLogger("claude-swap.vision_key_owner")
 _log.addHandler(logging.NullHandler())
 
 
-def owner_email(answer: object) -> str | None:
-    """``owner.email`` from an api-keys/self answer about a key, else None."""
+_KEY_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+
+@dataclass(frozen=True)
+class KeyIdentity:
+    """What Vision says about the key in use; None where it said nothing usable."""
+
+    owner_email: str | None
+    # Vision's id for the key (``data.key.id``): the usage report's totals
+    # are kept per key, because the server upserts them per key.
+    key_id: str | None
+
+
+def key_identity(answer: object) -> KeyIdentity | None:
+    """The identity in an api-keys/self answer about a key, else None."""
     if not isinstance(answer, dict) or answer.get("via") != "api_key":
         return None
     owner = answer.get("owner")
-    if not isinstance(owner, dict):
-        return None
-    return person_email(owner.get("email"))
+    key = answer.get("key")
+    email = person_email(owner.get("email")) if isinstance(owner, dict) else None
+    key_id = key.get("id") if isinstance(key, dict) else None
+    return KeyIdentity(
+        email,
+        key_id if isinstance(key_id, str) and _KEY_ID.fullmatch(key_id) else None,
+    )
 
 
 class KeyOwnerLookup:
-    """The cached owner email of ``client``'s current key; None while unknown."""
+    """The cached identity of ``client``'s current key; None while unknown."""
 
     def __init__(
         self, client: VisionClient, *, clock: Callable[[], float] = time.monotonic
@@ -53,7 +73,7 @@ class KeyOwnerLookup:
         self.client = client
         self.clock = clock
         self._lock = threading.Lock()
-        self._email: str | None = None
+        self._identity: KeyIdentity | None = None
         self._resolved_generation: int | None = None
         self._in_flight = False
         self._retry_at: float | None = None
@@ -66,12 +86,12 @@ class KeyOwnerLookup:
         with self._lock:
             return self._in_flight
 
-    def current(self) -> str | None:
-        """The owner of the key in use if already known; never blocks on Vision."""
+    def current(self) -> KeyIdentity | None:
+        """The key in use's identity if already known; never blocks on Vision."""
         generation = self.client.key_generation
         with self._lock:
             if self._resolved_generation == generation:
-                return self._email
+                return self._identity
             if not self._in_flight and (
                 self._retry_at is None or self.clock() >= self._retry_at
             ):
@@ -83,10 +103,10 @@ class KeyOwnerLookup:
 
     def _resolve(self) -> None:
         generation = self.client.key_generation
-        email: str | None = None
+        identity: KeyIdentity | None = None
         failed = True
         try:
-            email = owner_email(self.client.request("GET", SELF_PATH))
+            identity = key_identity(self.client.request("GET", SELF_PATH))
             failed = False
         except ClaudeSwitchError as error:
             # VisionError's text names only Vision's origin and the refusal
@@ -102,7 +122,7 @@ class KeyOwnerLookup:
                 if failed:
                     self._retry_at = self.clock() + RETRY_AFTER_FAILURE_SECONDS
                 elif self.client.key_generation == generation:
-                    self._email = email
+                    self._identity = identity
                     self._resolved_generation = generation
                     self._retry_at = None
                 # Otherwise the key was replaced mid-lookup; the next read asks again.
