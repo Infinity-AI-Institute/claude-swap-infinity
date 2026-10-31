@@ -105,6 +105,12 @@ def wait_for(predicate, timeout=5.0):
     return False
 
 
+def owner(lookup):
+    """The owner email the lookup knows for the key in use, else None."""
+    identity = lookup.current()
+    return None if identity is None else identity.owner_email
+
+
 def pool_with(client):
     credentials = pool()
     credentials.client = client
@@ -116,12 +122,12 @@ def test_each_line_names_the_owner_of_the_key_in_use(upstream, vision, tmp_path)
     with InferenceProxy(
         pool_with(client), upstream=upstream, ledger=AccountLedger(tmp_path)
     ) as proxy:
-        assert wait_for(lambda: proxy.key_owner.current() is not None)
+        assert wait_for(lambda: owner(proxy.key_owner) is not None)
         send(proxy)
         send(proxy)
     rows = lines(tmp_path / f"{SESSION}.jsonl")
     assert [row["key_owner_email"] for row in rows] == ["owner-1@infinity.inc"] * 2
-    assert list(rows[0])[-1] == "key_owner_email"
+    assert "key_owner_email" in rows[0]
     assert rows[0]["account_email"] == ACCOUNT_A["email"]
     # Resolved once per process, not per request.
     assert vision.self_calls == 1
@@ -137,7 +143,7 @@ def test_the_lookup_never_delays_a_request(upstream, vision, tmp_path):
         assert send(proxy)[0] == 200
         assert time.monotonic() - started < 2
         vision.hold.set()
-        assert wait_for(lambda: proxy.key_owner.current() is not None)
+        assert wait_for(lambda: owner(proxy.key_owner) is not None)
         send(proxy)
     assert [
         row["key_owner_email"] for row in lines(tmp_path / f"{SESSION}.jsonl")
@@ -166,13 +172,13 @@ def test_a_key_re_read_after_a_rejection_is_looked_up_again(vision):
     client = VisionClient(vision.url, KEY_ONE, reload=lambda: replacement)
     lookup = KeyOwnerLookup(client)
     lookup.start()
-    assert wait_for(lambda: lookup.current() == "owner-1@infinity.inc")
+    assert wait_for(lambda: owner(lookup) == "owner-1@infinity.inc")
     # The key is revoked and rotated; the next Vision request re-reads it (P3).
     vision.revoked.add(KEY_ONE)
     client.request("GET", "/api/me")
     # Never the previous key's owner for the new key.
-    assert lookup.current() in (None, "owner-2@infinity.inc")
-    assert wait_for(lambda: lookup.current() == "owner-2@infinity.inc")
+    assert owner(lookup) in (None, "owner-2@infinity.inc")
+    assert wait_for(lambda: owner(lookup) == "owner-2@infinity.inc")
     assert vision.self_calls == 2
 
 
@@ -183,13 +189,13 @@ def test_a_failed_lookup_is_retried_later_not_on_every_request(vision):
     lookup.start()
     assert wait_for(lambda: vision.self_calls == 1 and not lookup.resolving())
     for _ in range(5):
-        assert lookup.current() is None
+        assert owner(lookup) is None
     assert not lookup.resolving()
     assert vision.self_calls == 1
     vision.status_override = None
     clock.return_value += 61
-    lookup.current()
-    assert wait_for(lambda: lookup.current() == "owner-1@infinity.inc")
+    owner(lookup)
+    assert wait_for(lambda: owner(lookup) == "owner-1@infinity.inc")
     assert vision.self_calls == 2
 
 
@@ -211,7 +217,7 @@ def test_an_unexpected_self_answer_is_unknown(payload):
     lookup = KeyOwnerLookup(client)
     lookup.start()
     assert wait_for(lambda: not lookup.resolving())
-    assert lookup.current() is None
+    assert owner(lookup) is None
 
 
 def test_the_owner_is_recorded_exactly_as_vision_returns_it():
@@ -225,8 +231,8 @@ def test_the_owner_is_recorded_exactly_as_vision_returns_it():
     }
     lookup = KeyOwnerLookup(client)
     lookup.start()
-    assert wait_for(lambda: lookup.current() is not None)
-    assert lookup.current() == "Owner-1@Infinity.Inc"
+    assert wait_for(lambda: owner(lookup) is not None)
+    assert owner(lookup) == "Owner-1@Infinity.Inc"
 
 
 def test_credentials_without_a_vision_client_record_null(upstream, tmp_path):
@@ -247,3 +253,18 @@ def test_the_client_counts_each_adopted_key(vision):
     vision.revoked.add(KEY_ONE)
     client.request("GET", "/api/me")
     assert client.key_generation == 1
+
+
+def test_the_lookup_also_names_the_keys_vision_id():
+    client = Mock(spec=VisionClient)
+    client.key_generation = 0
+    client.request.return_value = {
+        "via": "api_key",
+        "key": {"id": "vkey_synthetic"},
+        "owner": {"email": "owner-1@infinity.inc"},
+    }
+    lookup = KeyOwnerLookup(client)
+    lookup.start()
+    assert wait_for(lambda: lookup.current() is not None)
+    assert lookup.current().key_id == "vkey_synthetic"
+    assert lookup.current().owner_email == "owner-1@infinity.inc"
