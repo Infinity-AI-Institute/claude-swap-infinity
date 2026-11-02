@@ -162,10 +162,24 @@ generations for the limited account share that deadline. `Retry-After` accepts
 delta seconds or an HTTP date; missing or malformed values use 60 seconds.
 A second 429 is returned without another replay, and its account deadline
 is also recorded. With no eligible alternative, native receives the provider's
-429 and retry header. Subsequent requests during a fully blocked pool receive 429
-with the earliest remaining delay without sending provider requests. These
-backoffs are local to the running adapter; central usage remains authoritative
-for selection across processes and hosts.
+429 and retry header. Subsequent requests during a fully blocked pool are
+answered without sending provider requests:
+
+- If at least one account is only throttled (a 429 without usage-limit
+  headers), they receive a retryable 429 with the earliest remaining delay.
+- If every account is out of quota — spent by Vision's usage readings, or
+  refused by a provider 429 that carries Anthropic's usage-limit headers
+  (`anthropic-ratelimit-unified-representative-claim` or
+  `anthropic-ratelimit-unified-overage-status`) — they receive the
+  non-retryable 503 that names each account and the earliest reset. A
+  usage-limit 429 keeps its account out until `anthropic-ratelimit-unified-reset`
+  when that is in the future and within eight days, else for its Retry-After.
+
+Native Claude labels any 429 without usage-limit headers "Server is
+temporarily limiting requests (not your usage limit)", so a usage limit must
+never be answered with cswap's own 429. These backoffs are local to the
+running adapter; central usage remains authoritative for selection across
+processes and hosts.
 
 The native macOS qualification uses Claude 2.1.270 with SHA-256
 `a506b6d970a4cf44f6abdb53a81ddcd5d3b0ce042a95c502fe9d1f946bdb8807`.

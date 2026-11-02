@@ -17,7 +17,11 @@ import pytest
 from claude_swap.exceptions import ConfigError, NoUsableLogin, SessionError
 from claude_swap.vision import VisionError
 from claude_swap.vision_pool import IneligibleLogin, NoCentralQuota, ProviderRateLimited
-from claude_swap.vision_proxy import InferenceProxy
+from claude_swap.vision_proxy import (
+    InferenceProxy,
+    ProviderUsageLimit,
+    provider_usage_limit,
+)
 
 
 @pytest.fixture
@@ -44,6 +48,14 @@ def upstream():
             ):
                 self.send_response(429)
                 self.send_header("Retry-After", "120")
+                if b"usage" in body:
+                    self.send_header(
+                        "anthropic-ratelimit-unified-representative-claim",
+                        "seven_day",
+                    )
+                    self.send_header(
+                        "anthropic-ratelimit-unified-reset", "1800003600"
+                    )
                 self.end_headers()
                 return
             if b"hangup" in body:
@@ -316,9 +328,74 @@ def test_rate_limit_replays_on_one_other_account(upstream):
         request(proxy, body=b'{"limited":true}') as response,
     ):
         assert response.read() == b"data: synthetic\n\n"
-    credentials.rate_limited.assert_called_once_with(credential, "120", model=None)
+    credentials.rate_limited.assert_called_once_with(
+        credential, "120", model=None, usage_limit=None
+    )
     assert len(seen) == 2
     credentials.recover.assert_not_called()
+
+
+def test_usage_limit_429_reaches_the_pool_as_a_usage_limit(upstream):
+    url, seen = upstream
+    credentials = Mock()
+    credential = {"accessToken": "limited"}
+    credentials.get.return_value = credential
+    credentials.rate_limited.return_value = None
+    with InferenceProxy(credentials, upstream=url) as proxy:
+        with pytest.raises(urllib.error.HTTPError) as error:
+            request(proxy, body=b'{"limited":true,"usage":true}')
+        # Passed through with its headers: native shows its usage-limit message.
+        assert error.value.code == 429
+        assert (
+            error.value.headers["anthropic-ratelimit-unified-representative-claim"]
+            == "seven_day"
+        )
+    usage_limit = ProviderUsageLimit(claim="seven_day", resets_at=1800003600.0)
+    credentials.rate_limited.assert_called_once_with(
+        credential, "120", model=None, usage_limit=usage_limit
+    )
+    credentials.record_rate_limit.assert_called_once_with(
+        credential, "120", usage_limit=usage_limit
+    )
+    assert len(seen) == 1
+
+
+@pytest.mark.parametrize(
+    "headers,expected",
+    [
+        ({}, None),
+        ({"Retry-After": "30"}, None),
+        (
+            {
+                "anthropic-ratelimit-unified-representative-claim": "five_hour",
+                "anthropic-ratelimit-unified-reset": "1800003600",
+            },
+            ProviderUsageLimit(claim="five_hour", resets_at=1800003600.0),
+        ),
+        # Native counts a 429 with only the overage status as a usage limit too.
+        (
+            {"anthropic-ratelimit-unified-overage-status": "rejected"},
+            ProviderUsageLimit(claim=None, resets_at=None),
+        ),
+        # A claim that is not a plain identifier is kept out of messages.
+        (
+            {"anthropic-ratelimit-unified-representative-claim": "five hour; x"},
+            ProviderUsageLimit(claim=None, resets_at=None),
+        ),
+        (
+            {
+                "anthropic-ratelimit-unified-representative-claim": "seven_day",
+                "anthropic-ratelimit-unified-reset": "soon",
+            },
+            ProviderUsageLimit(claim="seven_day", resets_at=None),
+        ),
+    ],
+)
+def test_provider_usage_limit_reads_the_headers_native_reads(headers, expected):
+    message = http.client.HTTPMessage()
+    for name, value in headers.items():
+        message[name] = value
+    assert provider_usage_limit(message) == expected
 
 
 def test_no_spare_account_preserves_provider_retry_after(upstream):
@@ -345,7 +422,9 @@ def test_second_rate_limit_is_recorded_without_third_request(upstream):
             request(proxy, body=b'{"limited":true}')
         assert error.value.code == 429
     assert len(seen) == 2
-    credentials.record_rate_limit.assert_called_once_with(second, "120")
+    credentials.record_rate_limit.assert_called_once_with(
+        second, "120", usage_limit=None
+    )
 
 
 def test_locally_blocked_pool_returns_retry_after_without_provider_request(upstream):
