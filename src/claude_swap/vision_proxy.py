@@ -1,5 +1,8 @@
 """Process-local native inference adapter with request-time central credentials.
 
+A login's access token is reused across requests within a bounded window
+(``vision_session.IssuedCredentialCache``), not fetched for every request.
+
 Only the native message API is forwarded. The per-process capability is not a
 provider credential; real access tokens remain in the parent and are attached to
 the fixed Anthropic endpoint. Refresh tokens are never accepted or stored here.
@@ -38,7 +41,11 @@ from claude_swap.usage_totals import (
 )
 from claude_swap.vision import VisionClient, VisionError
 from claude_swap.vision_key_owner import KeyOwnerLookup
-from claude_swap.vision_session import acquire_credential, recover_rejected_credential
+from claude_swap.vision_session import (
+    IssuedCredentialCache,
+    acquire_credential,
+    recover_rejected_credential,
+)
 
 MAX_REQUEST_BYTES = 64 * 1024 * 1024
 UPSTREAM = "https://api.anthropic.com"
@@ -170,30 +177,54 @@ class _AdapterServer(http.server.ThreadingHTTPServer):
 
 
 class CentralCredential:
-    def __init__(self, client, record, *, wait_seconds=90):
+    """One Vision login's access token, reused while ``cache`` allows.
+
+    ``cache`` is shared when a pool builds one of these per request, so a
+    login's token outlives the object that fetched it.
+    """
+
+    def __init__(
+        self, client, record, *, wait_seconds=90, cache=None, clock=time.time
+    ):
         self.client = client
         self.record = dict(record)
         self.wait_seconds = wait_seconds
+        self.cache = IssuedCredentialCache(clock=clock) if cache is None else cache
         self.lock = threading.Lock()
 
     def get(self, *, model=None):
         with self.lock:
-            credential = acquire_credential(
-                self.client, self.record, wait_seconds=self.wait_seconds
+            login = self.record.get("visionLoginId")
+            generation = self.record.get("visionGeneration")
+            credential = self.cache.get(
+                login, min_generation=generation if type(generation) is int else 0
             )
+            fetched = credential is None
+            if fetched:
+                credential = acquire_credential(
+                    self.client, self.record, wait_seconds=self.wait_seconds
+                )
             if (
                 credential["email"] != self.record["email"]
                 or credential["organization_id"] != self.record["organizationUuid"]
             ):
+                self.cache.discard(credential["login_id"])
                 raise SessionError(
                     "The central login identity changed; synchronize accounts before continuing."
                 )
             self.record["visionGeneration"] = credential["generation"]
+            if fetched:
+                self.cache.put(credential)
             return credential
 
     def recover(self, rejected, *, model=None):
         with self.lock:
-            return recover_rejected_credential(self.client, rejected)
+            # The provider refused this token: never serve it again.
+            self.cache.discard(rejected["login_id"])
+            candidate = recover_rejected_credential(self.client, rejected)
+            if candidate is not None:
+                self.cache.put(candidate)
+            return candidate
 
     def record_rate_limit(self, credential, retry_after, *, usage_limit=None):
         pass

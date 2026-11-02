@@ -178,9 +178,14 @@ than the provider refresh grant. The launcher refuses an isolated store containi
 an unexpected local file or Keychain login. It removes inherited authentication
 and provider-route overrides before applying its own settings.
 
-The proxy obtains credentials at request time. After an explicit provider 401, it
-requests central recovery for the rejected login and accepts only a newer
-generation with a different access token. If that login does not recover, the
+The proxy chooses a login at request time and reuses the access token Vision
+last issued for it for up to five minutes, never within a minute of the token's
+expiry and never after Vision reports a newer generation. Before 2026-11-02 it
+fetched a token for every request, which made one issuance per native request,
+count_tokens and native's own retries included. After an explicit provider 401,
+it discards the rejected token, requests central recovery for the rejected login
+and accepts only a newer generation with a different access token, polling for it
+at 1, 2 and then 4-second intervals. If that login does not recover, the
 proxy can replay the request on another eligible login. It excludes the rejected
 login for 60 seconds, or until Vision reports a newer generation. After an explicit
 provider 429, the proxy can replay the request on another account with known
