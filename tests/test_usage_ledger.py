@@ -26,7 +26,6 @@ from claude_swap.usage_totals import (
     RETENTION_SECONDS,
     UsageTotals,
     load_machine_id,
-    report_body,
 )
 from claude_swap.vision_proxy import InferenceProxy
 from tests.test_account_ledger import (
@@ -327,6 +326,9 @@ def test_hourly_totals_have_the_report_contract_row_shape(provider, tmp_path):
             "cache_read_input_tokens": 8000,
             "cache_creation_input_tokens": 600,
             "reasoning_output_tokens": None,
+            # Local: changed twice, never sent (no Vision client here).
+            "version": 2,
+            "sent_version": 0,
         },
         {
             "api_key_id": None,
@@ -341,6 +343,8 @@ def test_hourly_totals_have_the_report_contract_row_shape(provider, tmp_path):
             "cache_read_input_tokens": 7,
             "cache_creation_input_tokens": 8,
             "reasoning_output_tokens": None,
+            "version": 1,
+            "sent_version": 0,
         },
     ]
 
@@ -492,44 +496,6 @@ def test_concurrent_first_use_agrees_on_one_machine_id(tmp_path):
     for thread in threads:
         thread.join()
     assert len(set(seen)) == 1
-
-
-def test_the_report_body_is_the_contract_request_for_one_key(tmp_path):
-    from claude_swap.response_usage import TokenUsage
-    from claude_swap.usage_totals import UsageRecord
-
-    store = UsageTotals(tmp_path / "totals.json", tmp_path / "machine_id")
-    now = datetime.now(UTC)
-    usage = TokenUsage(1, 2, 3, 4)
-    store.add(
-        [
-            UsageRecord(now, "key_one", "aia_x", "ail_x", "claude", "m", usage),
-            UsageRecord(now, "key_two", "aia_x", "ail_x", "claude", "m", usage),
-        ]
-    )
-    body = report_body(store.read(), version="9.9", api_key_id="key_one")
-    assert body == {
-        "reporter": {
-            "tool": "claude-swap",
-            "version": "9.9",
-            "machine_id": store.read()["machine_id"],
-        },
-        "rows": [
-            {
-                "bucket_start": now.strftime("%Y-%m-%dT%H:00:00Z"),
-                "account_id": "aia_x",
-                "login_id": "ail_x",
-                "harness": "claude",
-                "model": "m",
-                "requests": 1,
-                "input_tokens": 1,
-                "output_tokens": 2,
-                "cache_read_input_tokens": 3,
-                "cache_creation_input_tokens": 4,
-                "reasoning_output_tokens": None,
-            }
-        ],
-    }
 
 
 def test_the_proxy_records_the_vision_key_id_with_each_row(provider, tmp_path):
