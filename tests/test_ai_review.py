@@ -94,14 +94,14 @@ def _payload_for(monkeypatch, reviewer: str) -> dict:
 
 
 def test_the_only_reviewer_is_security_on_opus(monkeypatch):
-    # Luke, 2026-10-31: security reviews run on Opus 5.5; any other reviewer
+    # Luke, 2026-10-31: security reviews run on Sonnet 5.5; any other reviewer
     # would take the cheap Haiku 5.5 default.
     assert ai_review.DEFAULT_MODEL == "claude-haiku-5-5"
     assert set(ai_review.REVIEWERS) == {"security"}
     body = _payload_for(monkeypatch, "security")
-    assert body["model"] == "claude-opus-5-5"
+    assert body["model"] == "claude-sonnet-5-5"
     command = ai_review.claude_cli_command(body)
-    assert command[command.index("--model") + 1] == "claude-opus-5-5"
+    assert command[command.index("--model") + 1] == "claude-sonnet-5-5"
 
 
 def test_security_prompt_covers_this_repos_threats_and_treats_the_diff_as_data():
@@ -146,8 +146,8 @@ def test_unknown_reviewer_fails_fast_naming_the_known_ones():
 
 def test_models_that_ran_reads_what_anthropic_reports():
     # The claude CLI's JSON result keys its usage by model id.
-    cli_envelope = {"modelUsage": {"claude-haiku-5-5": {}, "claude-opus-5-5": {}}}
-    assert ai_review.models_that_ran(cli_envelope) == "claude-haiku-5-5, claude-opus-5-5"
+    cli_envelope = {"modelUsage": {"claude-haiku-5-5": {}, "claude-sonnet-5-5": {}}}
+    assert ai_review.models_that_ran(cli_envelope) == "claude-haiku-5-5, claude-sonnet-5-5"
     # The raw Messages API names the model that answered.
     assert ai_review.models_that_ran({"model": "claude-haiku-5-5"}) == "claude-haiku-5-5"
     assert ai_review.models_that_ran({}) == "unreported"

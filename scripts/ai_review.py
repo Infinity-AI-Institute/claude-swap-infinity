@@ -19,7 +19,7 @@ from pathlib import Path
 
 # The model of a reviewer that declares none. Cheap on purpose: Luke's
 # 2026-10-31 rule puts every AI reviewer on Haiku 5.5 except security. Only the
-# security reviewer exists here, and it declares Opus 5.5.
+# security reviewer exists here, and it declares Sonnet 5.5.
 DEFAULT_MODEL = "claude-haiku-5-5"
 
 
@@ -48,7 +48,7 @@ REVIEWERS = {
             "attacker-controlled input or code to reach users of the published package."
         ),
         # A missed exploitable bug costs more than a slower review (Luke, 2026-10-31).
-        model="claude-opus-5-5",
+        model="claude-sonnet-5-5",
     ),
 }
 

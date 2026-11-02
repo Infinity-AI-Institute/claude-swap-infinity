@@ -1,5 +1,5 @@
 name: AI review
-# An AI security reviewer on Claude Opus 5.5 for every PR into main. Ported
+# An AI security reviewer on Claude Sonnet 5.5 for every PR into main. Ported
 # from Infinity-AI-Institute/codex-swap's ai-review.yml with only the security
 # reviewer kept.
 #
