@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from claude_swap.exceptions import ClaudeSwitchError
+from claude_swap.usage_limits import USAGE_LIMIT_REACHED, describe_vision_refusal
 
 # Where a VisionClient's key came from, in configured_client's precedence order.
 KeySource = Literal["environment", "saved", "sign_in"]
@@ -64,6 +65,7 @@ ERROR_CODES = {
     "cancelled",
     "delivery_expired",
     "forbidden",
+    USAGE_LIMIT_REACHED,
 }
 
 
@@ -85,6 +87,13 @@ ACCESS_REFUSAL_ADVICE = {
 
 
 class VisionError(ClaudeSwitchError):
+    """A Vision refusal or failure.
+
+    ``details`` is the answer's ``error`` object when Vision sent one. A
+    ``usage_limit_reached`` refusal (HTTP 429 at the key's spend limit) reads
+    as Vision's own message, and must not be retried before its ``resets_at``.
+    """
+
     def __init__(
         self,
         code: str,
@@ -92,6 +101,7 @@ class VisionError(ClaudeSwitchError):
         retry_after_seconds: int | None = None,
         *,
         url: str | None = None,
+        details: dict[str, Any] | None = None,
     ):
         self.code = (
             code
@@ -100,6 +110,10 @@ class VisionError(ClaudeSwitchError):
         )
         self.status = status
         self.retry_after_seconds = retry_after_seconds
+        self.details: dict[str, Any] = details or {}
+        if self.code == USAGE_LIMIT_REACHED:
+            super().__init__(describe_vision_refusal(self.details)[1])
+            return
         source = "Vision account registry" if url is None else f"Vision at {url}"
         message = f"{source}: {self.code}."
         advice = ACCESS_REFUSAL_ADVICE.get(self.code)
@@ -222,10 +236,12 @@ class VisionTransport:
         try:
             response = urllib.request.build_opener(NoRedirects()).open(req, timeout=10)
         except urllib.error.HTTPError as error:
+            details = None
             with error:
                 try:
-                    raw = json.loads(error.read(4096))
-                    code = raw.get("error", {}).get("code")
+                    body = json.loads(error.read(4096)).get("error", {})
+                    code = body.get("code")
+                    details = body
                 except (ValueError, AttributeError, OSError):
                     code = "service_unavailable"
             retry_after = None
@@ -237,7 +253,9 @@ class VisionTransport:
                 and 1 <= int(raw_retry) <= 3600
             ):
                 retry_after = int(raw_retry)
-            raise VisionError(code, error.code, retry_after, url=self.url) from None
+            raise VisionError(
+                code, error.code, retry_after, url=self.url, details=details
+            ) from None
         except VisionError:
             raise
         except (OSError, urllib.error.URLError, ValueError):

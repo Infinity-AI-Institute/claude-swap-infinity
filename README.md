@@ -229,7 +229,45 @@ a fingerprint of the key (never the key itself) and sent by the first session
 that learns the key's id, so it is not lost if Claude exits first. If
 Vision refuses the key itself, cswap stops reporting for that session and,
 after Claude exits, prints one line saying what to do. Reporting never delays
-or fails a request. Usage limits are not enforced yet.
+or fails a request.
+
+#### Vision usage limits
+
+A Vision API key may carry a spend limit per day, week or month: Pacific
+calendar windows (the day from midnight PT, the week from Monday, the month
+from the 1st), in USD at API list price, which is an estimate from the reported
+tokens and not what Infinity pays. cswap reads the key's limits when Claude
+starts and every five minutes after (`GET /api/ai-accounts/usage/limits/self`;
+each usage report's answer carries them too), never once per request.
+
+- **Over a limit**, cswap answers every new model request itself, without
+  asking Vision for a credential, and Claude shows the answer as is and does
+  not retry it:
+
+  ```
+  API Error: 400 cswap: this Vision API key reached its weekly usage limit (31.40 of 30.00 USD at API list price, not what Infinity pays). cswap refuses new model requests until Mon Nov 9, 12:00 AM PST, when the week resets; ask the key's owner or a Vision admin to raise the limit.
+  ```
+
+  The refusal lifts at that reset, or as soon as a fresh read no longer says
+  the key is over (an admin raised or removed the limit). Usage keeps being
+  reported meanwhile.
+- **When Vision refuses a credential at a limit** (HTTP 429,
+  `usage_limit_reached`), Claude shows Vision's message as it wrote it, plus
+  the reset in Pacific time, and cswap refuses locally until that reset; the
+  429 is never retried. A launch that meets it stops with that message rather
+  than falling back to a local login. A Vision 503 (it could not check the
+  limit) is an outage like any other, which Claude retries.
+- **From 80% of a limit**, cswap prints one line per window per session, before
+  Claude starts if it is known by then, else after Claude exits; never over
+  Claude's screen:
+
+  ```
+  cswap: this Vision API key has used 82% of its daily usage limit (41.00 of 50.00 USD at API list price, not what Infinity pays). At the limit, cswap refuses new model requests until the day resets (Tue Nov 3, 12:00 AM PST).
+  ```
+
+A key with no limit is never refused, and neither is one whose limits could not
+be read yet; a failed read keeps what was last known, so an outage never lifts a
+refusal. Vision itself refuses credentials past a limit either way.
 
 No token, key, prompt or reply is ever written. The file is for infy to upload
 beside the session's transcript. Files untouched for 30 days are deleted when Claude next

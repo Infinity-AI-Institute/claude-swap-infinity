@@ -28,10 +28,14 @@ Answers:
 - 401, 403: the key may not report. Reporting stops for this process, and
   ``notice`` holds one line for the person, printed when Claude exits.
 
-Limits (``limits`` in the answer, and ``GET /api/ai-accounts/usage/limits/self``)
-are provisional in the contract and null today. They are read and kept on
-``LocalLimitGate``, which refuses nothing until the limits contract is fixed:
-that is where local refusal goes.
+Limits (vision PR #421): ``limits`` in every report answer, and
+``GET /api/ai-accounts/usage/limits/self``, are kept on ``limit_gate``
+(``usage_limits.LimitGate``), which the adapter asks before each request. The
+limits are read at start, before the key is even identified, then again
+whenever ``interval`` passes without a report answer carrying them (every
+answer counts as a read), and ``LIMITS_RETRY_SECONDS`` after a failed read; a
+failed read keeps what was known. Reports keep going while the gate refuses,
+and limits are still read after Vision refused the key's reports.
 """
 
 from __future__ import annotations
@@ -39,12 +43,14 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import math
 import threading
 import time
 from collections.abc import Callable, Iterable
 from typing import Any, Protocol
 
 from claude_swap.exceptions import ClaudeSwitchError
+from claude_swap.usage_limits import LimitGate
 from claude_swap.usage_totals import (
     REPORT_FIELDS,
     REPORTER_TOOL,
@@ -72,6 +78,9 @@ BACKOFF_MAX_SECONDS = 1800
 # whole (400/413). One bad row among 500 takes about 18; a refusal that is not
 # about rows at all (every row fails) stops here, dropping nothing.
 MAX_ISOLATION_REQUESTS = 32
+# A limits read that failed is tried again this soon; one that answered waits
+# ``interval``. Reads are cheap, but never per request.
+LIMITS_RETRY_SECONDS = 60
 
 REVOKED_KEY_NOTICE = (
     "cswap: Vision refused this session's usage reports because its Vision API "
@@ -123,30 +132,11 @@ def report_batches(
 
 
 def fetch_limits(client: VisionClient) -> object:
-    """The caller's limits from ``GET .../usage/limits/self``; None today."""
+    """The ``limits`` block of ``GET .../usage/limits/self`` (null: no limit)."""
     answer = client.request("GET", LIMITS_SELF_PATH)
     if not isinstance(answer, dict) or "limits" not in answer:
         raise VisionError("service_unavailable")
     return answer["limits"]
-
-
-class LocalLimitGate:
-    """Where cswap will refuse requests locally once a key is over its limit.
-
-    The contract's ``limits`` shape is provisional (null until Vision's limits
-    release), so this keeps the latest value and refuses nothing. When the
-    shape is fixed, ``refusal`` returns the message to show instead of
-    forwarding the request; the adapter already asks it before each request.
-    """
-
-    def __init__(self) -> None:
-        self.limits: object = None
-
-    def update(self, limits: object) -> None:
-        self.limits = limits
-
-    def refusal(self) -> str | None:
-        return None
 
 
 class _Isolation:
@@ -192,7 +182,10 @@ class UsageReporter:
         self.interval = interval
         self.burst = burst
         self.min_gap = min_gap
-        self.limit_gate = LocalLimitGate()
+        self.limit_gate = LimitGate(tool="cswap", clock=clock)
+        # Set once the first limits read has answered or failed.
+        self.limits_read_once = threading.Event()
+        self._limits_due_at: float | None = None  # None: read at the next pass
         # One line for the person when Vision refuses the key; None otherwise.
         self.notice: str | None = None
         self.next_attempt_at: float | None = None  # set while backing off
@@ -268,8 +261,16 @@ class UsageReporter:
 
     def _seconds_until_due(self) -> float:
         now = self.clock()
+        limits_in = (
+            0.0 if self._limits_due_at is None else self._limits_due_at - now
+        )
+        return max(1.0, min(self._report_due_in(now), limits_in))
+
+    def _report_due_in(self, now: float) -> float:
+        if self._stopped:
+            return math.inf
         if self.next_attempt_at is not None:
-            return max(1.0, self.next_attempt_at - now)
+            return self.next_attempt_at - now
         if self._last_report is None:
             return 1.0
         due = self._last_report + self.interval
@@ -278,7 +279,7 @@ class UsageReporter:
         if burst:
             # A burst is deferred to the end of the minimum gap, never dropped.
             due = min(due, self._last_report + self.min_gap)
-        return max(1.0, due - now)
+        return due - now
 
     def _due(self) -> bool:
         now = self.clock()
@@ -292,10 +293,36 @@ class UsageReporter:
         return elapsed >= self.interval or (burst and elapsed >= self.min_gap)
 
     def tick(self) -> None:
-        """Report if one is due (first pass, interval, burst, end of a backoff)."""
-        if self._stopped or not self._due():
+        """Report if one is due (first pass, interval, burst, end of a backoff),
+        then read the limits if no report answer just did."""
+        if not self._stopped and self._due():
+            self.report_now()
+        self._read_limits_if_due()
+
+    # -- limits ---------------------------------------------------------------
+
+    def _read_limits_if_due(self) -> None:
+        now = self.clock()
+        if self._limits_due_at is not None and now < self._limits_due_at:
             return
-        self.report_now()
+        try:
+            limits = fetch_limits(self.client)
+        except VisionError as error:
+            self._limits_due_at = now + LIMITS_RETRY_SECONDS
+            _log.warning(
+                "Could not read this key's usage limits (HTTP %s %s); retrying in %d s.",
+                error.status,
+                error.code,
+                LIMITS_RETRY_SECONDS,
+            )
+        else:
+            self._adopt_limits(limits)
+        finally:
+            self.limits_read_once.set()
+
+    def _adopt_limits(self, limits: object) -> None:
+        self.limit_gate.update(limits)
+        self._limits_due_at = self.clock() + self.interval
 
     # -- one pass -------------------------------------------------------------
 
@@ -397,7 +424,8 @@ class UsageReporter:
                 rejected.add(keys[index])
                 self._log_rejection(str(result.get("code")))
         self.totals.settle(sent, rejected)
-        self.limit_gate.update(answer.get("limits"))
+        if "limits" in answer:  # absent is not null: it says nothing
+            self._adopt_limits(answer["limits"])
 
     def _split(
         self,

@@ -185,6 +185,15 @@ never be answered with cswap's own 429. These backoffs are local to the
 running adapter; central usage remains authoritative for selection across
 processes and hosts.
 
+Vision's own spend limit on the API key (vision PR #421) is a different thing:
+it is the key's, not an account's, so it never sets a login aside or moves to
+another. A credential fetch Vision refuses with 429 `usage_limit_reached`, and
+every request while the key's last-read limits say `exceeded`, get the
+non-retryable 400 with the refusal's text, until the window's `resets_at` or a
+fresh limits read that is no longer `exceeded`. See the README's "Vision usage
+limits" for the messages and the read schedule (`usage_limits.py`,
+`usage_report.py`).
+
 The native macOS qualification uses Claude 2.1.270 with SHA-256
 `a506b6d970a4cf44f6abdb53a81ddcd5d3b0ce042a95c502fe9d1f946bdb8807`.
 `tests/test_vision_native.py` opts in via `CLAUDE_NATIVE_TEST_BINARY`: it blocks
