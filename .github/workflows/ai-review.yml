@@ -1,0 +1,78 @@
+name: AI review
+# An AI security reviewer on Claude Opus 5.5 for every PR into main. Ported
+# from Infinity-AI-Institute/codex-swap's ai-review.yml with only the security
+# reviewer kept.
+#
+# This repo is public. pull_request_target runs THIS file and the reviewer
+# script from main (the base), never from the PR, which is what lets fork PRs
+# be reviewed with the secret: the PR's diff is fetched with `gh pr diff` and
+# handed to the model as untrusted data, and no PR code is checked out or run.
+# Findings go to a workflow artifact, not a PR comment; on a public repo any
+# signed-in GitHub user can download that artifact. A finding of
+# high severity fails the check; it blocks a merge only if branch protection
+# requires the check.
+#
+# Gated on the repository variable AI_REVIEW_ENABLED (as in codex-swap) so PRs
+# do not go red before the ANTHROPIC_API_KEY secret exists.
+on:
+  pull_request_target:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+  # Re-review one PR by number, e.g. after setting the secret.
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Number of the PR to review
+        required: true
+permissions:
+  contents: read
+  pull-requests: read
+concurrency:
+  group: ai-review-${{ github.event.pull_request.number || inputs.pr_number }}
+  cancel-in-progress: true
+jobs:
+  review:
+    if: vars.AI_REVIEW_ENABLED == 'true'
+    # One job per reviewer (REVIEWERS in scripts/ai_review.py).
+    strategy:
+      fail-fast: false
+      matrix:
+        reviewer: [security]
+    runs-on: ubuntu-latest
+    # The claude-CLI credential path needs up to 600s for the review itself
+    # (see scripts/ai_review.py), plus checkout and the CLI install.
+    timeout-minutes: 12
+    steps:
+      # Always execute the trusted base revision. Never check out or run PR code.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+      # The claude CLI is the runtime for the OAuth-token credential shape
+      # (see below). Pinned, as in codex-swap.
+      - run: npm install -g @anthropic-ai/claude-code@2.1.310
+      # ANTHROPIC_API_KEY is routed by the SHAPE of its value
+      # (scripts/ai_review.py): an sk-ant-api… Console key goes to the raw
+      # Messages API; an sk-ant-oat… Claude subscription OAuth token (which
+      # the raw API rejects with a bare 401) runs through `claude --print`
+      # with every tool disabled, preserving this step's no-tools posture;
+      # anything else fails fast, named, before any network call.
+      - name: Review the PR diff as untrusted data, without tools
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+          REVIEWER: ${{ matrix.reviewer }}
+        run: python scripts/ai_review.py
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: ai-review-${{ matrix.reviewer }}
+          path: ai-review.json
+          if-no-files-found: ignore
