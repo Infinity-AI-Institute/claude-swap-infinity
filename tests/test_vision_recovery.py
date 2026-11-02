@@ -91,3 +91,27 @@ def test_identity_change_is_rejected(rejected):
     with pytest.raises(VisionError):
         recover_rejected_credential(client, rejected)
     client.refresh.assert_not_called()
+
+
+def test_waiting_for_a_refresh_backs_off_instead_of_polling_each_second(
+    rejected, monkeypatch
+):
+    """Each poll Vision answers with the rejected generation is an issuance.
+
+    Polling every second for the 90-second wait issued it about 90 times.
+    """
+    elapsed = [0.0]
+
+    def sleep(seconds):
+        elapsed[0] += seconds
+
+    monkeypatch.setattr("claude_swap.vision_session.time.sleep", sleep)
+    monkeypatch.setattr("claude_swap.vision_session.time.monotonic", lambda: elapsed[0])
+    client = Mock()
+    client.credential.return_value = rejected  # the refresh never lands
+    client.refresh.return_value = {"state": "running"}
+    assert recover_rejected_credential(client, rejected, wait_seconds=90) is None
+    assert elapsed[0] == 90
+    # One read before the refresh, then polls 1 s, 2 s, then 4 s apart until
+    # the deadline: 26 issuances, where polling each second made 92.
+    assert client.credential.call_count == 26

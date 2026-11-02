@@ -91,7 +91,10 @@ def test_threshold_switch_uses_complete_pool_without_changing_global_active(setu
     assert pool.get(model="claude-sonnet-4-6")["accessToken"] == "synthetic-token-2"
     assert pool.get(model="claude-sonnet-4-6")["accessToken"] == "synthetic-token-2"
     assert client.discover.call_count == 1
-    assert read.call_count == client.credential.call_count == 2
+    # Selection reads usage on every request; the token issued for the first
+    # is reused by the second.
+    assert read.call_count == 2
+    assert client.credential.call_count == 1
     assert switcher._get_sequence_data().get("activeAccountNumber") is None
     assert not list(switcher.credentials_dir.glob("*"))
     client.refresh.assert_not_called()
@@ -437,8 +440,9 @@ def test_login_needing_relogin_is_skipped_within_the_same_request(setup):
     assert pool.get()["accessToken"] == "synthetic-token-3"
     calls = client.credential.call_count
     assert pool.get()["accessToken"] == "synthetic-token-3"
-    # The dead login is not asked again on the next request.
-    assert client.credential.call_count == calls + 1
+    # The dead login is not asked again on the next request, and the login
+    # that served the first reuses its token.
+    assert client.credential.call_count == calls
     excluded = pool._records()[1]
     why = excluded[item(2)["login_id"]]
     assert why.command is not None and why.command.startswith(

@@ -69,7 +69,9 @@ in `tests/test_vision.py`, `tests/test_vision_registry.py`, and
 Remote launch runs a loopback inference adapter beside the native process. Native
 receives a random process capability through `CLAUDE_CODE_OAUTH_TOKEN` and sends
 message requests to the adapter. The adapter gets authorized access credentials
-from Vision for each request and attaches them to the fixed Anthropic endpoint.
+from Vision, reuses a login's token for up to five minutes (never within a minute
+of its expiry or after a newer generation appears), and attaches it to the fixed
+Anthropic endpoint.
 It rejects redirects and forwards only message and token-count routes. It never
 writes a refresh token or copies the local account backup. An unavailable
 credential requests recovery from Vision with the observed generation and waits
@@ -104,8 +106,10 @@ includes all reported model windows. Hard exhaustion or removed membership can
 bypass proactive cooldown. Selection stays private to this process and does not
 change the global active account or the native conversation directory.
 
-Each request reads local disable preferences and obtains a central credential,
-including when membership is still within its 30-second discovery cache. Unknown
+Each request reads local disable preferences and selects a login, including when
+membership is still within its 30-second discovery cache. The selected login's
+token is reused for up to five minutes; a login the next discovery no longer lists,
+or a key it refuses, stops being served at once. Unknown
 or stale observations never qualify a new account. If observations are unavailable,
 the existing authorized login may continue; the client does not infer spare quota
 from a failed observation. If the current account is known exhausted and no eligible
