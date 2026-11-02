@@ -31,7 +31,7 @@ from claude_swap.settings import (
     parse_window_thresholds,
 )
 from claude_swap.vision import VisionError
-from claude_swap.vision_proxy import CentralCredential
+from claude_swap.vision_proxy import CentralCredential, ProviderUsageLimit
 from claude_swap.vision_registry import RegistryPool
 from claude_swap.vision_session import ReloginRequired, recover_rejected_credential
 from claude_swap.vision_usage import RELOGIN_USAGE_ERROR, read_usage
@@ -50,6 +50,11 @@ REQUEST_RECOVERY_WAIT_SECONDS = 15
 # generation, which returns it at once.
 UNAVAILABLE_RETRY_SECONDS = 30
 RELOGIN_RECHECK_SECONDS = 300
+# The longest a provider usage-limit reset is believed: a weekly window plus a
+# day. A reset further out, or already past, falls back to Retry-After.
+MAX_USAGE_LIMIT_RESET_SECONDS = 8 * 86400
+# How refusals name the provider's usage-limit claims; others are shown as-is.
+USAGE_LIMIT_LABELS = {"five_hour": "5-hour", "seven_day": "weekly"}
 # Vision refusals about one login's credential. Anything else (the key, the
 # member's access, Vision's own health) affects every login alike, so trying
 # the next login would only repeat it.
@@ -128,10 +133,11 @@ class NoCentralQuota(NoUsableLogin):
 
 
 class ProviderRateLimited(NoCentralQuota):
-    """Every remaining login is inside a provider Retry-After window.
+    """No login can serve, and at least one is only throttled by the provider.
 
-    ``retry_after_seconds`` is the soonest such window's end: retrying then is
-    expected to succeed, so native may retry on its own.
+    ``retry_after_seconds`` is the soonest throttle's end: retrying then is
+    expected to succeed, so native may retry on its own. A login past a
+    provider usage limit does not count: it is out until the limit resets.
     """
 
 
@@ -148,6 +154,20 @@ def relogin_login(row: dict, cause: str) -> IneligibleLogin:
     return IneligibleLogin(
         row.get("email", ""), f"{cause}; run `{command}`", None, command
     )
+
+
+def usage_limit_reason(
+    usage_limit: ProviderUsageLimit, until: float, now: float
+) -> str:
+    """Why a login the provider refused for a usage limit is out until ``until``."""
+    limit = "usage limit"
+    claim = usage_limit.claim
+    if claim is not None:
+        limit = f"{USAGE_LIMIT_LABELS.get(claim, claim.replace('_', ' '))} {limit}"
+    if until == usage_limit.resets_at:
+        return f"{limit} reached, resets {describe_moment(until, now)}"
+    # No believable reset: the provider's Retry-After set the deadline.
+    return f"{limit} reached; retrying {describe_moment(until, now)}"
 
 
 def describe_moment(timestamp: float, now: float) -> str:
@@ -241,6 +261,9 @@ class CentralPoolCredential:
         self.lock = threading.RLock()
         self.rejected = {}
         self.rate_limits = {}
+        # account -> the provider usage limit behind its rate_limits deadline.
+        # Accounts absent here, with a live deadline, are only throttled.
+        self.usage_limits: dict[str, ProviderUsageLimit] = {}
         # login -> (generation, retry_at, why): logins Vision could not issue.
         self.unavailable: dict[str, tuple[int, float, IneligibleLogin]] = {}
         # Logins whose last usage reading says their credential expired; None
@@ -277,12 +300,14 @@ class CentralPoolCredential:
             limited_until = self.rate_limits.get(row["visionAccountId"], 0)
             login = row["visionLoginId"]
             if limited_until > now:
-                excluded[login] = IneligibleLogin(
-                    email,
-                    "rate-limited by the provider until "
-                    + describe_moment(limited_until, now),
-                    limited_until,
-                )
+                usage_limit = self.usage_limits.get(row["visionAccountId"])
+                if usage_limit is None:
+                    reason = "rate-limited by the provider until " + describe_moment(
+                        limited_until, now
+                    )
+                else:
+                    reason = usage_limit_reason(usage_limit, limited_until, now)
+                excluded[login] = IneligibleLogin(email, reason, limited_until)
                 continue
             rejected = self.rejected.get(login)
             if rejected is not None:
@@ -501,7 +526,14 @@ class CentralPoolCredential:
             return self.get(model=model)
 
     def _unavailable(self, logins, now):
-        remaining = [deadline - now for deadline in self.rate_limits.values()]
+        # Only a throttle makes a retry worthwhile. A usage limit does not
+        # clear before its reset, and answering it with a retryable 429 makes
+        # native say "not your usage limit" (incident, 2026-10-31).
+        remaining = [
+            deadline - now
+            for account, deadline in self.rate_limits.items()
+            if account not in self.usage_limits
+        ]
         remaining = [delay for delay in remaining if delay > 0]
         if remaining:
             raise ProviderRateLimited(
@@ -566,17 +598,44 @@ class CentralPoolCredential:
             return []
         return result
 
-    def record_rate_limit(self, credential, retry_after):
+    def record_rate_limit(
+        self, credential, retry_after, *, usage_limit: ProviderUsageLimit | None = None
+    ):
+        """Keep an account the provider answered 429 out until it may serve again.
+
+        A throttle lasts its Retry-After. A usage limit lasts until the
+        provider's reset when it gives a believable one.
+        """
         with self.lock:
             account = credential["account_id"]
-            deadline = self.clock() + retry_delay(retry_after, self.clock())
+            now = self.clock()
+            deadline = now + retry_delay(retry_after, now)
+            if (
+                usage_limit is not None
+                and usage_limit.resets_at is not None
+                and now < usage_limit.resets_at <= now + MAX_USAGE_LIMIT_RESET_SECONDS
+            ):
+                deadline = max(deadline, usage_limit.resets_at)
             # Quota belongs to the account, not the token generation or login.
             # A refresh or another login must not bypass the provider's delay.
-            self.rate_limits[account] = max(self.rate_limits.get(account, 0), deadline)
+            if deadline < self.rate_limits.get(account, 0):
+                return
+            self.rate_limits[account] = deadline
+            if usage_limit is None:
+                self.usage_limits.pop(account, None)
+            else:
+                self.usage_limits[account] = usage_limit
 
-    def rate_limited(self, credential, retry_after, *, model=None):
+    def rate_limited(
+        self,
+        credential,
+        retry_after,
+        *,
+        model=None,
+        usage_limit: ProviderUsageLimit | None = None,
+    ):
         with self.lock:
-            self.record_rate_limit(credential, retry_after)
+            self.record_rate_limit(credential, retry_after, usage_limit=usage_limit)
             try:
                 return self.get(model=model)
             except NoCentralQuota:

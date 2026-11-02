@@ -488,3 +488,118 @@ def test_vision_outage_without_a_local_login_fails_as_before(host):
         host.manager.exec_default(PROMPT_ARGS)
     host.manager._exec.assert_not_called()
     host.run_native.assert_not_called()
+
+
+# -- a provider usage limit on the last login with quota ----------------------
+#
+# Incident, 2026-10-31 to 2026-11-02: nine of Infinity's ten Vision Claude
+# accounts sat at their weekly limit (the tenth needed a re-login), so every
+# session ran on the one account left. Each time that account reached its
+# 5-hour or weekly limit, Anthropic answered 429 with its usage-limit headers.
+# cswap passed the first 429 through, then answered every request inside the
+# Retry-After window with its own retryable 429. Native Claude labels a 429
+# without usage-limit headers "Server is temporarily limiting requests (not
+# your usage limit)", so people were told the opposite of what happened.
+
+USAGE_LIMIT_RESET_IN_SECONDS = 3 * 3600
+
+
+@pytest.fixture
+def usage_limited_upstream():
+    """Anthropic as it answers a subscription account past its 5-hour limit."""
+    import http.server
+    import threading
+
+    reset = int(time.time()) + USAGE_LIMIT_RESET_IN_SECONDS
+    requests = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *_):
+            pass
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers["Content-Length"]))
+            requests.append(self.headers.get("Authorization"))
+            body = json.dumps(
+                {
+                    "type": "error",
+                    "error": {"type": "rate_limit_error", "message": "limited"},
+                }
+            ).encode()
+            self.send_response(429)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Retry-After", "60")
+            self.send_header("anthropic-ratelimit-unified-status", "rejected")
+            self.send_header(
+                "anthropic-ratelimit-unified-representative-claim", "five_hour"
+            )
+            self.send_header("anthropic-ratelimit-unified-reset", str(reset))
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}", requests, reset
+    finally:
+        server.shutdown()
+        server.server_close()
+        worker.join()
+
+
+def _native_request(proxy):
+    request = urllib.request.Request(
+        proxy.url + "/v1/messages",
+        data=json.dumps({"model": "claude-opus-4-6"}).encode(),
+        headers={
+            "Authorization": "Bearer " + proxy.capability,
+            "Content-Type": "application/json",
+        },
+    )
+    with pytest.raises(urllib.error.HTTPError) as answered:
+        urllib.request.urlopen(request, timeout=5)
+    return answered.value
+
+
+def test_usage_limit_on_the_last_login_is_reported_as_a_usage_limit(
+    host, usage_limited_upstream
+):
+    url, upstream_requests, reset = usage_limited_upstream
+    host.client.discover.return_value = [item(1), item(2)]
+    # Vision's last reading of login 1 predates its limit; login 2 is spent.
+    host.usage = {
+        1: healthy(host.now),
+        2: {
+            "five_hour": {"pct": 0.0, "resets_at": iso(host.now + 3600)},
+            "seven_day": {"pct": 100.0, "resets_at": iso(host.now + 4 * 86400)},
+        },
+    }
+    pool = CentralPoolCredential(
+        host.switcher, host.client, {"visionLoginId": item(1)["login_id"]}
+    )
+    with InferenceProxy(pool, upstream=url) as proxy:
+        first = _native_request(proxy)
+        second = _native_request(proxy)
+
+    # The provider's own 429 reaches native with its usage-limit headers, so
+    # native shows its "You've hit your limit" message.
+    assert first.code == 429
+    assert first.headers["anthropic-ratelimit-unified-representative-claim"] == (
+        "five_hour"
+    )
+    assert len(upstream_requests) == 1
+
+    # Every login is out of quota until a reset: no retryable 429 (which
+    # native would label "not your usage limit"), but one non-retryable
+    # answer naming each login and when it returns.
+    message = json.loads(second.read())["error"]["message"]
+    assert second.code == 503
+    assert second.headers["x-should-retry"] == "false"
+    assert "user1@example.invalid (5-hour usage limit reached" in message
+    assert "user2@example.invalid (7d window at 100%" in message
+    assert "rate-limited by the provider" not in message
+    assert abs(int(second.headers["Retry-After"]) - USAGE_LIMIT_RESET_IN_SECONDS) <= 5
+    # No second provider request: login 1 stays out until its reset.
+    assert len(upstream_requests) == 1

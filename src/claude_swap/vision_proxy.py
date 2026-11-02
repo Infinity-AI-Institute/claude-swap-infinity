@@ -67,6 +67,47 @@ RESPONSE_HEADERS = {
     "request-id",
     "retry-after",
 }
+# The headers that make native Claude treat a 429 as a subscription usage limit
+# ("You've hit your limit") rather than a throttle ("Server is temporarily
+# limiting requests (not your usage limit)"). Claude 2.1.316 checks for either
+# of the first two; the third is the limit's reset, in epoch seconds.
+USAGE_LIMIT_CLAIM_HEADER = "anthropic-ratelimit-unified-representative-claim"
+USAGE_LIMIT_OVERAGE_HEADER = "anthropic-ratelimit-unified-overage-status"
+USAGE_LIMIT_RESET_HEADER = "anthropic-ratelimit-unified-reset"
+
+
+@dataclass(frozen=True)
+class ProviderUsageLimit:
+    """A provider 429 saying the account reached a subscription usage limit.
+
+    Unlike a throttle, it does not clear after Retry-After: the account is out
+    until ``resets_at``. ``claim`` names the limit (``five_hour``,
+    ``seven_day``) when the provider says which; ``resets_at`` is the
+    provider's reset in epoch seconds, unvalidated against the clock.
+    """
+
+    claim: str | None
+    resets_at: float | None
+
+
+def provider_usage_limit(headers) -> ProviderUsageLimit | None:
+    """The usage limit a provider 429's headers report, or None for a throttle."""
+    claim = headers.get(USAGE_LIMIT_CLAIM_HEADER)
+    if claim is None and headers.get(USAGE_LIMIT_OVERAGE_HEADER) is None:
+        return None
+    if claim is not None:
+        claim = claim.strip()
+        # Shown to people in refusals, so only a plain identifier is kept.
+        plain = claim.isascii() and claim.replace("_", "").isalnum()
+        if not (plain and len(claim) <= 40):
+            claim = None
+    resets_at = None
+    raw_reset = (headers.get(USAGE_LIMIT_RESET_HEADER) or "").strip()
+    if raw_reset.isascii() and raw_reset.isdecimal() and len(raw_reset) <= 12:
+        resets_at = float(raw_reset)
+    return ProviderUsageLimit(claim=claim, resets_at=resets_at)
+
+
 # Appended to the pool's explanation when no Vision login can serve a request.
 # A launch that names no account falls back to a local login, so relaunching
 # that way is the way out.
@@ -154,10 +195,10 @@ class CentralCredential:
         with self.lock:
             return recover_rejected_credential(self.client, rejected)
 
-    def record_rate_limit(self, credential, retry_after):
+    def record_rate_limit(self, credential, retry_after, *, usage_limit=None):
         pass
 
-    def rate_limited(self, credential, retry_after, *, model=None):
+    def rate_limited(self, credential, retry_after, *, model=None, usage_limit=None):
         return None
 
     def relogin_command(self, credential):
@@ -546,6 +587,7 @@ class InferenceProxy:
                                 credential,
                                 response.headers.get("Retry-After"),
                                 model=model,
+                                usage_limit=provider_usage_limit(response.headers),
                             )
                         except BaseException:
                             response.close()
@@ -557,7 +599,9 @@ class InferenceProxy:
                     with response:
                         if response.status == 429:
                             proxy.credentials.record_rate_limit(
-                                credential, response.headers.get("Retry-After")
+                                credential,
+                                response.headers.get("Retry-After"),
+                                usage_limit=provider_usage_limit(response.headers),
                             )
                         status = response.status
                         if 300 <= status < 400:
