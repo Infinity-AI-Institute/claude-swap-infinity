@@ -7,8 +7,11 @@ import os
 import stat
 import sys
 import tempfile
+import threading
 import time
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 from claude_swap import macos_keychain
@@ -28,6 +31,81 @@ ROUTE_OVERRIDES = {
     "CLAUDE_SECURESTORAGE_CONFIG_DIR",
     "NODE_TLS_REJECT_UNAUTHORIZED",
 }
+
+
+# How long the native adapter reuses an access token Vision issued before
+# asking again. Each issuance re-checks the key, the member's access and the
+# login, so this bounds how long a running session keeps a token Vision would
+# now refuse; a revoked key or a withdrawn account reaches it sooner, at the
+# pool's next 30-second discovery. Fetching before every native request
+# instead cost Vision one issuance per request (incident, 2026-11-02).
+CREDENTIAL_REUSE_SECONDS = 300
+# A token this close to its expiry is fetched again rather than reused: Vision
+# issues the refreshed successor, and the client refuses a token within 30
+# seconds of its expiry.
+CREDENTIAL_EXPIRY_MARGIN_SECONDS = 60
+# Polls for a pending central refresh back off to this interval. Every poll
+# Vision answers with the still-current generation is an issuance, so polling
+# each second could issue the rejected generation 90 times in one recovery.
+REFRESH_POLL_MAX_SECONDS = 4
+
+
+class IssuedCredentialCache:
+    """Access tokens Vision issued, by login, reused within their reuse window.
+
+    Thread-safe: one adapter serves native's concurrent requests. A token is
+    reused for at most ``CREDENTIAL_REUSE_SECONDS``, never within
+    ``CREDENTIAL_EXPIRY_MARGIN_SECONDS`` of its expiry, and never once the
+    roster names a newer generation of its login.
+    """
+
+    def __init__(self, *, clock: Callable[[], float] = time.time):
+        self.clock = clock
+        self._lock = threading.Lock()
+        # login id -> (issued credential, epoch seconds its reuse ends)
+        self._entries: dict[str, tuple[dict, float]] = {}
+
+    def get(self, login_id: str, *, min_generation: int) -> dict | None:
+        """The reusable credential for ``login_id``, or None to fetch one."""
+        with self._lock:
+            entry = self._entries.get(login_id)
+            if entry is None:
+                return None
+            credential, reusable_until = entry
+            current = credential["generation"] >= min_generation
+            if current and self.clock() < reusable_until:
+                return credential
+            del self._entries[login_id]
+            return None
+
+    def put(self, credential: dict) -> None:
+        """Keep a credential Vision just issued, if it is not about to expire."""
+        now = self.clock()
+        reusable_until = now + CREDENTIAL_REUSE_SECONDS
+        expires_at = credential.get("expires_at")
+        if expires_at is not None:
+            expiry = datetime.fromisoformat(expires_at).timestamp()
+            reusable_until = min(
+                reusable_until, expiry - CREDENTIAL_EXPIRY_MARGIN_SECONDS
+            )
+        with self._lock:
+            if reusable_until > now:
+                self._entries[credential["login_id"]] = (credential, reusable_until)
+            else:
+                self._entries.pop(credential["login_id"], None)
+
+    def discard(self, login_id: str) -> None:
+        """Forget a login's credential, e.g. once the provider rejected it."""
+        with self._lock:
+            self._entries.pop(login_id, None)
+
+
+def _refresh_poll_delays() -> Iterator[float]:
+    """Seconds between polls for a pending refresh: 1, 2, 4, 4, ..."""
+    delay = 1.0
+    while True:
+        yield delay
+        delay = min(REFRESH_POLL_MAX_SECONDS, delay * 2)
 
 
 class CredentialUnavailable(SessionError):
@@ -73,6 +151,7 @@ def acquire_credential(client: VisionClient, record: dict, *, wait_seconds=90):
     if receipt["state"] not in {"queued", "running"}:
         return client.credential(account, login)
     deadline = time.monotonic() + wait_seconds
+    delays = _refresh_poll_delays()
     while True:
         try:
             return client.credential(account, login)
@@ -83,7 +162,7 @@ def acquire_credential(client: VisionClient, record: dict, *, wait_seconds=90):
                 raise CredentialUnavailable(
                     "Vision credential recovery is pending; retry the launch."
                 ) from None
-        time.sleep(min(1, max(0, deadline - time.monotonic())))
+        time.sleep(min(next(delays), max(0, deadline - time.monotonic())))
 
 
 def recover_rejected_credential(client, rejected, *, wait_seconds=90):
@@ -125,13 +204,14 @@ def recover_rejected_credential(client, rejected, *, wait_seconds=90):
     if receipt["state"] in {"current", "reauth_required", "obsolete"}:
         return None
     deadline = time.monotonic() + wait_seconds
+    delays = _refresh_poll_delays()
     while True:
         candidate = successor()
         if candidate is not None:
             return candidate
         if time.monotonic() >= deadline:
             return None
-        time.sleep(min(1, max(0, deadline - time.monotonic())))
+        time.sleep(min(next(delays), max(0, deadline - time.monotonic())))
 
 
 def credential_directory(backup_dir, url, login_id):

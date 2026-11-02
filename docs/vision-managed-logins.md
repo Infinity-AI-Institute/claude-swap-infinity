@@ -191,7 +191,7 @@ Central-account launches keep a local adapter running beside Claude:
 
 ```text
 native message request
-    -> obtain the current authorized Vision access credential
+    -> reuse the login's Vision access credential, or obtain a new one
     -> attach it to the fixed Anthropic message endpoint
     -> stream the response back to the same native process
 ```
@@ -199,8 +199,10 @@ native message request
 The adapter binds to loopback and gives the native process a random per-process
 capability. Provider access tokens stay in the adapter; no provider refresh token
 is delivered to either component. Only `/v1/messages` and its `count_tokens`
-endpoint are forwarded. Provider redirects are rejected, and Vision revocation
-blocks subsequent credential issuance before another upstream request.
+endpoint are forwarded. Provider redirects are rejected. Vision revocation blocks
+credential issuance at once; a running adapter stops sending requests within the
+pool's 30-second discovery cache, or, for a revocation discovery cannot see, once
+its reused token's five-minute window ends.
 
 Native arguments, terminal input/output and exit status are preserved. Terminal
 Ctrl+C remains available to Claude to cancel a turn or exit. The adapter stops

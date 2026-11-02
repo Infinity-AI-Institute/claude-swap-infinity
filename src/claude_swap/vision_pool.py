@@ -33,7 +33,11 @@ from claude_swap.settings import (
 from claude_swap.vision import VisionError
 from claude_swap.vision_proxy import CentralCredential, ProviderUsageLimit
 from claude_swap.vision_registry import RegistryPool
-from claude_swap.vision_session import ReloginRequired, recover_rejected_credential
+from claude_swap.vision_session import (
+    IssuedCredentialCache,
+    ReloginRequired,
+    recover_rejected_credential,
+)
 from claude_swap.vision_usage import RELOGIN_USAGE_ERROR, read_usage
 
 # The pool runs inside the native adapter, whose terminal native Claude draws
@@ -269,6 +273,9 @@ class CentralPoolCredential:
         # Logins whose last usage reading says their credential expired; None
         # until the first reading.
         self.observed_relogin: frozenset[str] | None = None
+        # Issued access tokens, reused across requests instead of fetching
+        # one from Vision for every native request.
+        self.credential_cache = IssuedCredentialCache(clock=clock)
         # login -> roster alias of the row each issued credential came from,
         # for the account ledger. Kept from selection so a request never
         # re-reads the roster just to name its account.
@@ -352,6 +359,7 @@ class CentralPoolCredential:
                         self.client,
                         record,
                         wait_seconds=REQUEST_RECOVERY_WAIT_SECONDS,
+                        cache=self.credential_cache,
                     ).get(model=model)
                 except (SessionError, VisionError) as error:
                     if not self._set_aside(record, error):
@@ -513,10 +521,13 @@ class CentralPoolCredential:
 
     def recover(self, rejected, *, model=None):
         with self.lock:
+            # The provider refused this token: never serve it again.
+            self.credential_cache.discard(rejected["login_id"])
             # Use the identity actually rejected by the provider, not whichever
             # login another concurrent native request most recently selected.
             candidate = recover_rejected_credential(self.client, rejected)
             if candidate is not None:
+                self.credential_cache.put(candidate)
                 return candidate
             self.rejected[rejected["login_id"]] = (
                 rejected["generation"],
