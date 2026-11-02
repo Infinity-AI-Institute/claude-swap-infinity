@@ -10,13 +10,13 @@ not log in to Claude on this machine, register the machine, or write a cswap
 configuration file.
 
 You need [`uv`](https://docs.astral.sh/uv/) and the native Claude Code CLI
-(`claude`). `uv` installs Python 3.12 if your machine does not have it. This
+(`claude`). `uv` installs Python 3.14 if your machine does not have it. This
 repository is public, so the install needs no GitHub login.
 
 1. Install the fork:
 
    ```bash
-   uv tool install --python 3.12 git+https://github.com/Infinity-AI-Institute/claude-swap-infinity
+   uv tool install --python 3.14 git+https://github.com/Infinity-AI-Institute/claude-swap-infinity
    ```
 
 2. Create your own API key in Vision at **Settings (gear) → API keys**
@@ -245,7 +245,7 @@ upstream tool. They do not have Vision support. If `cswap vision status` fails w
 `unrecognized arguments`, you have the upstream tool. Replace it with the fork:
 
 ```bash
-uv tool install --force --python 3.12 git+https://github.com/Infinity-AI-Institute/claude-swap-infinity
+uv tool install --force --python 3.14 git+https://github.com/Infinity-AI-Institute/claude-swap-infinity
 ```
 
 If you installed the upstream tool with `pipx`, run `pipx uninstall claude-swap`
@@ -266,6 +266,10 @@ Git URL that you installed from. An installation made from a local clone
 (`uv tool install ./claude-swap-infinity`) does not get new commits this way.
 To change it to the Git URL, run the `uv tool install --force` command in
 [Replace an upstream install](#replace-an-upstream-install).
+
+`cswap upgrade` keeps the Python version the tool was installed with. To move
+an installation made with `--python 3.12` to 3.14, run that same
+`uv tool install --force` command once.
 
 ### Saved key and troubleshooting
 
@@ -506,7 +510,7 @@ Needs the `menubar` extra (macOS only). Install it from this fork; the PyPI pack
 replaces the fork with the upstream tool, which has no Vision support:
 
 ```bash
-uv tool install --force --python 3.12 'claude-swap[menubar] @ git+https://github.com/Infinity-AI-Institute/claude-swap-infinity'
+uv tool install --force --python 3.14 'claude-swap[menubar] @ git+https://github.com/Infinity-AI-Institute/claude-swap-infinity'
 cswap menubar
 ```
 
@@ -632,7 +636,7 @@ pipx uninstall claude-swap
 
 ## Requirements
 
-- Python 3.12+ (`uv` installs it when needed)
+- Python 3.12 or newer; 3.14 is recommended (`uv` installs it when needed)
 - Claude Code installed. Vision accounts need no Claude login on this machine;
   local accounts need one.
 
