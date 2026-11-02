@@ -56,6 +56,8 @@ class SyntheticVision:
         self.reports: list[dict] = []
         self.answers: list[tuple[int, dict | None, dict]] = []
         self.reject: dict[str, str] = {}  # login_id -> code
+        # A report holding any of these logins is refused whole, as malformed (400).
+        self.malformed: set[str] = set()
         self.limits_calls = 0
         self.hold = threading.Event()
         self.hold.set()
@@ -85,6 +87,8 @@ class SyntheticVision:
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 vision.hold.wait(10)
                 vision.reports.append(body)
+                if any(row["login_id"] in vision.malformed for row in body["rows"]):
+                    return self._send(400, {"error": {"code": "invalid_request"}})
                 if vision.answers:
                     status, payload, headers = vision.answers.pop(0)
                     if payload is not None:
@@ -144,17 +148,26 @@ def record(login=LOGIN_A, account=ACCOUNT_A, model="claude-opus-4-6", *, key=KEY
     return UsageRecord(when or datetime.now(UTC), key, account, login, "claude", model, usage)
 
 
-def setup(tmp_path, vision, *, key_owner=None, clock=None, **options):
+def setup(tmp_path, vision, *, key_owner=None, clock=None, key=KEY, **options):
     totals = UsageTotals(tmp_path / "totals.json", tmp_path / "machine_id")
     reporter = UsageReporter(
         totals,
-        VisionClient(vision.url, KEY),
+        VisionClient(vision.url, key),
         key_owner or identity(),
         version="0.26.0b1+infinity.8",
         clock=clock or Clock(),
         **options,
     )
     return totals, reporter
+
+
+def eventually(condition, seconds=5.0):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if condition():
+            return True
+        time.sleep(0.05)
+    return condition()
 
 
 def file_rows(tmp_path):
@@ -222,30 +235,141 @@ def test_nothing_is_sent_while_the_key_is_unidentified(tmp_path, vision):
     assert vision.reports == []
 
 
-def test_records_held_until_the_key_is_known_are_then_filed_and_sent(tmp_path, vision):
+def unknown_key():
     lookup = Mock()
     lookup.current.return_value = None
+    return lookup
+
+
+def test_records_held_until_the_key_is_known_are_then_filed_and_sent(tmp_path, vision):
+    lookup = unknown_key()
     totals, reporter = setup(tmp_path, vision, key_owner=lookup)
     reporter.hold([record(key=None), record(key=None)])
     reporter.report_now()
     assert vision.reports == []
-    assert not (tmp_path / "totals.json").exists()
+    assert file_rows(tmp_path) == []  # held, not filed under any key
     lookup.current.return_value = KeyIdentity("owner-1@infinity.inc", KEY_ID)
     reporter.report_now()
     [row] = vision.sent_rows()
     assert row["requests"] == 2
     assert file_rows(tmp_path)[0]["api_key_id"] == KEY_ID
+    assert totals.read()["held"] == []
 
 
-def test_held_records_are_kept_unattributed_at_exit(tmp_path, vision):
-    lookup = Mock()
-    lookup.current.return_value = None
-    totals, reporter = setup(tmp_path, vision, key_owner=lookup)
+def test_held_usage_is_on_disk_and_survives_a_restart(tmp_path, vision):
+    # A process killed before its key was named loses nothing: the next one files it.
+    _, reporter = setup(tmp_path, vision, key_owner=unknown_key())
+    reporter.hold([record(key=None), record(LOGIN_B, ACCOUNT_B, key=None)])
+    _, restarted = setup(tmp_path, vision)
+    restarted.report_now()
+    assert sorted(row["login_id"] for row in vision.sent_rows()) == [LOGIN_A, LOGIN_B]
+
+
+def test_held_usage_of_another_key_is_never_filed_under_this_one(tmp_path, vision):
+    _, reporter = setup(tmp_path, vision, key_owner=unknown_key())
+    reporter.hold([record(key=None)])
+    totals, other = setup(
+        tmp_path, vision, key="vsk_" + "2" * 40, key_owner=identity(OTHER_KEY_ID)
+    )
+    other.report_now()
+    assert vision.reports == []
+    [held] = totals.read()["held"]
+    assert "vsk_" not in json.dumps(held)  # a fingerprint, never the key
+    # The key it was recorded with still files it.
+    _, same = setup(tmp_path, vision)
+    same.report_now()
+    assert len(vision.sent_rows()) == 1
+
+
+def test_held_usage_stays_held_at_exit_when_the_key_is_still_unknown(tmp_path, vision):
+    totals, reporter = setup(tmp_path, vision, key_owner=unknown_key())
     reporter.start()
     reporter.hold([record(key=None)])
     reporter.stop(timeout=2)
-    [row] = file_rows(tmp_path)
-    assert (row["api_key_id"], row["requests"]) == (None, 1)
+    assert file_rows(tmp_path) == []
+    [held] = totals.read()["held"]
+    assert held["requests"] == 1
+    assert vision.reports == []
+
+
+def test_a_pass_without_a_known_key_does_not_reset_the_timer(tmp_path, vision):
+    lookup = unknown_key()
+    totals, reporter = setup(tmp_path, vision, key_owner=lookup)
+    totals.add([record()])
+    reporter.tick()  # the first pass, before api-keys/self has answered
+    assert vision.reports == []
+    lookup.current.return_value = KeyIdentity("owner-1@infinity.inc", KEY_ID)
+    reporter.tick()  # no clock advance: the first real report is still due
+    assert len(vision.reports) == 1
+
+
+def test_a_burst_inside_the_minimum_gap_is_deferred_not_dropped(tmp_path, vision):
+    clock = Clock()
+    totals, reporter = setup(tmp_path, vision, clock=clock, interval=300, burst=5)
+    totals.add([record()])
+    reporter.tick()
+    clock.now += 10
+    reporter.nudge(5)
+    # The loop waits until the minimum gap has passed, not the whole interval.
+    assert reporter._seconds_until_due() == pytest.approx(20)
+
+
+def test_the_running_loop_reports_a_burst_once_the_gap_has_passed(tmp_path, vision):
+    totals, reporter = setup(
+        tmp_path, vision, clock=time.time, interval=300, burst=2, min_gap=1
+    )
+    totals.add([record()])
+    reporter.start()
+    try:
+        assert eventually(lambda: len(vision.reports) == 1)
+        totals.add([record(LOGIN_B, ACCOUNT_B)])
+        reporter.nudge(2)
+        assert eventually(lambda: len(vision.reports) == 2)  # well inside 300 s
+    finally:
+        reporter.stop(timeout=2)
+
+
+def test_a_batch_refused_as_malformed_is_split_so_good_rows_still_go(tmp_path, vision):
+    bad = "ail_00000000-0000-4000-8000-0000000000ff"
+    vision.malformed.add(bad)
+    clock = Clock()
+    totals, reporter = setup(tmp_path, vision, clock=clock)
+    totals.add([record(), record(bad), record(LOGIN_B, ACCOUNT_B)])
+    reporter.report_now()
+    sent = {row["login_id"]: row["sent_version"] for row in file_rows(tmp_path)}
+    assert sent == {LOGIN_A: 1, bad: 0, LOGIN_B: 1}
+    # The refused row stays, unsent, and is tried again after the longest backoff.
+    assert reporter.next_attempt_at == clock.now + 1800
+
+
+def many_rows(tmp_path, count):
+    state = json.loads((tmp_path / "totals.json").read_text())
+    [template] = state["rows"]
+    logins = [f"ail_00000000-0000-4000-8000-{index:012d}" for index in range(count)]
+    state["rows"] = [{**template, "login_id": login} for login in logins]
+    (tmp_path / "totals.json").write_text(json.dumps(state))
+    return logins
+
+
+def test_a_refused_row_does_not_hold_back_later_batches(tmp_path, vision):
+    totals, reporter = setup(tmp_path, vision)
+    totals.add([record()])
+    logins = many_rows(tmp_path, 700)
+    vision.malformed.add(logins[3])  # in the first batch of 500
+    reporter.report_now()
+    unsent = [row["login_id"] for row in file_rows(tmp_path) if row["sent_version"] == 0]
+    assert unsent == [logins[3]]
+    assert len(vision.reports) < 40  # isolating one row costs a few requests
+
+
+def test_isolating_refused_rows_spends_a_bounded_number_of_requests(tmp_path, vision):
+    totals, reporter = setup(tmp_path, vision)
+    totals.add([record()])
+    logins = many_rows(tmp_path, 600)
+    vision.malformed.update(logins)  # every row: not a row problem at all
+    reporter.report_now()
+    assert len(vision.reports) <= 2 + 32
+    assert all(row["sent_version"] == 0 for row in file_rows(tmp_path))  # nothing dropped
 
 
 def test_rejected_rows_are_dropped_and_their_codes_logged_once(tmp_path, vision, caplog):

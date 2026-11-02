@@ -13,7 +13,11 @@ cross-process lock, re-reads, adds, and atomically replaces the file, so
 concurrent sessions never overwrite each other's counts. Rows are partitioned
 by the Vision API key that served them (``api_key_id``, from Vision's
 api-keys/self; null until that lookup answers), because the server upserts per
-key: one key's report must not carry another key's usage.
+key: one key's report must not carry another key's usage. A request that
+finished before that lookup answered is kept under ``held``, by a fingerprint
+of the key that served it (never the key), until a process using that key
+learns its id and files it (``claim_held``): nothing is lost if the process
+exits first, and no other key's report carries it.
 
 Like the ledger, this is bookkeeping: ``add`` never raises, and a failure costs
 only the count, after one warning in cswap's log.
@@ -21,6 +25,7 @@ only the count, after one warning in cswap's log.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -54,6 +59,8 @@ COUNT_FIELDS = (
 # A row's identity: the report's upsert key (minus machine, which is global
 # here) plus the key that served it.
 ROW_KEY = ("api_key_id", "bucket_start", "login_id", "model")
+# A held row's identity: the key's fingerprint instead of its (unknown) id.
+HELD_KEY = ("key_fingerprint", "bucket_start", "login_id", "model")
 # A report row, exactly as the contract names its fields, in its order.
 REPORT_FIELDS = (
     "bucket_start",
@@ -98,6 +105,13 @@ class UsageRecord:
     harness: str
     model: str | None
     usage: TokenUsage
+    # Set, with api_key_id None, for a request whose key id was not known yet.
+    key_fingerprint: str | None = None
+
+
+def key_fingerprint(api_key: str) -> str:
+    """Tells Vision keys apart without recording one: 64 bits of its SHA-256."""
+    return hashlib.sha256(api_key.encode()).hexdigest()[:16]
 
 
 def row_key(row: dict[str, Any]) -> tuple[Any, ...]:
@@ -162,7 +176,7 @@ def _match(pattern: re.Pattern[str], value: object) -> str | None:
 
 
 def _empty_state(machine_id: str) -> dict[str, Any]:
-    return {"v": STATE_VERSION, "machine_id": machine_id, "rows": []}
+    return {"v": STATE_VERSION, "machine_id": machine_id, "rows": [], "held": []}
 
 
 class UsageTotals:
@@ -184,19 +198,53 @@ class UsageTotals:
 
     def add(self, records: Iterable[UsageRecord]) -> None:
         """Count each record that has usage and reportable ids; never raises."""
-        rows = [row for row in map(self._row, records) if row is not None]
-        if not rows:
+        filed: list[dict[str, Any]] = []
+        held: list[dict[str, Any]] = []
+        for record in records:
+            row = self._row(record)
+            if row is None:
+                continue
+            if record.api_key_id is None and record.key_fingerprint is not None:
+                held.append({**row, "key_fingerprint": record.key_fingerprint})
+            else:
+                filed.append(row)
+        if not filed and not held:
             return
         try:
             with self._thread_lock, FileLock(
-                self.path.with_name(self.path.name + ".lock"),
-                timeout=LOCK_TIMEOUT_SECONDS,
+                self.path.with_name(self.path.name + ".lock"), timeout=LOCK_TIMEOUT_SECONDS
             ):
                 state = self._load_for_update()
-                self._merge(state, rows)
+                state["rows"] = self._merged(state["rows"], filed, ROW_KEY)
+                state["held"] = self._merged(state["held"], held, HELD_KEY)
                 self._write(state)
         except (OSError, ClaudeSwitchError) as error:
             self._warn(f"could not update {self.path}: {error}")
+
+    def claim_held(self, fingerprint: str, api_key_id: str) -> None:
+        """File the held rows of the key with ``fingerprint`` under its id, now known.
+
+        Raises OSError or ClaudeSwitchError when the file cannot be updated.
+        """
+        with self._thread_lock, FileLock(
+            self.path.with_name(self.path.name + ".lock"), timeout=LOCK_TIMEOUT_SECONDS
+        ):
+            state = self._load_for_update()
+            claimed = [row for row in state["held"] if row.get("key_fingerprint") == fingerprint]
+            if not claimed:
+                return
+            state["held"] = [row for row in state["held"] if row not in claimed]
+            filed = [
+                {
+                    **{key: value for key, value in row.items() if key != "key_fingerprint"},
+                    "api_key_id": api_key_id,
+                    "version": 1,
+                    "sent_version": 0,
+                }
+                for row in claimed
+            ]
+            state["rows"] = self._merged(state["rows"], filed, ROW_KEY)
+            self._write(state)
 
     def read(self) -> dict[str, Any]:
         """The current totals (empty if none yet); for reporting."""
@@ -271,28 +319,35 @@ class UsageTotals:
     def _cutoff(self) -> str:
         return bucket_start(datetime.fromtimestamp(self.clock() - RETENTION_SECONDS, UTC))
 
-    def _merge(self, state: dict[str, Any], rows: list[dict[str, Any]]) -> None:
+    def _merged(
+        self,
+        existing_rows: list[Any],
+        rows: list[dict[str, Any]],
+        identity: tuple[str, ...],
+    ) -> list[dict[str, Any]]:
+        """``existing_rows`` plus ``rows``, adding counts where ``identity`` matches."""
         cutoff = self._cutoff()
+
+        def key(value: dict[str, Any]) -> tuple[Any, ...]:
+            return tuple(value.get(field) for field in identity)
+
         kept = {
-            row_key(row): row
-            for row in state["rows"]
+            key(row): row
+            for row in existing_rows
             if isinstance(row, dict) and str(row.get("bucket_start", "")) >= cutoff
         }
         for row in rows:
             if row["bucket_start"] < cutoff:
                 continue
-            key = row_key(row)
-            existing = kept.get(key)
+            existing = kept.get(key(row))
             if existing is None:
-                kept[key] = row
+                kept[key(row)] = row
                 continue
             existing["version"] = _version(existing, "version", 1) + 1
-            existing["requests"] = int(existing.get("requests", 0)) + 1
+            existing["requests"] = int(existing.get("requests", 0)) + int(row["requests"])
             for field in COUNT_FIELDS:
-                existing[field] = int(existing.get(field) or 0) + row[field]
-        state["rows"] = sorted(
-            kept.values(), key=lambda row: tuple(str(row.get(f)) for f in ROW_KEY)
-        )
+                existing[field] = int(existing.get(field) or 0) + int(row[field] or 0)
+        return sorted(kept.values(), key=lambda row: tuple(str(f) for f in key(row)))
 
     def _load_for_update(self) -> dict[str, Any]:
         machine_id = load_machine_id(self.machine_id_path)
@@ -313,6 +368,10 @@ class UsageTotals:
                 or not isinstance(state.get("rows"), list)
             ):
                 raise ValueError("not a usage totals file")
+            held = state.get("held", [])
+            state["held"] = (
+                [row for row in held if isinstance(row, dict)] if isinstance(held, list) else []
+            )
         except ValueError:
             if not set_aside_corrupt:
                 return None

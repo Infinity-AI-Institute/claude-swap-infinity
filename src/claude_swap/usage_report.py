@@ -6,8 +6,10 @@ upserts each row under ``(key, machine_id, bucket_start, login_id, model)``
 and the row REPLACES what it stored, so a row is sent as its running total
 whenever it changed since Vision last accepted it, the current hour included.
 
-Schedule, on a background thread: a first pass at start, then every
-``interval`` seconds, earlier after a burst of finished requests, and one
+Schedule, on a background thread: a first pass at start (repeated each
+second until Vision has named the key), then every ``interval`` seconds,
+earlier after a burst of finished requests (deferred until ``min_gap`` after
+the last report, never dropped), and one
 last pass when the adapter exits (bounded by the caller's timeout; the thread
 is a daemon, so a hung Vision never holds the process). Nothing here runs on a
 request's thread: a request only calls ``nudge`` or ``hold``.
@@ -19,6 +21,10 @@ Answers:
 - 429, 5xx, a network failure, or an answer that is not the contract's: the
   whole batch is retried after a backoff (60 s doubling to 30 min, or the
   Retry-After Vision names).
+- 400 or 413, a report refused whole: it is halved until the rows at fault are
+  isolated (a bounded number of requests per pass), so every other row is
+  still sent; the refused rows stay local and are retried after the longest
+  backoff.
 - 401, 403: the key may not report. Reporting stops for this process, and
   ``notice`` holds one line for the person, printed when Claude exits.
 
@@ -30,6 +36,7 @@ that is where local refusal goes.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import threading
@@ -43,6 +50,7 @@ from claude_swap.usage_totals import (
     REPORTER_TOOL,
     UsageRecord,
     UsageTotals,
+    key_fingerprint,
     load_machine_id,
     row_key,
 )
@@ -60,6 +68,10 @@ BURST_RECORDS = 50
 MIN_GAP_SECONDS = 30
 BACKOFF_INITIAL_SECONDS = 60
 BACKOFF_MAX_SECONDS = 1800
+# Requests one pass may spend isolating rows from a report Vision refused as a
+# whole (400/413). One bad row among 500 takes about 18; a refusal that is not
+# about rows at all (every row fails) stops here, dropping nothing.
+MAX_ISOLATION_REQUESTS = 32
 
 REVOKED_KEY_NOTICE = (
     "cswap: Vision refused this session's usage reports because its Vision API "
@@ -137,6 +149,20 @@ class LocalLimitGate:
         return None
 
 
+class _Isolation:
+    """The requests one pass may spend splitting reports Vision refused as malformed."""
+
+    def __init__(self, budget: int) -> None:
+        self.remaining = budget
+        self.unsent = 0  # rows left for a later pass
+
+    def spend(self) -> bool:
+        if self.remaining <= 0:
+            return False
+        self.remaining -= 1
+        return True
+
+
 class _Retry(Exception):
     """A failure after which the whole batch is sent again later."""
 
@@ -156,6 +182,7 @@ class UsageReporter:
         clock: Callable[[], float] = time.time,
         interval: float = REPORT_INTERVAL_SECONDS,
         burst: int = BURST_RECORDS,
+        min_gap: float = MIN_GAP_SECONDS,
     ) -> None:
         self.totals = totals
         self.client = client
@@ -164,6 +191,7 @@ class UsageReporter:
         self.clock = clock
         self.interval = interval
         self.burst = burst
+        self.min_gap = min_gap
         self.limit_gate = LocalLimitGate()
         # One line for the person when Vision refuses the key; None otherwise.
         self.notice: str | None = None
@@ -176,7 +204,6 @@ class UsageReporter:
         self._failures = 0
         self._last_report: float | None = None
         self._since_report = 0
-        self._held: list[UsageRecord] = []
         self._logged_codes: set[str] = set()
         self._thread: threading.Thread | None = None
 
@@ -191,9 +218,17 @@ class UsageReporter:
             self._wake.set()
 
     def hold(self, records: list[UsageRecord]) -> None:
-        """Keep records whose key is not yet identified, to file once it is."""
-        with self._lock:
-            self._held.extend(records)
+        """Keep, on disk, records whose key id is not known yet, to file once it is.
+
+        They are kept under a fingerprint of the key in use, so only a process
+        using that same key files them, and a process that exits first loses
+        nothing.
+        """
+        fingerprint = key_fingerprint(self.client.api_key)
+        self.totals.add(
+            dataclasses.replace(record, api_key_id=None, key_fingerprint=fingerprint)
+            for record in records
+        )
 
     # -- lifecycle ------------------------------------------------------------
 
@@ -209,8 +244,6 @@ class UsageReporter:
         self._wake.set()
         if self._thread is not None:
             self._thread.join(timeout)
-        else:
-            self._file_held(at_exit=True)
 
     def _run(self) -> None:
         while not self._stopping:
@@ -220,7 +253,7 @@ class UsageReporter:
         self._guarded(self._final_pass)
 
     def _final_pass(self) -> None:
-        self._file_held(at_exit=True)
+        # Held usage and unsent rows stay on disk for the next process.
         if not self._stopped:
             self.report_now()
 
@@ -239,7 +272,13 @@ class UsageReporter:
             return max(1.0, self.next_attempt_at - now)
         if self._last_report is None:
             return 1.0
-        return max(1.0, self._last_report + self.interval - now)
+        due = self._last_report + self.interval
+        with self._lock:
+            burst = self._since_report >= self.burst
+        if burst:
+            # A burst is deferred to the end of the minimum gap, never dropped.
+            due = min(due, self._last_report + self.min_gap)
+        return max(1.0, due - now)
 
     def _due(self) -> bool:
         now = self.clock()
@@ -250,7 +289,7 @@ class UsageReporter:
         elapsed = now - self._last_report
         with self._lock:
             burst = self._since_report >= self.burst
-        return elapsed >= self.interval or (burst and elapsed >= MIN_GAP_SECONDS)
+        return elapsed >= self.interval or (burst and elapsed >= self.min_gap)
 
     def tick(self) -> None:
         """Report if one is due (first pass, interval, burst, end of a backoff)."""
@@ -265,15 +304,22 @@ class UsageReporter:
         with self._report_lock:
             if self._stopped:
                 return
-            self._last_report = self.clock()
-            with self._lock:
-                self._since_report = 0
             identity = self.key_owner.current()
             key_id = None if identity is None else identity.key_id
             if key_id is None:
-                return  # unidentified key: nothing can be attributed yet
-            self._file_held(key_id=key_id)
-            rows = self.totals.pending(key_id)
+                # Nothing can be attributed yet; this was no report, so the
+                # schedule does not move and the next tick asks again.
+                return
+            self._last_report = self.clock()
+            with self._lock:
+                self._since_report = 0
+            isolation = _Isolation(MAX_ISOLATION_REQUESTS)
+            try:
+                self.totals.claim_held(key_fingerprint(self.client.api_key), key_id)
+                rows = self.totals.pending(key_id)
+            except (OSError, ClaudeSwitchError) as error:
+                self._backoff(f"local totals unavailable: {error}", None)
+                return
             if not rows:
                 self._succeeded()
                 return
@@ -289,7 +335,7 @@ class UsageReporter:
                 for body in report_batches(rows, reporter):
                     batch_keys = keys[offset : offset + len(body["rows"])]
                     offset += len(body["rows"])
-                    self._send(body, batch_keys, versions)
+                    self._send(body, batch_keys, versions, isolation)
             except _Retry as retry:
                 self._backoff(str(retry), retry.retry_after)
                 return
@@ -300,13 +346,20 @@ class UsageReporter:
                 # The totals file could not be read or settled; try later.
                 self._backoff(f"local totals unavailable: {error}", None)
                 return
-            self._succeeded()
+            if isolation.unsent:
+                # Rows Vision refused as malformed: resending soon cannot help.
+                self._backoff(
+                    f"{isolation.unsent} row(s) refused as malformed", BACKOFF_MAX_SECONDS
+                )
+            else:
+                self._succeeded()
 
     def _send(
         self,
         body: dict[str, Any],
         keys: list[tuple[Any, ...]],
         versions: dict[tuple[Any, ...], Any],
+        isolation: _Isolation,
     ) -> None:
         try:
             answer = self.client.request("POST", REPORTS_PATH, body)
@@ -319,8 +372,13 @@ class UsageReporter:
                 raise _Retry(
                     f"HTTP {error.status} {error.code}", error.retry_after_seconds
                 ) from None
-            # 400/413/other: a request this client built wrongly. Resending
-            # the same batch cannot help soon, so it waits the longest backoff.
+            if error.status in (400, 413):
+                # Refused whole: isolate the rows at fault by halving, so every
+                # other row is still sent. A row refused alone stays local.
+                self._split(body, keys, versions, isolation)
+                return
+            # Another 4xx: a request this client built wrongly. Resending the
+            # same batch cannot help soon, so it waits the longest backoff.
             _log.warning(
                 "Vision refused a usage report as malformed (HTTP %s %s).",
                 error.status,
@@ -341,6 +399,25 @@ class UsageReporter:
         self.totals.settle(sent, rejected)
         self.limit_gate.update(answer.get("limits"))
 
+    def _split(
+        self,
+        body: dict[str, Any],
+        keys: list[tuple[Any, ...]],
+        versions: dict[tuple[Any, ...], Any],
+        isolation: _Isolation,
+    ) -> None:
+        rows = body["rows"]
+        if len(rows) == 1:
+            isolation.unsent += 1
+            return
+        half = len(rows) // 2
+        for part_rows, part_keys in ((rows[:half], keys[:half]), (rows[half:], keys[half:])):
+            if not isolation.spend():
+                isolation.unsent += len(part_rows)  # out of budget: a later pass
+                continue
+            part = {"reporter": body["reporter"], "rows": part_rows}
+            self._send(part, part_keys, versions, isolation)
+
     def _log_rejection(self, code: str) -> None:
         if code in self._logged_codes:
             return
@@ -348,24 +425,6 @@ class UsageReporter:
         _log.warning(
             "Vision rejected usage report rows (%s); they were dropped.", code
         )
-
-    def _file_held(self, *, key_id: str | None = None, at_exit: bool = False) -> None:
-        """File held records under the key now known, or unattributed at exit."""
-        if key_id is None and not at_exit:
-            return
-        if key_id is None:
-            identity = self.key_owner.current()
-            key_id = None if identity is None else identity.key_id
-        with self._lock:
-            held, self._held = self._held, []
-        if held:
-            self.totals.add(
-                UsageRecord(
-                    record.sent_at, key_id, record.account_id, record.login_id,
-                    record.harness, record.model, record.usage,
-                )
-                for record in held
-            )
 
     def _succeeded(self) -> None:
         self._failures = 0
