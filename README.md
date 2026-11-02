@@ -222,6 +222,11 @@ minutes, sooner after a burst of requests, and once more when Claude exits
 total whenever it changed, and Vision replaces what it had. Rows Vision
 rejects are dropped, with the reason in cswap's log; if Vision is down or
 busy, cswap tries the whole batch again later, waiting longer each time. If
+Vision refuses a report as malformed, cswap halves it until the rows at fault
+are found, sends the rest, and keeps those rows to try again later. Usage from
+requests that finish before Vision has named the key is kept in the file under
+a fingerprint of the key (never the key itself) and sent by the first session
+that learns the key's id, so it is not lost if Claude exits first. If
 Vision refuses the key itself, cswap stops reporting for that session and,
 after Claude exits, prints one line saying what to do. Reporting never delays
 or fails a request. Usage limits are not enforced yet.

@@ -117,7 +117,10 @@ def test_requests_finished_before_the_key_is_known_are_reported_later(
     proxy = proxy_for(url, vision, tmp_path)
     with proxy:
         post(proxy, b'{"model":"claude-opus-4-6"}')
-        assert not (tmp_path / "totals.json").exists()
+        # Held on disk under the key's fingerprint, not filed under any key.
+        assert wait_for(lambda: (tmp_path / "totals.json").exists())
+        state = json.loads((tmp_path / "totals.json").read_text())
+        assert state["rows"] == [] and len(state["held"]) == 1
         vision.self_answer = {"via": "api_key", "key": {"id": KEY_ID}, "owner": {}}
         proxy.key_owner._retry_at = 0  # skip the lookup's one-minute retry wait
         assert wait_for(lambda: proxy.key_owner.current() is not None)
