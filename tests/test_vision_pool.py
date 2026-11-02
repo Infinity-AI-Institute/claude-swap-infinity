@@ -18,6 +18,7 @@ from claude_swap.vision_pool import (
     request_models,
     retry_delay,
 )
+from claude_swap.vision_proxy import ProviderUsageLimit
 
 NOW = 1_800_000_000.0
 
@@ -327,6 +328,84 @@ def test_all_accounts_limited_returns_remaining_retry_delay(setup):
     # Each login is named with its own window, not a bare "rate_limited".
     assert str(error.value).count("rate-limited by the provider until") == 3
     assert client.credential.call_count == calls
+
+
+FIVE_HOUR_LIMIT = ProviderUsageLimit(claim="five_hour", resets_at=NOW + 3600)
+
+
+def test_usage_limit_keeps_the_account_out_until_the_provider_reset(setup):
+    pool, _, _, observations, _, _ = setup
+    credential = pool.get()
+    assert credential["accessToken"] == "synthetic-token-2"
+    replacement = pool.rate_limited(credential, "60", usage_limit=FIVE_HOUR_LIMIT)
+    assert replacement["accessToken"] == "synthetic-token-3"
+    # The provider's reset, not its 60-second Retry-After.
+    assert pool.rate_limits[credential["account_id"]] == NOW + 3600
+
+
+def test_usage_limit_on_the_last_login_with_quota_is_no_quota_not_a_throttle(setup):
+    """Incident 2026-10-31: the last account's limit was shown as a throttle."""
+    pool, _, client, observations, clock, _ = setup
+    observations[item(1)["login_id"]] = observation(1, 100, reset=7200)
+    observations[item(3)["login_id"]] = observation(3, 100, reset=7200)
+    credential = pool.get()
+    assert credential["accessToken"] == "synthetic-token-2"
+    assert pool.rate_limited(credential, "60", usage_limit=FIVE_HOUR_LIMIT) is None
+    calls = client.credential.call_count
+    clock.return_value += 120
+    with pytest.raises(NoCentralQuota) as error:
+        pool.get()
+    assert not isinstance(error.value, ProviderRateLimited)
+    message = str(error.value)
+    assert "user2@example.invalid (5-hour usage limit reached" in message
+    assert "rate-limited by the provider" not in message
+    # The earliest return is the provider's reset, an hour out, not a minute.
+    assert error.value.retry_after_seconds == 3600 - 120
+    assert client.credential.call_count == calls
+
+
+def test_a_throttle_on_the_last_login_with_quota_is_still_retryable(setup):
+    pool, _, _, observations, clock, _ = setup
+    observations[item(1)["login_id"]] = observation(1, 100, reset=7200)
+    observations[item(3)["login_id"]] = observation(3, 100, reset=7200)
+    credential = pool.get()
+    assert pool.rate_limited(credential, "60") is None
+    clock.return_value += 30
+    with pytest.raises(ProviderRateLimited) as error:
+        pool.get()
+    assert error.value.retry_after_seconds == 30
+
+
+@pytest.mark.parametrize(
+    "usage_limit,deadline",
+    [
+        # No reset header: the Retry-After stands.
+        (ProviderUsageLimit(claim="seven_day", resets_at=None), NOW + 60),
+        # A reset in the past or beyond a weekly window is not believed.
+        (ProviderUsageLimit(claim="seven_day", resets_at=NOW - 10), NOW + 60),
+        (ProviderUsageLimit(claim="seven_day", resets_at=NOW + 9 * 86400), NOW + 60),
+    ],
+)
+def test_unusable_usage_limit_reset_falls_back_to_retry_after(
+    setup, usage_limit, deadline
+):
+    pool, _, _, _, _, _ = setup
+    credential = pool.get()
+    pool.record_rate_limit(credential, "60", usage_limit=usage_limit)
+    assert pool.rate_limits[credential["account_id"]] == deadline
+
+
+def test_usage_limit_without_a_claim_still_reads_as_a_usage_limit(setup):
+    pool, _, _, observations, _, _ = setup
+    observations[item(1)["login_id"]] = observation(1, 100, reset=7200)
+    observations[item(3)["login_id"]] = observation(3, 100, reset=7200)
+    credential = pool.get()
+    unnamed = ProviderUsageLimit(claim=None, resets_at=None)
+    assert pool.rate_limited(credential, "60", usage_limit=unnamed) is None
+    with pytest.raises(NoCentralQuota) as error:
+        pool.get()
+    assert not isinstance(error.value, ProviderRateLimited)
+    assert "user2@example.invalid (usage limit reached" in str(error.value)
 
 
 def test_all_logins_for_limited_account_are_excluded(setup):
