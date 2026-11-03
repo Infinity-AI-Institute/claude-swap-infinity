@@ -481,6 +481,22 @@ def test_vision_login_needing_reauthentication_falls_back_to_a_local_account(
     host.run_native.assert_not_called()
 
 
+def test_a_key_over_its_usage_limit_does_not_fall_back_to_a_local_login(host):
+    # Vision's limit is on the key; a launch must stop and say so, not move on.
+    host.usage[1] = healthy(host.now)
+    host.add_local_account(5, "local@example.invalid")
+    host.client.credential.side_effect = VisionError(
+        "usage_limit_reached",
+        status=429,
+        details={"message": "This API key reached its day usage limit."},
+    )
+    with pytest.raises(VisionError, match="reached its day usage limit"):
+        host.manager.exec_default(PROMPT_ARGS)
+    host.setup_session.assert_not_called()
+    host.manager._exec.assert_not_called()
+    host.run_native.assert_not_called()
+
+
 def test_vision_outage_without_a_local_login_fails_as_before(host):
     host.usage[1] = healthy(host.now)
     host.client.credential.side_effect = VisionError("service_unavailable", status=503)

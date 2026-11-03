@@ -1,6 +1,6 @@
 [project]
 name = "claude-swap"
-version = "0.26.0b1+infinity.9"
+version = "0.26.0b1+infinity.10"
 description = "Multi-account switcher for Claude Code"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -10,6 +10,9 @@ dependencies = [
     # import it on the hot path; the macOS migration has a security-CLI
     # fallback and the legacy purge sweep no-ops when it's absent.
     "keyring>=25.0.0; sys_platform == 'win32'",
+    # Windows-only: Python reads time zones from the OS elsewhere; Vision's
+    # usage-limit resets are shown in Pacific time (usage_limits.py).
+    "tzdata>=2024.1; sys_platform == 'win32'",
     "textual>=8.2.8,<9",
     "truststore>=0.10.4",
 ]

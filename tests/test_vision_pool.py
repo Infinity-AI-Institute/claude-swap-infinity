@@ -508,6 +508,19 @@ def test_refused_key_is_not_mistaken_for_a_dead_login(setup):
     assert client.credential.call_count == 1
 
 
+def test_a_key_over_its_usage_limit_is_not_mistaken_for_a_dead_login(setup):
+    # The limit is the key's: every login would answer the same 429.
+    pool, _, client, _, _, _ = setup
+    client.credential.side_effect = VisionError(
+        "usage_limit_reached", status=429, details={"message": "Limit reached."}
+    )
+    with pytest.raises(VisionError) as refused:
+        pool.get()
+    assert refused.value.code == "usage_limit_reached"
+    assert client.credential.call_count == 1
+    assert pool.unavailable == {}
+
+
 def test_relogin_returns_the_login_to_the_pool_at_its_new_generation(setup):
     pool, _, client, observations, _, _ = setup
     issue = client.credential.side_effect

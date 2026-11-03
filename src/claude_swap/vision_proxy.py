@@ -32,7 +32,8 @@ from claude_swap import __version__
 from claude_swap.account_ledger import AccountLedger, LedgerEntry, default_ledger_dir
 from claude_swap.exceptions import ClaudeSwitchError, NoUsableLogin, SessionError
 from claude_swap.response_usage import TokenUsage, usage_reader
-from claude_swap.usage_report import LocalLimitGate, UsageReporter
+from claude_swap.usage_limits import USAGE_LIMIT_REACHED, LimitGate
+from claude_swap.usage_report import UsageReporter
 from claude_swap.usage_totals import (
     UsageRecord,
     UsageTotals,
@@ -59,6 +60,9 @@ COUNT_TOKENS_PATH = "/v1/messages/count_tokens"
 FINISH_WAIT_SECONDS = 2.0
 # The last report's share of that, even when requests used the rest.
 FINAL_REPORT_MIN_SECONDS = 0.25
+# How long a launch waits for the first usage-limits read, to print a warning
+# before native starts drawing; a slower read's warning prints after exit.
+LIMITS_ANNOUNCE_WAIT_SECONDS = 1.0
 FORWARDED_HEADERS = {
     "anthropic-version",
     "anthropic-beta",
@@ -306,8 +310,12 @@ class InferenceProxy:
             if isinstance(client, VisionClient)
             else None
         )
+        # Asked before every request. Without a Vision client nothing feeds
+        # it, so it never refuses.
         self.limit_gate = (
-            self.reporter.limit_gate if self.reporter is not None else LocalLimitGate()
+            self.reporter.limit_gate
+            if self.reporter is not None
+            else LimitGate(tool="cswap")
         )
         self.upstream = upstream.rstrip("/")
         self.capability = secrets.token_urlsafe(32)
@@ -324,11 +332,14 @@ class InferenceProxy:
         return f"http://127.0.0.1:{self.server.server_port}"
 
     def __enter__(self):
-        self._announce_relogin()
         self.ledger.prune_once()
         self.key_owner.start()
         if self.reporter is not None:
+            # Its first pass reads the key's usage limits, while the re-login
+            # check below runs.
             self.reporter.start()
+        self._announce_relogin()
+        self._announce_limits()
         proxy = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -412,7 +423,12 @@ class InferenceProxy:
                     error.code,
                     error.status,
                 )
-                if error.code == "unauthorized":
+                if error.code == USAGE_LIMIT_REACHED:
+                    # The key's spend limit: no login can serve until the
+                    # window resets, so it is refused here until then, not
+                    # retried, and the refusal is shown as Vision wrote it.
+                    self._needs_action(proxy.limit_gate.refuse_from_vision(error.details))
+                elif error.code == "unauthorized":
                     client = getattr(proxy.credentials, "client", None)
                     self._needs_action(
                         rejected_key_message(getattr(client, "key_source", None))
@@ -692,6 +708,17 @@ class InferenceProxy:
             for line in self.credentials.relogin_notices():
                 print(line, file=sys.stderr)
 
+    def _announce_limits(self):
+        """Print usage-limit warnings Vision stated by now, before native starts.
+
+        Bounded: a slow limits read leaves its warning for after native exits.
+        """
+        if self.reporter is None:
+            return
+        self.reporter.limits_read_once.wait(LIMITS_ANNOUNCE_WAIT_SECONDS)
+        for line in self.limit_gate.take_notices():
+            print(line, file=sys.stderr)
+
     def record_request(self, request_headers, path, requested_model, attempts):
         """Write a finished request's ledger lines and add its usage to the totals.
 
@@ -778,8 +805,10 @@ class InferenceProxy:
             self.reporter.stop(
                 max(FINAL_REPORT_MIN_SECONDS, deadline - time.monotonic())
             )
+            # Native has exited: stderr is the person's terminal again.
+            for line in self.limit_gate.take_notices():
+                print(line, file=sys.stderr)
             if self.reporter.notice is not None:
-                # Native has exited: stderr is the person's terminal again.
                 print(self.reporter.notice, file=sys.stderr)
 
     def environment(self, native_env):

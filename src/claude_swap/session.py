@@ -709,6 +709,7 @@ class SessionManager:
         launched as named; the adapter still moves its requests between Vision
         logins, as it always has.
         """
+        from claude_swap.usage_limits import USAGE_LIMIT_REACHED
         from claude_swap.vision import VisionError, configured_client
         from claude_swap.vision_pool import NoCentralQuota
         from claude_swap.vision_proxy import run_native
@@ -755,7 +756,12 @@ class SessionManager:
                 self, record, client, share=share, share_history=share_history
             )
         except (VisionError, CredentialUnavailable) as error:
-            if not allow_fallback:
+            # A key over its Vision spend limit stops here with Vision's own
+            # words; launching another login would get around the limit.
+            over_limit = (
+                isinstance(error, VisionError) and error.code == USAGE_LIMIT_REACHED
+            )
+            if not allow_fallback or over_limit:
                 raise
             self._fall_back_from_vision(
                 error,

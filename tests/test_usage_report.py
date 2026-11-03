@@ -1,9 +1,9 @@
 """Uploading the hourly usage totals to Vision (usage report contract v1).
 
 A synthetic Vision on loopback answers ``POST /api/ai-accounts/usage/reports``
-and ``GET /api/ai-accounts/usage/limits/self`` the way vision PR #417 does
-(``{"data": {"rows": [...], "limits": null}}``), so the real VisionClient,
-its retries and its errors are exercised.
+and ``GET /api/ai-accounts/usage/limits/self`` the way vision PRs #417 and
+#421 do (``{"data": {"rows": [...], "limits": ...}}``), so the real
+VisionClient, its retries and its errors are exercised.
 """
 
 import http.server
@@ -18,7 +18,7 @@ import pytest
 
 from claude_swap.response_usage import TokenUsage
 from claude_swap.usage_report import (
-    LocalLimitGate,
+    LIMITS_RETRY_SECONDS,
     UsageReporter,
     fetch_limits,
     report_batches,
@@ -59,6 +59,9 @@ class SyntheticVision:
         # A report holding any of these logins is refused whole, as malformed (400).
         self.malformed: set[str] = set()
         self.limits_calls = 0
+        # What both the limits read and every report answer say (PR #421).
+        self.limits: list | None = None
+        self.limits_status = 200
         self.hold = threading.Event()
         self.hold.set()
         vision = self
@@ -80,7 +83,11 @@ class SyntheticVision:
             def do_GET(self):
                 if self.path == "/api/ai-accounts/usage/limits/self":
                     vision.limits_calls += 1
-                    return self._send(200, {"data": {"limits": None}})
+                    if vision.limits_status != 200:
+                        return self._send(
+                            vision.limits_status, {"error": {"code": "service_unavailable"}}
+                        )
+                    return self._send(200, {"data": {"limits": vision.limits}})
                 self._send(404, {"error": {"code": "not_found"}})
 
             def do_POST(self):
@@ -106,7 +113,7 @@ class SyntheticVision:
                             {"index": index, "status": "accepted",
                              "permitted_at_report": True}
                         )
-                self._send(200, {"data": {"rows": results, "limits": None}})
+                self._send(200, {"data": {"rows": results, "limits": vision.limits}})
 
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.url = f"http://127.0.0.1:{self.server.server_port}"
@@ -560,35 +567,108 @@ def test_buckets_too_old_to_report_are_pruned_not_sent(tmp_path, vision):
     assert len(vision.sent_rows()) == 1
 
 
-def test_the_limits_in_a_report_answer_are_kept_for_the_gate(tmp_path, vision):
+def exceeded_day():
+    return [
+        {
+            "window": "day",
+            "resets_at": (datetime.now(UTC) + timedelta(hours=3)).isoformat(),
+            "limit": {"unit": "usd_estimated", "value": 50},
+            "used": {"value": 52.5, "as_of": datetime.now(UTC).isoformat()},
+            "state": "exceeded",
+        }
+    ]
+
+
+def test_the_limits_in_a_report_answer_refuse_locally(tmp_path, vision):
     totals, reporter = setup(tmp_path, vision)
     totals.add([record()])
-    provisional = [{"window": "day", "state": "ok"}]
+    vision.limits = exceeded_day()
+    reporter.report_now()
+    assert "daily usage limit (52.50 of 50.00 USD at API list price" in (
+        reporter.limit_gate.refusal() or ""
+    )
+
+
+def test_an_answer_without_a_limits_field_keeps_the_known_limits(tmp_path, vision):
+    totals, reporter = setup(tmp_path, vision)
+    reporter.limit_gate.update(exceeded_day())
+    totals.add([record()])
     vision.answers.append(
-        (
-            200,
-            {
-                "data": {
-                    "rows": [{"index": 0, "status": "accepted", "permitted_at_report": True}],
-                    "limits": provisional,
-                }
-            },
-            {},
-        )
+        (200, {"data": {"rows": [{"index": 0, "status": "accepted"}]}}, {})
     )
     reporter.report_now()
-    assert reporter.limit_gate.limits == provisional
-    # Refusing locally waits for the limits contract.
+    assert reporter.limit_gate.refusal() is not None
+
+
+def test_usage_is_still_reported_while_the_limit_refuses(tmp_path, vision):
+    totals, reporter = setup(tmp_path, vision)
+    reporter.limit_gate.update(exceeded_day())
+    totals.add([record()])
+    reporter.report_now()
+    assert len(vision.sent_rows()) == 1
+
+
+def test_the_limits_read_follows_the_contract(vision):
+    assert fetch_limits(VisionClient(vision.url, KEY)) is None
+    vision.limits = exceeded_day()
+    assert fetch_limits(VisionClient(vision.url, KEY)) == vision.limits
+    assert vision.limits_calls == 2
+
+
+def test_limits_are_read_at_start_before_the_key_is_known_then_each_interval(
+    tmp_path, vision
+):
+    clock = Clock()
+    _, reporter = setup(tmp_path, vision, key_owner=unknown_key(), clock=clock)
+    vision.limits = exceeded_day()
+    reporter.tick()
+    assert vision.limits_calls == 1
+    assert reporter.limit_gate.refusal() is not None
+    reporter.tick()
+    assert vision.limits_calls == 1  # not on every pass
+    clock.now += reporter.interval
+    vision.limits = None
+    reporter.tick()
+    assert vision.limits_calls == 2
     assert reporter.limit_gate.refusal() is None
 
 
-def test_the_limits_read_returns_null_today(vision):
-    assert fetch_limits(VisionClient(vision.url, KEY)) is None
+def test_a_report_answer_counts_as_a_limits_read(tmp_path, vision):
+    clock = Clock()
+    totals, reporter = setup(tmp_path, vision, clock=clock)
+    reporter.tick()  # start: reads limits, reports nothing
+    totals.add([record()])
+    clock.now += reporter.interval
+    reporter.tick()  # the report's answer carries the limits
+    assert (vision.limits_calls, len(vision.reports)) == (1, 1)
+
+
+def test_a_failed_limits_read_is_retried_soon_and_keeps_what_was_known(
+    tmp_path, vision
+):
+    clock = Clock()
+    _, reporter = setup(tmp_path, vision, key_owner=unknown_key(), clock=clock)
+    reporter.limit_gate.update(exceeded_day())
+    vision.limits_status = 503
+    reporter.tick()
     assert vision.limits_calls == 1
+    assert reporter.limit_gate.refusal() is not None  # never lifted by an outage
+    assert reporter._seconds_until_due() <= LIMITS_RETRY_SECONDS
+    clock.now += LIMITS_RETRY_SECONDS
+    vision.limits_status = 200
+    reporter.tick()
+    assert vision.limits_calls == 2
+    assert reporter.limit_gate.refusal() is None
 
 
-def test_the_gate_refuses_nothing_until_limits_are_specified():
-    gate = LocalLimitGate()
-    assert gate.refusal() is None
-    gate.update([{"window": "day", "state": "exceeded"}])
-    assert gate.refusal() is None
+def test_limits_are_still_read_after_vision_refused_the_reports(tmp_path, vision):
+    clock = Clock()
+    totals, reporter = setup(tmp_path, vision, clock=clock)
+    totals.add([record()])
+    vision.answers.append((403, {"error": {"code": "capability_required"}}, {}))
+    reporter.tick()
+    assert reporter.notice is not None
+    clock.now += reporter.interval
+    vision.limits = exceeded_day()
+    reporter.tick()
+    assert reporter.limit_gate.refusal() is not None
