@@ -31,6 +31,8 @@ from datetime import UTC, datetime
 from claude_swap import __version__
 from claude_swap.account_ledger import AccountLedger, LedgerEntry, default_ledger_dir
 from claude_swap.exceptions import ClaudeSwitchError, NoUsableLogin, SessionError
+from claude_swap.flag_refresh import FlagRefresher
+from claude_swap.paths import get_backup_root, global_config_path_for
 from claude_swap.response_usage import TokenUsage, usage_reader
 from claude_swap.usage_limits import USAGE_LIMIT_REACHED, LimitGate
 from claude_swap.usage_report import UsageReporter
@@ -60,6 +62,8 @@ COUNT_TOKENS_PATH = "/v1/messages/count_tokens"
 FINISH_WAIT_SECONDS = 2.0
 # The last report's share of that, even when requests used the rest.
 FINAL_REPORT_MIN_SECONDS = 0.25
+# How long leaving waits for an out-of-band flag refresh to stop (flag_refresh).
+FLAG_REFRESH_STOP_SECONDS = 1.0
 # How long a launch waits for the first usage-limits read, to print a warning
 # before native starts drawing; a slower read's warning prints after exit.
 LIMITS_ANNOUNCE_WAIT_SECONDS = 1.0
@@ -830,6 +834,17 @@ def run_native(native, arguments, launch, client, record, *, switcher=None):
         child = subprocess.Popen(
             [native, *arguments], env=proxy.environment(launch.env)
         )
+        # Native's own flag fetch bypasses the adapter and is refused with
+        # the capability, so the flags it caches are refreshed beside it
+        # (flag_refresh). The real token reaches only that throwaway run.
+        refresher = FlagRefresher(
+            [native],
+            global_config_path_for(launch.env),
+            launch.env,
+            lambda: proxy.credentials.get()["accessToken"],
+            marker_dir=get_backup_root() / "flag-refresh",
+        )
+        refresher.start()
         previous = {}
         try:
             if threading.current_thread() is threading.main_thread():
@@ -854,4 +869,5 @@ def run_native(native, arguments, launch, client, record, *, switcher=None):
                     child.wait(timeout=5)
             for signum, handler in previous.items():
                 signal.signal(signum, handler)
+            refresher.stop(FLAG_REFRESH_STOP_SECONDS)
     raise SystemExit(returncode)

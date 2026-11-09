@@ -80,6 +80,19 @@ fails without requesting refresh. Claude keeps its existing native config and
 conversation home (`CLAUDE_CONFIG_DIR`, or `~/.claude` when unset). Swapping
 accounts changes credentials, not the session store: `--resume` and `--continue`
 work across accounts and after restarting without copying conversations.
+
+Native fetches its feature flags from `api.anthropic.com` directly, not through
+`ANTHROPIC_BASE_URL`, with the capability as the bearer, so that fetch is refused
+and the flags native caches in `.claude.json` would never change (#40). While a
+session runs, the adapter's process therefore refreshes them beside it when they
+are over six hours old: Claude Code runs `doctor` with a real access token in a
+throwaway profile, which fetches and saves the flags without a model request,
+and only the four flag keys (`cachedGrowthBookFeatures`,
+`cachedGrowthBookFeaturesAt`, `cachedExperimentFeatures`,
+`cachedExperimentData`) are copied into the session's config, under Claude
+Code's config lock. The real token never reaches the session's native process.
+A session that ends first stops the refresh, and an attempt is not repeated
+within an hour (`src/claude_swap/flag_refresh.py`).
 Only secure credential storage is isolated under
 `vision-sessions/<registry-hash>/<login-id>` in the backup directory, using native
 `CLAUDE_SECURESTORAGE_CONFIG_DIR`. Existing local credentials are untouched.
