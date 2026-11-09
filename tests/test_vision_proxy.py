@@ -645,3 +645,52 @@ def test_adapter_failures_never_reach_the_native_terminal(tmp_path):
     assert result.returncode == 0, result.stderr
     assert result.stdout.split("\n")[0] == "HTTPError 502"
     assert result.stderr == ""
+
+
+def test_native_runner_refreshes_flags_beside_the_session(monkeypatch, tmp_path):
+    """#40: native's flag fetch is refused under the adapter, so the runner
+    refreshes them out of band with a real token, never handing it to native."""
+    from types import SimpleNamespace
+
+    from claude_swap.vision_proxy import run_native
+
+    events = []
+
+    class Refresher:
+        def __init__(self, command, config_path, base_env, token_source, **kw):
+            events.append(("init", command, config_path, kw["marker_dir"]))
+            self.token_source = token_source
+
+        def start(self):
+            events.append(("start", self.token_source()))
+
+        def stop(self, timeout):
+            events.append(("stop", timeout))
+
+    monkeypatch.setattr("claude_swap.vision_proxy.FlagRefresher", Refresher)
+    child = Mock()
+    child.wait.return_value = 0
+    child.poll.return_value = 0
+    spawn = Mock(return_value=child)
+    monkeypatch.setattr("claude_swap.vision_proxy.subprocess.Popen", spawn)
+    credentials = Mock()
+    credentials.get.return_value = {"accessToken": "synthetic-provider-token"}
+    monkeypatch.setattr(
+        "claude_swap.vision_proxy.CentralCredential", Mock(return_value=credentials)
+    )
+    launch = SimpleNamespace(
+        env={
+            "CLAUDE_CODE_OAUTH_TOKEN": "synthetic-provider-token",
+            "CLAUDE_CONFIG_DIR": str(tmp_path / "profile"),
+        }
+    )
+    with pytest.raises(SystemExit):
+        run_native("/synthetic/claude", [], launch, Mock(), {})
+
+    init, start, stop = events
+    assert init[1] == ["/synthetic/claude"]
+    assert init[2] == tmp_path / "profile" / ".claude.json"
+    assert start == ("start", "synthetic-provider-token")
+    assert stop[0] == "stop"
+    native_env = spawn.call_args.kwargs["env"]
+    assert native_env["CLAUDE_CODE_OAUTH_TOKEN"] != "synthetic-provider-token"

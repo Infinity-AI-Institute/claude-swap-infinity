@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import os
 import shutil
+from collections.abc import Mapping
 from pathlib import Path
 
 from claude_swap.exceptions import MigrationError
@@ -45,11 +46,17 @@ def get_global_config_path() -> Path:
     Returns the legacy ``<config_home>/.config.json`` if it exists, else
     ``(CLAUDE_CONFIG_DIR || $HOME)/.claude.json``.
     """
-    legacy = get_claude_config_home() / ".config.json"
+    return global_config_path_for(os.environ)
+
+
+def global_config_path_for(env: Mapping[str, str]) -> Path:
+    """:func:`get_global_config_path` for a process launched with ``env``."""
+    config_dir = env.get("CLAUDE_CONFIG_DIR")
+    home = Path(config_dir) if config_dir else Path.home() / ".claude"
+    legacy = home / ".config.json"
     if legacy.exists():
         return legacy
-    env = os.environ.get("CLAUDE_CONFIG_DIR")
-    base = Path(env) if env else Path.home()
+    base = Path(config_dir) if config_dir else Path.home()
     return base / ".claude.json"
 
 
